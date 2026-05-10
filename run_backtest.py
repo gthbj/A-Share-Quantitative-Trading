@@ -42,6 +42,7 @@ def main() -> int:
     parser.add_argument("--capital", type=float, default=1_000_000, help="初始资金")
     parser.add_argument("--config", default="config/backtest.yaml", help="配置文件路径")
     parser.add_argument("--output", default="output/report", help="报告输出目录")
+    parser.add_argument("--frequency", default=None, help="回测频率：daily / 1min / 5min / 15min / 30min / 60min")
     args = parser.parse_args()
 
     # 加载配置
@@ -62,6 +63,9 @@ def main() -> int:
         print(f"{args.strategy} 不是 BaseStrategy 的子类")
         return 1
 
+    # 确定频率
+    frequency = args.frequency or cfg.get("backtest", {}).get("frequency", "daily")
+
     # 运行回测
     engine = BacktestEngine(
         strategy_cls=strategy_cls,
@@ -70,6 +74,7 @@ def main() -> int:
         end_date=args.end,
         initial_capital=args.capital,
         benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
+        frequency=frequency,
     )
     nav_df = engine.run()
 
@@ -78,7 +83,7 @@ def main() -> int:
         return 1
 
     # 绩效分析
-    metrics = calculate_metrics(nav_df, engine.benchmark_df)
+    metrics = calculate_metrics(nav_df, engine.benchmark_df, frequency=frequency)
     print(f"\n{'='*40}")
     print(f"累计收益率: {metrics.total_return:.2%}")
     print(f"年化收益率: {metrics.annual_return:.2%}")

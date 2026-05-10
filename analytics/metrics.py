@@ -31,11 +31,25 @@ class MetricsResult:
     turnover: float = 0.0
 
 
+def _annual_factor(frequency: str) -> int:
+    """根据回测频率返回年化系数。"""
+    factors = {
+        "daily": 252,
+        "1min": 252 * 240,
+        "5min": 252 * 48,
+        "15min": 252 * 16,
+        "30min": 252 * 8,
+        "60min": 252 * 4,
+    }
+    return factors.get(frequency, 252)
+
+
 def calculate_metrics(
     nav_df: pd.DataFrame,
     benchmark_df: Optional[pd.DataFrame] = None,
     risk_free_rate: float = 0.02,
     fills: Optional[List] = None,
+    frequency: str = "daily",
 ) -> MetricsResult:
     """计算回测绩效指标。
 
@@ -57,8 +71,10 @@ def calculate_metrics(
     result = MetricsResult()
 
     # ---------- 收益指标 ----------
+    ann_factor = _annual_factor(frequency)
+
     result.total_return = (nav.iloc[-1] / nav.iloc[0]) - 1 if nav.iloc[0] != 0 else 0.0
-    n_years = len(returns) / 252.0
+    n_years = len(returns) / ann_factor
     if n_years > 0:
         result.annual_return = (1 + result.total_return) ** (1 / n_years) - 1
 
@@ -83,14 +99,14 @@ def calculate_metrics(
 
     # ---------- 风险指标 ----------
     if len(returns) > 1:
-        result.volatility = returns.std() * np.sqrt(252)
-        excess_daily = returns - risk_free_rate / 252
+        result.volatility = returns.std() * np.sqrt(ann_factor)
+        excess_period = returns - risk_free_rate / ann_factor
         if result.volatility > 0:
-            result.sharpe_ratio = (excess_daily.mean() * 252) / result.volatility
+            result.sharpe_ratio = (excess_period.mean() * ann_factor) / result.volatility
 
         downside = returns[returns < 0]
         if len(downside) > 0 and downside.std() > 0:
-            result.sortino_ratio = (returns.mean() * 252) / (downside.std() * np.sqrt(252))
+            result.sortino_ratio = (returns.mean() * ann_factor) / (downside.std() * np.sqrt(ann_factor))
 
     # ---------- Beta / Alpha / IR ----------
     if benchmark_df is not None and not benchmark_df.empty and "close" in benchmark_df.columns:
@@ -103,7 +119,7 @@ def calculate_metrics(
                 result.beta = cov / bench_var
                 result.alpha = result.annual_return - (risk_free_rate + result.beta * (result.benchmark_return - risk_free_rate))
 
-            tracking_error = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).std() * np.sqrt(252)
+            tracking_error = (aligned.iloc[:, 0] - aligned.iloc[:, 1]).std() * np.sqrt(ann_factor)
             if tracking_error > 0:
                 result.information_ratio = result.excess_return / tracking_error
 

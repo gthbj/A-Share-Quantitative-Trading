@@ -63,14 +63,16 @@ class Context:
     # ---------- 数据查询接口 ----------
 
     def get_price(self, code: str, count: int = 20) -> pd.DataFrame:
-        """获取最近 N 日历史行情。"""
-        # 计算日期范围：向前取 count*1.5 个自然日，再过滤交易日
+        """获取最近 N 根 Bar 的历史行情。"""
+        # 计算日期范围：向前取 count*1.5 个自然日，再过滤 Bar
         from datetime import datetime, timedelta
 
-        end = datetime.strptime(self.current_date, "%Y%m%d")
+        # current_date 可能是 YYYYMMDD（日线）或 YYYYMMDDHHMM（分钟级）
+        date_str = self.current_date[:8]
+        end = datetime.strptime(date_str, "%Y%m%d")
         start = end - timedelta(days=int(count * 1.5))
-        df = self.data_source.get_daily_bars(
-            code, start.strftime("%Y%m%d"), self.current_date
+        df = self.data_source.get_bars(
+            code, start.strftime("%Y%m%d"), date_str
         )
         if not df.empty:
             df = df.tail(count)

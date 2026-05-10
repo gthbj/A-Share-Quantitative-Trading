@@ -49,13 +49,14 @@
 
 | 文件 | 职责 |
 |------|------|
-| `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。所有数据源（AKShare、Tushare、本地文件）必须实现此接口，保证上层无感知。 |
-| `akshare_source.py` | AKShare 免费数据源实现。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
-| `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}.parquet` 组织，提供按日期范围快速索引。 |
+| `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
+| `akshare_source.py` | AKShare 免费数据源实现。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。自动将框架 `period` 映射为 AKShare 接口参数。 |
+| `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
 
 **设计要点**：
 - 抽象接口隔离具体数据源，便于后续接入 Wind、Tushare Pro 等付费源。
 - 缓存策略为 **写时缓存**：首次从远程拉取后自动落盘，不预加载全量数据。
+- 分钟级数据时间列统一格式化为 `YYYYMMDDHHMM`（12位），便于按交易日前缀快速筛选。
 
 ---
 
@@ -77,13 +78,14 @@
 | 文件 | 职责 |
 |------|------|
 | `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 计算成交价（支持开盘价/收盘价模式，叠加滑点）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
-| `backtest.py` | **回测主引擎**。按交易日历逐日推进，调用策略生命周期（`before_trading_start` → `handle_data` → `after_trading_end`），预加载行情数据，收集订单并交由 `TradeEngine` 撮合，最后记录每日 NAV。 |
+| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。 |
 | `paper_trader.py` | **虚拟盘**。状态持久化到 `data/paper_state.json`，支持断点续跑。每日收盘后读取最新行情，更新持仓市值，可扩展为定时自动运行。 |
 
 **设计要点**：
 - `TradeEngine` 与 `BacktestEngine` 分离：前者只负责"一笔订单能否成交"，后者负责"何时调用策略、如何组织交易日历"。
 - 回测默认采用 **T+1 开盘价成交**（`price_type="next_open"`），避免未来函数（Lookahead Bias）。
 - 涨跌停判定基于 `prev_close` 与当日 `open` 计算，主板简化为 ±10%（实际可通过配置扩展科创板 ±20%、ST ±5%）。
+- 分钟级回测保持 T+1 以**交易日**为维度：当日买入的股票在当日剩余所有分钟内均不可卖，下一交易日开盘后解冻。
 
 ---
 
@@ -187,13 +189,19 @@ context.order(code, target_qty - current_qty)
 
 后续版本可在需求明确后补充完整实现。
 
-### 4.5 为什么不支持分钟级回测？
+### 4.5 分钟级回测是如何实现的？
 
-当前版本为 **M1（基础框架）** 交付物，优先保证日线回测的完整性与正确性。代码结构已预留分钟级扩展：
-- `BaseDataSource.get_daily_bars` 可扩展为 `get_bars(period="1min")`。
-- `BacktestEngine` 的逐日循环可改写为逐 Bar 循环。
+框架现已支持日线/分钟线双频回测，通过 `frequency` 参数统一切换。
 
-分钟级回测将在 **M4（高级功能）** 阶段实现。
+**数据层**：`BaseDataSource.get_bars(period="1min")` 统一封装日K与分钟K获取，`LocalStorage` 通过 `{code}_{period}.parquet` 文件名隔离不同周期缓存。
+
+**引擎层**：`BacktestEngine.run()` 根据 `frequency` 自动分发到 `_run_daily()` 或 `_run_intraday()`。
+- 日线模式：每个交易日调用一次 `handle_data()`。
+- 分钟模式：每个交易日加载当日全部分钟 Bar，按时间顺序逐条推进；`before_trading_start` 仅在 9:30 第一个 Bar 调用，`after_trading_end` 仅在 15:00 最后一个 Bar 调用。
+
+**T+1 兼容**：分钟级回测中 T+1 仍以**交易日**为解冻维度，而非逐分钟解冻。当日任意时刻买入的股票，当日剩余分钟内 `sellable_qty = 0`；下一交易日 9:30 第一个 Bar 之前执行 `portfolio.before_trading()` 统一解冻。
+
+**绩效分析**：`metrics.py` 根据 `frequency` 自动选择年化系数（日线 252，1min 252×240），避免分钟级收益率使用日线年化系数导致指标失真。
 
 ---
 
@@ -201,7 +209,7 @@ context.order(code, target_qty - current_qty)
 
 ### 5.1 接入新数据源
 
-1. 继承 `BaseDataSource`，实现 `get_daily_bars`、`get_stock_list`、`get_index_constituents`。
+1. 继承 `BaseDataSource`，实现 `get_bars`、`get_stock_list`、`get_index_constituents`。
 2. 在 `run_backtest.py` 中替换 `AKShareDataSource()` 为你的实现。
 
 ### 5.2 添加新策略

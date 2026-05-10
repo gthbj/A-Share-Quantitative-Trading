@@ -6,6 +6,7 @@ backtest:
   end_date: "20231231"
   initial_capital: 1000000  # 初始资金：100万人民币
   benchmark: "000300.SH"   # 沪深300
+  frequency: "daily"       # 回测频率：daily / 1min / 5min / 15min / 30min / 60min
 
 # 交易费率
 trading:

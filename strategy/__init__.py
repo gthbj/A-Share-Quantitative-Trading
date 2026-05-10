@@ -4,6 +4,7 @@ from .base_strategy import BaseStrategy, Context
 from .double_ma import DoubleMAStrategy
 from .momentum import MomentumStrategy
 from .multi_factor import MultiFactorStrategy
+from .intraday_ma import IntradayMAStrategy
 
 __all__ = [
     "BaseStrategy",
@@ -11,4 +12,5 @@ __all__ = [
     "DoubleMAStrategy",
     "MomentumStrategy",
     "MultiFactorStrategy",
+    "IntradayMAStrategy",
 ]

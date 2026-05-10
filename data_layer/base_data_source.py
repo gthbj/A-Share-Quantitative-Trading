@@ -31,19 +31,21 @@ class BaseDataSource(ABC):
     """
 
     @abstractmethod
-    def get_daily_bars(
+    def get_bars(
         self,
         code: str,
         start_date: str,
         end_date: str,
+        period: str = "daily",
         adjust: str = "qfq",
     ) -> pd.DataFrame:
-        """获取日K线数据。
+        """获取K线数据。
 
         Args:
             code: 股票代码，如 "000001.SZ"。
             start_date: 起始日期，YYYYMMDD。
             end_date: 结束日期，YYYYMMDD。
+            period: 周期，支持 "daily", "1min", "5min", "15min", "30min", "60min"。
             adjust: 复权方式，"qfq" 前复权 / "hfq" 后复权 / None 不复权。
 
         Returns:
@@ -72,20 +74,21 @@ class BaseDataSource(ABC):
         """
         raise NotImplementedError
 
-    def get_multi_daily_bars(
+    def get_multi_bars(
         self,
         codes: List[str],
         start_date: str,
         end_date: str,
+        period: str = "daily",
         adjust: str = "qfq",
     ) -> Dict[str, pd.DataFrame]:
-        """批量获取多只股票日K线。
+        """批量获取多只股票K线。
 
         默认串行获取，子类可覆盖为并行加速。
         """
         result: Dict[str, pd.DataFrame] = {}
         for code in codes:
-            df = self.get_daily_bars(code, start_date, end_date, adjust)
+            df = self.get_bars(code, start_date, end_date, period, adjust)
             if not df.empty:
                 result[code] = df
         return result

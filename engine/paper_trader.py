@@ -120,7 +120,7 @@ class PaperTrader:
         bars = {}
         for code in codes:
             try:
-                df = self.data_source.get_daily_bars(code, date, date)
+                df = self.data_source.get_bars(code, date, date)
                 if not df.empty:
                     bars[code] = df.iloc[0]
             except Exception:

@@ -31,26 +31,29 @@ class LocalStorage:
         self.daily_dir.mkdir(parents=True, exist_ok=True)
         self.info_dir.mkdir(parents=True, exist_ok=True)
 
-    def _daily_path(self, code: str, fmt: str = "parquet") -> Path:
-        return self.daily_dir / f"{code}.{fmt}"
+    def _bar_path(self, code: str, period: str = "daily", fmt: str = "parquet") -> Path:
+        if period == "daily":
+            return self.daily_dir / f"{code}.{fmt}"
+        return self.daily_dir / f"{code}_{period}.{fmt}"
 
-    def save_daily(self, code: str, df: pd.DataFrame, fmt: str = "parquet") -> None:
-        """保存单只股票日K数据。"""
-        path = self._daily_path(code, fmt)
+    def save_bars(self, code: str, df: pd.DataFrame, period: str = "daily", fmt: str = "parquet") -> None:
+        """保存单只股票K线数据。"""
+        path = self._bar_path(code, period, fmt)
         if fmt == "parquet":
             df.to_parquet(path, index=False)
         else:
             df.to_csv(path, index=False)
 
-    def load_daily(
+    def load_bars(
         self,
         code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        period: str = "daily",
         fmt: str = "parquet",
     ) -> pd.DataFrame:
-        """读取单只股票日K数据，支持日期过滤。"""
-        path = self._daily_path(code, fmt)
+        """读取单只股票K线数据，支持日期过滤。"""
+        path = self._bar_path(code, period, fmt)
         if not path.exists():
             return pd.DataFrame()
 
