@@ -95,7 +95,7 @@ class BacktestEngine:
                 if df is not None and not df.empty:
                     row = df[df["date"] == date_str]
                     if not row.empty:
-                        today_bars[code] = row.iloc[0]
+                        today_bars[code] = row.iloc[0].copy()
 
             # 2. 更新前一日收盘价（用于涨跌停判定）
             if i > 0:

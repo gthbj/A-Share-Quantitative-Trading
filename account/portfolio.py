@@ -22,7 +22,6 @@ class Portfolio:
 
     # ---------- 查询接口 ----------
 
-    @property
     def total_value(self, price_map: Optional[Dict[str, float]] = None) -> float:
         """总资产 = 可用现金 + 冻结资金 + 持仓市值。"""
         pos_value = 0.0
@@ -32,7 +31,6 @@ class Portfolio:
                 pos_value += pos.market_value(price)
         return self.available_cash + self.frozen_cash + pos_value
 
-    @property
     def total_position_value(self, price_map: Dict[str, float]) -> float:
         """持仓总市值。"""
         return sum(

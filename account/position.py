@@ -59,12 +59,10 @@ class Position:
                 sellable += qty
         self.sellable_qty = sellable
 
-    @property
     def market_value(self, current_price: float = 0.0) -> float:
         """按当前价格计算持仓市值。"""
         return self.total_qty * current_price
 
-    @property
     def profit_ratio(self, current_price: float = 0.0) -> float:
         """当前盈亏比例。"""
         if self.cost_price == 0:
