@@ -1,0 +1,39 @@
+# A股模拟量化交易系统 - 回测配置
+
+# 回测基础参数
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  initial_capital: 1000000  # 初始资金：100万人民币
+  benchmark: "000300.SH"   # 沪深300
+
+# 交易费率
+trading:
+  commission_rate: 0.00025   # 券商佣金：万分之2.5
+  min_commission: 5.0       # 最低佣金5元
+  stamp_duty_rate: 0.0005   # 印花税：千分之0.5（卖出时收取）
+  transfer_fee_rate: 0.00001 # 过户费：万分之0.1（沪市双向）
+
+# 滑点设置
+slippage:
+  enabled: true
+  type: "percent"  # percent | fixed
+  value: 0.001     # 0.1%
+
+# 撮合规则
+execution:
+  price_type: "next_open"  # next_open | current_close
+  volume_limit: 0.10       # 单笔订单不超过当日成交量的10%
+  allow_short: false       # 不允许做空
+
+# 数据配置
+data:
+  source: "akshare"  # akshare | tushare | local
+  tushare_token: ""  # Tushare Pro Token（如使用Tushare）
+  cache_dir: "data/raw"
+  storage_format: "parquet"  # parquet | csv
+
+# 日志
+logging:
+  level: "INFO"
+  file: "logs/backtest.log"

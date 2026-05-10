@@ -1,0 +1,86 @@
+"""本地数据存储与读取。
+
+支持 Parquet / CSV 格式，提供按日期范围、股票代码的快速索引。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+
+
+class LocalStorage:
+    """本地行情数据存储器。
+
+    目录结构：
+        data/raw/
+            ├── daily/
+            │     ├── 000001.parquet
+            │     ├── 000002.parquet
+            │     └── ...
+            └── info/
+                  └── stock_list.parquet
+    """
+
+    def __init__(self, root_dir: str = "data/raw") -> None:
+        self.root = Path(root_dir)
+        self.daily_dir = self.root / "daily"
+        self.info_dir = self.root / "info"
+        self.daily_dir.mkdir(parents=True, exist_ok=True)
+        self.info_dir.mkdir(parents=True, exist_ok=True)
+
+    def _daily_path(self, code: str, fmt: str = "parquet") -> Path:
+        return self.daily_dir / f"{code}.{fmt}"
+
+    def save_daily(self, code: str, df: pd.DataFrame, fmt: str = "parquet") -> None:
+        """保存单只股票日K数据。"""
+        path = self._daily_path(code, fmt)
+        if fmt == "parquet":
+            df.to_parquet(path, index=False)
+        else:
+            df.to_csv(path, index=False)
+
+    def load_daily(
+        self,
+        code: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        fmt: str = "parquet",
+    ) -> pd.DataFrame:
+        """读取单只股票日K数据，支持日期过滤。"""
+        path = self._daily_path(code, fmt)
+        if not path.exists():
+            return pd.DataFrame()
+
+        if fmt == "parquet":
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path)
+
+        if "date" not in df.columns:
+            return df
+
+        if start_date:
+            df = df[df["date"] >= start_date]
+        if end_date:
+            df = df[df["date"] <= end_date]
+        return df.reset_index(drop=True)
+
+    def save_stock_list(self, df: pd.DataFrame, fmt: str = "parquet") -> None:
+        """保存股票基础信息表。"""
+        path = self.info_dir / f"stock_list.{fmt}"
+        if fmt == "parquet":
+            df.to_parquet(path, index=False)
+        else:
+            df.to_csv(path, index=False)
+
+    def load_stock_list(self, fmt: str = "parquet") -> pd.DataFrame:
+        """读取股票基础信息表。"""
+        path = self.info_dir / f"stock_list.{fmt}"
+        if not path.exists():
+            return pd.DataFrame()
+        if fmt == "parquet":
+            return pd.read_parquet(path)
+        return pd.read_csv(path)
