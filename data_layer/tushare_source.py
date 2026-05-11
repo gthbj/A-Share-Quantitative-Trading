@@ -5,11 +5,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 
-from .akshare_source import AKShareDataSource
 from .base_data_source import BaseDataSource
 from .local_storage import LocalStorage
 from utils.logger import get_logger
@@ -137,3 +136,28 @@ class TushareDataSource(BaseDataSource):
             self.storage.save_bars(norm_code, df, period=period)
 
         return df
+
+    def get_stock_list(self) -> pd.DataFrame:
+        """获取股票基础信息列表（Tushare 实现）。"""
+        ts = self._get_ts()
+        try:
+            df = ts.stock_basic(exchange="", list_status="L")
+            if df is not None and not df.empty:
+                df = df[["ts_code", "name", "industry"]].copy()
+                df.columns = ["code", "name", "industry"]
+                return df
+        except Exception as e:
+            logger.warning(f"Tushare 获取股票列表失败: {e}")
+        return pd.DataFrame()
+
+    def get_index_constituents(self, index_code: str) -> List[str]:
+        """获取指数成分股列表（Tushare 实现）。"""
+        ts = self._get_ts()
+        norm = index_code.split(".")[0]
+        try:
+            df = ts.index_weight(index_code=norm)
+            if df is not None and not df.empty:
+                return df["con_code"].astype(str).tolist()
+        except Exception as e:
+            logger.warning(f"Tushare 获取指数成分股失败 ({index_code}): {e}")
+        return []
