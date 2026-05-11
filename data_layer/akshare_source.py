@@ -153,6 +153,16 @@ class AKShareDataSource(BaseDataSource):
         available_cols = [c for c in cols if c in df.columns]
         return df[available_cols].copy()
 
+    def _is_cache_fully_covered(
+        self, cached_df: pd.DataFrame, start_date: str, end_date: str
+    ) -> bool:
+        """判断缓存数据是否完全覆盖请求区间。"""
+        if cached_df.empty or "date" not in cached_df.columns:
+            return False
+        cached_min = str(cached_df["date"].min())
+        cached_max = str(cached_df["date"].max())
+        return cached_min <= str(start_date) and cached_max >= str(end_date)
+
     def get_bars(
         self,
         code: str,
@@ -166,22 +176,34 @@ class AKShareDataSource(BaseDataSource):
         ak_period = self._map_period(period)
         asset_type = self._detect_asset_type(code)
 
-        # 1. 尝试读本地缓存
+        # 1. 尝试读本地缓存（完整文件，用于覆盖范围检查）
+        cached_full = pd.DataFrame()
         if self.use_cache:
-            cached = self.storage.load_bars(norm_code, start_date, end_date, period=period)
-            if not cached.empty:
-                return cached
+            cached_full = self.storage.load_bars_raw(norm_code, period=period)
+            if self._is_cache_fully_covered(cached_full, start_date, end_date):
+                # 完全覆盖：返回过滤后的缓存
+                return self.storage.load_bars(norm_code, start_date, end_date, period=period)
 
-        # 2. 根据资产类型调用对应接口
+        # 2. 计算需要拉取的区间
+        # 若缓存部分覆盖，扩展区间以包含缓存已有数据，避免重复写入时丢失旧数据
+        fetch_start = start_date
+        fetch_end = end_date
+        if not cached_full.empty and "date" in cached_full.columns:
+            cached_min = str(cached_full["date"].min())
+            cached_max = str(cached_full["date"].max())
+            fetch_start = min(fetch_start, cached_min)
+            fetch_end = max(fetch_end, cached_max)
+
+        # 3. 根据资产类型调用对应接口拉取数据
         df = pd.DataFrame()
         if asset_type == "etf":
-            df = self._fetch_etf_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+            df = self._fetch_etf_bars(ak, norm_code, ak_period, fetch_start, fetch_end, adjust)
         elif asset_type == "index":
-            df = self._fetch_index_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+            df = self._fetch_index_bars(ak, norm_code, ak_period, fetch_start, fetch_end, adjust)
         else:
-            df = self._fetch_stock_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+            df = self._fetch_stock_bars(ak, norm_code, ak_period, fetch_start, fetch_end, adjust)
 
-        # 3. 分钟级 fallback（仅个股/ETF）
+        # 4. 分钟级 fallback（仅个股/ETF）
         if (df is None or df.empty) and period != "daily" and asset_type != "index":
             logger.warning(
                 f"AKShare 分钟数据获取失败 ({code}, {period})，"
@@ -193,13 +215,26 @@ class AKShareDataSource(BaseDataSource):
 
         df = self._standardize_df(df, norm_code, period)
         if df.empty:
+            # 网络拉取失败但有旧缓存：返回旧缓存的过滤结果（降级可用）
+            if not cached_full.empty:
+                logger.warning(
+                    f"AKShare 数据获取失败 ({code})，返回本地缓存的部分数据"
+                )
+                return self.storage.load_bars(norm_code, start_date, end_date, period=period)
             return pd.DataFrame()
 
-        # 4. 写缓存
+        # 5. 与缓存合并（如有）并写缓存
         if self.use_cache:
-            self.storage.save_bars(norm_code, df, period=period)
+            if not cached_full.empty:
+                combined = pd.concat([cached_full, df], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["date"], keep="last")
+                combined = combined.sort_values("date").reset_index(drop=True)
+                self.storage.save_bars(norm_code, combined, period=period)
+            else:
+                self.storage.save_bars(norm_code, df, period=period)
 
-        return df
+        # 6. 返回请求区间内的数据
+        return df[(df["date"] >= str(start_date)) & (df["date"] <= str(end_date))].copy() if not df.empty else pd.DataFrame()
 
     def _generate_mock_intraday_bars(
         self,

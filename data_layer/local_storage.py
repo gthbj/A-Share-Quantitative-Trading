@@ -44,6 +44,26 @@ class LocalStorage:
         else:
             df.to_csv(path, index=False)
 
+    def load_bars_raw(
+        self,
+        code: str,
+        period: str = "daily",
+        fmt: str = "parquet",
+    ) -> pd.DataFrame:
+        """读取单只股票K线数据的完整缓存（不做日期过滤）。
+
+        用于缓存覆盖范围检查，配合 load_bars 使用。
+        """
+        path = self._bar_path(code, period, fmt)
+        if not path.exists():
+            return pd.DataFrame()
+
+        if fmt == "parquet":
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path)
+        return df.reset_index(drop=True)
+
     def load_bars(
         self,
         code: str,

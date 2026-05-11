@@ -344,15 +344,33 @@ class BacktestEngine:
         )
         df["returns"] = df["nav"].pct_change().fillna(0)
         df["cumulative_returns"] = (1 + df["returns"]).cumprod() - 1
-        # 分钟级时间戳可能为 YYYYMMDDHHMM，根据长度区分解析
+        # 按字符串长度显式路由日期解析，避免 format + errors='coerce' 的未定义行为
         raw_dates = df["date"].astype(str)
-        df["date"] = pd.to_datetime(raw_dates, format="%Y%m%d%H%M", errors="coerce")
-        # 对解析失败的（日线 YYYYMMDD 或长度不足），fallback 到 YYYYMMDD 格式
-        mask = df["date"].isna()
-        if mask.any():
-            df.loc[mask, "date"] = pd.to_datetime(
-                raw_dates[mask].str.slice(0, 8), format="%Y%m%d", errors="coerce"
+        lengths = raw_dates.str.len()
+
+        # 初始化结果列为 NaT
+        df["date"] = pd.NaT
+
+        # 8 位：日线 YYYYMMDD
+        mask8 = lengths == 8
+        if mask8.any():
+            df.loc[mask8, "date"] = pd.to_datetime(
+                raw_dates[mask8], format="%Y%m%d", errors="coerce"
             )
+
+        # 12 位：分钟线 YYYYMMDDHHMM
+        mask12 = lengths == 12
+        if mask12.any():
+            df.loc[mask12, "date"] = pd.to_datetime(
+                raw_dates[mask12], format="%Y%m%d%H%M", errors="coerce"
+            )
+
+        # 异常长度：报错
+        invalid = ~(mask8 | mask12)
+        if invalid.any():
+            bad = raw_dates[invalid].iloc[0]
+            raise ValueError(f"无法识别的日期格式（长度既非8也非12）: {bad}")
+
         df.set_index("date", inplace=True)
         return df
 
