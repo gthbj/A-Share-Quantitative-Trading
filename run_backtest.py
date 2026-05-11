@@ -17,6 +17,7 @@ from analytics.metrics import calculate_metrics
 from analytics.plotter import Plotter
 from analytics.report import generate_html_report
 from data_layer.akshare_source import AKShareDataSource
+from data_layer.tushare_source import TushareDataSource
 from engine.backtest import BacktestEngine
 from strategy.base_strategy import BaseStrategy
 from utils.logger import setup_logging
@@ -50,7 +51,12 @@ def main() -> int:
     setup_logging(level=cfg.get("logging", {}).get("level", "INFO"))
 
     # 初始化数据源
-    data_source = AKShareDataSource()
+    data_cfg = cfg.get("data", {})
+    source_type = data_cfg.get("source", "akshare")
+    if source_type == "tushare":
+        data_source = TushareDataSource(token=data_cfg.get("tushare_token", ""))
+    else:
+        data_source = AKShareDataSource()
 
     # 解析策略类
     try:

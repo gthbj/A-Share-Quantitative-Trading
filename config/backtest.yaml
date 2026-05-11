@@ -29,8 +29,8 @@ execution:
 
 # 数据配置
 data:
-  source: "akshare"  # akshare | tushare | local
-  tushare_token: ""  # Tushare Pro Token（如使用Tushare）
+  source: "akshare"         # akshare | tushare | local
+  tushare_token: ""         # Tushare Pro Token（如使用 Tushare，需在 https://tushare.pro 注册获取）
   cache_dir: "data/raw"
   storage_format: "parquet"  # parquet | csv
 
