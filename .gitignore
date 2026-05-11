@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 运行时输出（保留目录结构示例，但不跟踪每次生成的结果）
+# output/report/*.png
+# output/report/*.html

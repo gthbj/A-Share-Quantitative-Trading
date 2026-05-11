@@ -63,8 +63,9 @@ def main() -> int:
         print(f"{args.strategy} 不是 BaseStrategy 的子类")
         return 1
 
-    # 确定频率
+    # 确定频率与止损配置
     frequency = args.frequency or cfg.get("backtest", {}).get("frequency", "daily")
+    stop_loss_cfg = cfg.get("stop_loss", {})
 
     # 运行回测
     engine = BacktestEngine(
@@ -75,6 +76,8 @@ def main() -> int:
         initial_capital=args.capital,
         benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
         frequency=frequency,
+        stop_loss_enabled=stop_loss_cfg.get("enabled", False),
+        stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
     )
     nav_df = engine.run()
 

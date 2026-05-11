@@ -78,7 +78,7 @@
 | 文件 | 职责 |
 |------|------|
 | `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 计算成交价（支持开盘价/收盘价模式，叠加滑点）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
-| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。 |
+| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。 |
 | `paper_trader.py` | **虚拟盘**。状态持久化到 `data/paper_state.json`，支持断点续跑。每日收盘后读取最新行情，更新持仓市值，可扩展为定时自动运行。 |
 
 **设计要点**：
@@ -86,6 +86,7 @@
 - 回测默认采用 **T+1 开盘价成交**（`price_type="next_open"`），避免未来函数（Lookahead Bias）。
 - 涨跌停判定基于 `prev_close` 与当日 `open` 计算，主板简化为 ±10%（实际可通过配置扩展科创板 ±20%、ST ±5%）。
 - 分钟级回测保持 T+1 以**交易日**为维度：当日买入的股票在当日剩余所有分钟内均不可卖，下一交易日开盘后解冻。
+- **全局止损**：引擎每日/每 Bar 在策略信号之后、撮合之前自动检查持仓浮亏。仅对 `sellable_qty > 0` 的仓位生效（T+1 当日买入不会被止），止损单以 `OrderType.MARKET` 发出，与策略订单一起进入 `TradeEngine` 按 A 股规则撮合。 |
 
 ---
 
@@ -224,6 +225,8 @@ context.order(code, target_qty - current_qty)
 - `trading.commission_rate`：佣金费率
 - `slippage.value`：滑点大小
 - `execution.price_type`：`next_open` 或 `current_close`
+- `stop_loss.enabled`：是否启用全局止损
+- `stop_loss.threshold`：止损阈值（如 `0.05` 表示浮亏达到 5% 触发）
 
 如需修改涨跌停幅度（如科创板 20%），编辑 `engine/trade_engine.py` 的 `_try_fill` 方法。
 

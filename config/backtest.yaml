@@ -34,6 +34,11 @@ data:
   cache_dir: "data/raw"
   storage_format: "parquet"  # parquet | csv
 
+# 止损配置
+stop_loss:
+  enabled: true          # 是否启用全局止损
+  threshold: 0.05        # 止损阈值：浮亏达到 5% 时触发（正数表示百分比）
+
 # 日志
 logging:
   level: "INFO"

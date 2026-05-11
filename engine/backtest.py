@@ -14,7 +14,7 @@ import pandas as pd
 
 from account.portfolio import Portfolio
 from data_layer.base_data_source import BaseDataSource
-from engine.trade_engine import Fill, Order, OrderSide, TradeEngine
+from engine.trade_engine import Fill, Order, OrderSide, OrderType, TradeEngine
 from strategy.base_strategy import BaseStrategy, Context
 from utils.calendar import TradingCalendar
 from utils.logger import get_logger
@@ -49,6 +49,8 @@ class BacktestEngine:
         benchmark: str = "000300.SH",
         trade_engine: Optional[TradeEngine] = None,
         frequency: str = "daily",
+        stop_loss_enabled: bool = False,
+        stop_loss_threshold: float = 0.05,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.data_source = data_source
@@ -58,10 +60,18 @@ class BacktestEngine:
         self.benchmark = benchmark
         self.trade_engine = trade_engine or TradeEngine()
         self.frequency = frequency
+        self.stop_loss_enabled = stop_loss_enabled
+        self.stop_loss_threshold = stop_loss_threshold
+
+        # 校验止损阈值
+        if self.stop_loss_enabled and self.stop_loss_threshold <= 0:
+            raise ValueError("stop_loss_threshold 必须为正数")
 
         self.calendar = TradingCalendar()
         self.records: List[DailyRecord] = []
         self.benchmark_df: Optional[pd.DataFrame] = None
+        # 待执行的止损队列：code -> qty，由前一日收盘后检查写入
+        self._stop_loss_pending: Dict[str, int] = {}
 
     def _is_intraday(self) -> bool:
         """判断当前是否为分钟级回测。"""
@@ -135,15 +145,17 @@ class BacktestEngine:
                         if not prow.empty:
                             today_bars[code]["prev_close"] = prow.iloc[0]["close"]
 
-            # 3. 开盘前
+            # 3. 开盘前（含上一日止损订单生成）
             portfolio.before_trading(date_str)
+            stop_loss_orders = self._generate_stop_loss_orders(portfolio)
             strategy.before_trading_start(context, today_bars)
 
             # 4. 盘中处理
             strategy.handle_data(context, today_bars)
 
-            # 5. 获取订单并撮合
+            # 5. 获取订单并撮合（策略订单 + 止损订单）
             orders = context.pop_orders()
+            orders.extend(stop_loss_orders)
             for order in orders:
                 if order.side == OrderSide.BUY:
                     price = today_bars.get(order.code, {}).get("open", 0.0)
@@ -161,7 +173,10 @@ class BacktestEngine:
             # 6. 收盘后
             strategy.after_trading_end(context, today_bars)
 
-            # 7. 记录净值
+            # 7. 收盘后止损检查
+            self._check_stop_loss(portfolio, today_bars, date_str)
+
+            # 8. 记录净值
             price_map = {code: bar["close"] for code, bar in today_bars.items()}
             nav = portfolio.total_value(price_map)
             self.records.append(
@@ -213,6 +228,9 @@ class BacktestEngine:
             if not sorted_times:
                 continue
 
+            # 上一日遗留的止损订单，仅在第一个 Bar 加入
+            pending_stop_loss_orders: List[Order] = []
+
             for t_idx, time_str in enumerate(sorted_times):
                 context.current_date = time_str
                 is_first_bar_of_day = t_idx == 0
@@ -240,13 +258,17 @@ class BacktestEngine:
                 # 开盘前（仅每天第一个 Bar）
                 if is_first_bar_of_day:
                     portfolio.before_trading(date_str)
+                    pending_stop_loss_orders = self._generate_stop_loss_orders(portfolio)
                     strategy.before_trading_start(context, current_bars)
 
                 # 盘中处理
                 strategy.handle_data(context, current_bars)
 
-                # 获取订单并撮合
+                # 获取订单并撮合（策略订单 + 上一日止损订单）
                 orders = context.pop_orders()
+                if is_first_bar_of_day:
+                    orders.extend(pending_stop_loss_orders)
+                    pending_stop_loss_orders = []
                 for order in orders:
                     if order.side == OrderSide.BUY:
                         price = current_bars.get(order.code, {}).get("open", 0.0)
@@ -264,6 +286,7 @@ class BacktestEngine:
                 # 收盘后（仅每天最后一个 Bar）
                 if is_last_bar_of_day:
                     strategy.after_trading_end(context, current_bars)
+                    self._check_stop_loss(portfolio, current_bars, date_str)
 
                 # 记录净值
                 price_map = {
@@ -332,3 +355,67 @@ class BacktestEngine:
             )
         df.set_index("date", inplace=True)
         return df
+
+    # ---------- 止损机制 ----------
+
+    def _check_stop_loss(
+        self,
+        portfolio: Portfolio,
+        bar_data: Dict[str, pd.Series],
+        date: str,
+    ) -> None:
+        """收盘后检查持仓浮亏，触发止损条件的记入待执行队列。
+
+        检查规则：
+        - 仅对 sellable_qty > 0 的持仓检查（T+1 当日买入不止损）
+        - 以当前收盘价计算 profit_ratio，若 < -threshold 则触发
+        - 触发后记录到 _stop_loss_pending，下一交易日开盘前生成订单
+        """
+        if not self.stop_loss_enabled:
+            return
+
+        for code, pos in portfolio.positions.items():
+            if pos.sellable_qty <= 0:
+                continue
+            bar = bar_data.get(code)
+            if bar is None:
+                continue
+            close_price = bar.get("close", 0.0)
+            if close_price <= 0:
+                continue
+            profit_ratio = pos.profit_ratio(close_price)
+            if profit_ratio < -self.stop_loss_threshold:
+                self._stop_loss_pending[code] = pos.sellable_qty
+                logger.info(
+                    f"{date} 止损触发: {code} "
+                    f"成本价={pos.cost_price:.2f} 收盘价={close_price:.2f} "
+                    f"浮亏={profit_ratio:.2%} 阈值={self.stop_loss_threshold:.2%} "
+                    f"计划卖出={pos.sellable_qty}股"
+                )
+
+    def _generate_stop_loss_orders(self, portfolio: Portfolio) -> List[Order]:
+        """根据待执行止损队列生成市价卖出订单，并清空队列。
+
+        在下一交易日开盘前调用，将前一日的止损计划转化为实际订单。
+        """
+        if not self.stop_loss_enabled or not self._stop_loss_pending:
+            return []
+
+        orders: List[Order] = []
+        for code, qty in list(self._stop_loss_pending.items()):
+            pos = portfolio.get_position(code)
+            if pos is not None and pos.sellable_qty > 0:
+                sell_qty = min(qty, pos.sellable_qty)
+                orders.append(
+                    Order(
+                        code=code,
+                        side=OrderSide.SELL,
+                        qty=sell_qty,
+                        order_type=OrderType.MARKET,
+                    )
+                )
+                logger.info(
+                    f"开盘前生成止损单: {code} 卖出 {sell_qty}股"
+                )
+            del self._stop_loss_pending[code]
+        return orders
