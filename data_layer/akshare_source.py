@@ -43,66 +43,91 @@ class AKShareDataSource(BaseDataSource):
         """统一代码格式，去除后缀用于 AKShare 查询。"""
         return code.split(".")[0]
 
-    def get_bars(
+    def _detect_asset_type(self, code: str) -> str:
+        """根据代码前缀判断资产类型：stock / etf / index。
+
+        规则：
+        - ETF：前缀为 15, 16, 51, 56, 58, 59
+        - 指数：前缀为 000, 399, 88 且后缀为 .SH 或 .SZ
+        - 个股：其他
+        """
+        norm = self._normalize_code(code)
+        if norm.startswith(("15", "16", "51", "56", "58", "59")):
+            return "etf"
+        if norm.startswith(("000", "399", "88")):
+            return "index"
+        return "stock"
+
+    def _fetch_stock_bars(
         self,
-        code: str,
+        ak,
+        norm_code: str,
+        ak_period: str,
         start_date: str,
         end_date: str,
-        period: str = "daily",
-        adjust: str = "qfq",
+        adjust: str,
     ) -> pd.DataFrame:
-        ak = self._get_ak()
-        norm_code = self._normalize_code(code)
+        """获取个股行情。"""
+        try:
+            return ak.stock_zh_a_hist(
+                symbol=norm_code,
+                period=ak_period,
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+        except Exception:
+            return pd.DataFrame()
 
-        # AKShare period 映射
-        ak_period = self._map_period(period)
+    def _fetch_etf_bars(
+        self,
+        ak,
+        norm_code: str,
+        ak_period: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+    ) -> pd.DataFrame:
+        """获取 ETF 行情。"""
+        try:
+            return ak.fund_etf_hist_em(
+                symbol=norm_code,
+                period=ak_period,
+                start_date=start_date,
+                end_date=end_date,
+                adjust=adjust,
+            )
+        except Exception:
+            return pd.DataFrame()
 
-        # 1. 尝试读本地缓存
-        if self.use_cache:
-            cached = self.storage.load_bars(norm_code, start_date, end_date, period=period)
-            if not cached.empty:
-                return cached
+    def _fetch_index_bars(
+        self,
+        ak,
+        norm_code: str,
+        ak_period: str,
+        start_date: str,
+        end_date: str,
+        adjust: str,
+    ) -> pd.DataFrame:
+        """获取指数行情。
 
-        # 2. 调用 AKShare 拉取
-        df = pd.DataFrame()
-        if period == "daily":
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=norm_code,
-                    period=ak_period,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-            except Exception:
-                pass
-        else:
-            # 分钟级：先尝试 AKShare 原生接口
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=norm_code,
-                    period=ak_period,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-            except Exception:
-                pass
+        注意：index_zh_a_hist 不支持 adjust 参数，若传入则忽略。
+        """
+        try:
+            return ak.index_zh_a_hist(
+                symbol=norm_code,
+                period=ak_period,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception:
+            return pd.DataFrame()
 
-            # 若 AKShare 返回空，fallback 到基于日K的模拟分钟数据（用于框架验证）
-            if df is None or df.empty:
-                logger.warning(
-                    f"AKShare 分钟数据获取失败 ({code}, {period})，"
-                    f"fallback 到基于日K的模拟分钟数据（仅用于框架逻辑验证，非真实行情）"
-                )
-                return self._generate_mock_intraday_bars(
-                    norm_code, start_date, end_date, period, adjust
-                )
-
+    def _standardize_df(self, df: pd.DataFrame, norm_code: str, period: str) -> pd.DataFrame:
+        """将 AKShare 返回的 DataFrame 标准化为统一格式。"""
         if df is None or df.empty:
             return pd.DataFrame()
 
-        # 列名标准化
         rename_map = {
             "日期": "date",
             "时间": "date",
@@ -116,18 +141,61 @@ class AKShareDataSource(BaseDataSource):
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         df["code"] = norm_code
 
-        # 分钟级数据时间格式处理：AKShare 分钟数据时间列通常为 "YYYY-MM-DD HH:MM:SS" 或 "HH:MM"
+        # 分钟级数据时间格式处理
         if period != "daily":
-            # 尝试将时间列统一格式化为 YYYYMMDDHHMM
             df["date"] = df["date"].astype(str).str.replace("-", "").str.replace(":", "").str.replace(" ", "")
-            # 保留前12位（YYYYMMDDHHMM），若更长则截断
             df["date"] = df["date"].str.slice(0, 12)
         else:
             df["date"] = df["date"].astype(str).str.replace("-", "")
 
-        df = df[["code", "date", "open", "high", "low", "close", "volume", "amount"]]
+        # 确保返回的列与个股一致
+        cols = ["code", "date", "open", "high", "low", "close", "volume", "amount"]
+        available_cols = [c for c in cols if c in df.columns]
+        return df[available_cols].copy()
 
-        # 3. 写缓存
+    def get_bars(
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        period: str = "daily",
+        adjust: str = "qfq",
+    ) -> pd.DataFrame:
+        ak = self._get_ak()
+        norm_code = self._normalize_code(code)
+        ak_period = self._map_period(period)
+        asset_type = self._detect_asset_type(code)
+
+        # 1. 尝试读本地缓存
+        if self.use_cache:
+            cached = self.storage.load_bars(norm_code, start_date, end_date, period=period)
+            if not cached.empty:
+                return cached
+
+        # 2. 根据资产类型调用对应接口
+        df = pd.DataFrame()
+        if asset_type == "etf":
+            df = self._fetch_etf_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+        elif asset_type == "index":
+            df = self._fetch_index_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+        else:
+            df = self._fetch_stock_bars(ak, norm_code, ak_period, start_date, end_date, adjust)
+
+        # 3. 分钟级 fallback（仅个股/ETF）
+        if (df is None or df.empty) and period != "daily" and asset_type != "index":
+            logger.warning(
+                f"AKShare 分钟数据获取失败 ({code}, {period})，"
+                f"fallback 到基于日K的模拟分钟数据（仅用于框架逻辑验证，非真实行情）"
+            )
+            return self._generate_mock_intraday_bars(
+                norm_code, start_date, end_date, period, adjust
+            )
+
+        df = self._standardize_df(df, norm_code, period)
+        if df.empty:
+            return pd.DataFrame()
+
+        # 4. 写缓存
         if self.use_cache:
             self.storage.save_bars(norm_code, df, period=period)
 
@@ -156,38 +224,13 @@ class AKShareDataSource(BaseDataSource):
         bars_per_day = {"1min": 240, "5min": 48, "15min": 16, "30min": 8, "60min": 4}.get(period, 240)
         interval_minutes = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60}.get(period, 1)
 
-        # 获取日K（优先本地缓存，fallback 到 AKShare）
-        daily_df = pd.DataFrame()
-        if self.use_cache:
-            daily_df = self.storage.load_bars(code, start_date, end_date, period="daily")
-
+        # 获取日K（通过 get_bars 自动路由到对应接口，支持 ETF/指数）
+        daily_df = self.get_bars(code, start_date, end_date, period="daily", adjust=adjust)
         if daily_df.empty:
-            try:
-                daily_df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                )
-            except Exception:
-                return pd.DataFrame()
-
-        if daily_df is None or daily_df.empty:
             return pd.DataFrame()
 
-        # 列名标准化
-        rename_map = {
-            "日期": "date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume",
-            "成交额": "amount",
-        }
-        daily_df = daily_df.rename(columns={k: v for k, v in rename_map.items() if k in daily_df.columns})
-        daily_df["date"] = daily_df["date"].astype(str).str.replace("-", "")
+        # 确保列名已标准化（get_bars 返回的已经是标准格式）
+        daily_df = daily_df.copy()
 
         all_bars = []
         rng = np.random.RandomState(42)  # 固定种子，保证可复现

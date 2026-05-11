@@ -27,7 +27,7 @@ class DoubleMAStrategy(BaseStrategy):
     def initialize(self, context: Context) -> None:
         super().initialize(context)
         # 演示：使用少量股票作为 universe
-        self.set_universe(["000001.SZ", "000002.SZ", "600000.SH"])
+        self.set_universe(["510300.SH"])
         context.user_data["holding"] = set()
 
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
