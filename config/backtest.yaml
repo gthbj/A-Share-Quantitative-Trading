@@ -29,10 +29,28 @@ execution:
 
 # 数据配置
 data:
-  source: "tushare"         # akshare | tushare | local
-  tushare_token: "9dd1e2dea4a9638565e54b77344a4f5bf50b1bd205892c9f080dad99"  # Tushare Pro Token
+  source: "maxcompute"      # 当前固定使用 MaxCompute；akshare/tushare 实现暂保留但不启用
   cache_dir: "data/raw"
   storage_format: "parquet"  # parquet | csv
+
+  # 本地缓存策略：MaxCompute SQL 查询计费，首次拉取后落盘，后续命中本地缓存
+  cache:
+    retention_days: 7        # 缓存文件保留时长（天），超过此期限的文件会被清理
+    max_size_gb: 1.0         # 缓存目录最大体积（GB），超过则按修改时间升序清理至阈值内
+
+  # 阿里云 MaxCompute（ODPS）数据源配置
+  # 敏感凭据（access_id / access_key）放在 config/secrets.yaml，不入 git
+  maxcompute:
+    endpoint: "http://service.cn-beijing.maxcompute.aliyun.com/api"
+    project: "a_share_historical_data"
+    # 表名与字段映射 —— 待补充
+    # 项目 a_share_historical_data 的具体表结构尚未确认，下列字段先留空，
+    # 由 MaxComputeDataSource 在调用时校验。详见 data_layer/maxcompute_source.py 的 TODO。
+    tables:
+      daily: ""                # 日K表名，例如 stock_daily
+      minute: ""               # 分钟K表名（可选），例如 stock_minute
+      stock_info: ""           # 股票基础信息表名，例如 stock_info
+      index_constituent: ""    # 指数成分股表名，例如 index_constituent
 
 # 止损配置
 stop_loss:

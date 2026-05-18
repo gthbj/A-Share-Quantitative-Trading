@@ -16,3 +16,6 @@ venv/
 # 运行时输出（保留目录结构示例，但不跟踪每次生成的结果）
 # output/report/*.png
 # output/report/*.html
+
+# 敏感配置（含 API Key 等凭据，禁止入库）
+config/secrets.yaml

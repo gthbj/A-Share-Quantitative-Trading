@@ -25,7 +25,7 @@
 │  Portfolio (资金) + Position (持仓/T+1)    │
 ├────────────────────────────────────────────┤
 │  Data Layer (数据层)                       │
-│  BaseDataSource → AKShareDataSource        │
+│  BaseDataSource → MaxComputeDataSource     │
 │  LocalStorage (Parquet/CSV 缓存)           │
 ├────────────────────────────────────────────┤
 │  Analytics & Utils (绩效与工具)            │
@@ -50,13 +50,16 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `akshare_source.py` | AKShare 免费数据源实现。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。自动将框架 `period` 映射为 AKShare 接口参数。 |
+| `maxcompute_source.py` | **当前默认数据源**。通过 pyodps 连接阿里云 MaxCompute（项目 `a_share_historical_data`，北京区 endpoint）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。**注意**：当前 SQL 查询逻辑为骨架，需补充项目中实际表结构（表名/字段名/代码格式/分区方式/复权方式）后才能产出数据，详见模块顶部 TODO。 |
+| `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
 
 **设计要点**：
 - 抽象接口隔离具体数据源，便于后续接入 Wind、Tushare Pro 等付费源。
 - 缓存策略为 **写时缓存**：首次从远程拉取后自动落盘，不预加载全量数据。
+- **缓存清理（MaxCompute 数据源专有）**：实例化时根据 `data.cache.retention_days` 与 `data.cache.max_size_gb` 自动清理过期或溢出的本地缓存文件，避免长期累积。
 - 分钟级数据时间列统一格式化为 `YYYYMMDDHHMM`（12位），便于按交易日前缀快速筛选。
+- **凭据隔离**：MaxCompute AccessKey 通过 `config/secrets.yaml`（已加入 `.gitignore`）或环境变量 `MAXCOMPUTE_ACCESS_ID` / `MAXCOMPUTE_ACCESS_KEY` 注入，不入仓库。
 
 ---
 
@@ -204,6 +207,32 @@ context.order(code, target_qty - current_qty)
 
 **绩效分析**：`metrics.py` 根据 `frequency` 自动选择年化系数（日线 252，1min 252×240），避免分钟级收益率使用日线年化系数导致指标失真。
 
+### 4.6 为什么默认数据源切换为 MaxCompute？
+
+历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选）。但 AKShare 接口稳定性差、有 IP 限流且分钟级数据被部分屏蔽；Tushare 的高频接口需要积分门槛。项目所有者已在阿里云 MaxCompute 中维护了 `a_share_historical_data` 项目作为权威历史行情源，因此将默认数据源切换为 MaxCompute。
+
+**实现要点**：
+- `MaxComputeDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
+- 连接懒加载，凭据通过 `config/secrets.yaml`（gitignored）或环境变量注入。
+- 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免 SQL 重复计费。
+- `akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 装载，以便后续按需切换。
+
+### 4.7 MaxCompute 表结构待补充清单
+
+> **当前状态**：`MaxComputeDataSource` 的 `_fetch_daily_bars` / `_fetch_minute_bars` / `get_stock_list` / `get_index_constituents` 均会抛出 `NotImplementedError`，提示需要补充以下信息才能产出数据。
+
+| 用途 | 配置键（`config/backtest.yaml`） | 待确认信息 |
+|------|----------------------------------|------------|
+| 日K | `data.maxcompute.tables.daily` | 表名；股票代码列名；日期列名与类型（STRING/DATE/DATETIME）；OHLCV 列名；股票代码格式（带后缀/裸代码）；分区字段；复权处理方式 |
+| 分钟K（可选） | `data.maxcompute.tables.minute` | 表名；period 字段；时间戳列格式；OHLCV 列名 |
+| 股票列表 | `data.maxcompute.tables.stock_info` | 表名；字段映射（code / name / list_date / industry） |
+| 指数成分股 | `data.maxcompute.tables.index_constituent` | 表名；字段映射（index_code / code） |
+
+补充上述信息后，需在 `data_layer/maxcompute_source.py` 的对应方法中：
+1. 在 `_fetch_daily_bars` / `_fetch_minute_bars` 中按实际字段名拼接 SQL；
+2. 将查询结果重命名为框架标准列 `[code, date, open, high, low, close, volume, amount]`；
+3. 在 `get_stock_list` / `get_index_constituents` 中同样填充 SQL 与列映射。
+
 ---
 
 ## 5. 扩展指南
@@ -211,7 +240,7 @@ context.order(code, target_qty - current_qty)
 ### 5.1 接入新数据源
 
 1. 继承 `BaseDataSource`，实现 `get_bars`、`get_stock_list`、`get_index_constituents`。
-2. 在 `run_backtest.py` 中替换 `AKShareDataSource()` 为你的实现。
+2. 在 `run_backtest.py` 中替换 `build_maxcompute_data_source()` 的调用为你的实现，或在 `data.source` 配置项基础上扩展分支。
 
 ### 5.2 添加新策略
 
@@ -239,8 +268,11 @@ context.order(code, target_qty - current_qty)
 | `run_backtest.py` | 入口 | CLI 命令行入口 |
 | `config/backtest.yaml` | 配置 | 回测参数与费率 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
-| `data_layer/akshare_source.py` | 实现 | AKShare 数据源 |
+| `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（默认） |
+| `data_layer/akshare_source.py` | 实现 | AKShare 数据源（保留备选） |
 | `data_layer/local_storage.py` | 工具 | 本地缓存读写 |
+| `config/secrets.yaml` | 配置 | MaxCompute 凭据，**不入 git** |
+| `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `account/portfolio.py` | 核心 | 虚拟账户 |
 | `account/position.py` | 核心 | 单股持仓（T+1） |
 | `engine/backtest.py` | 核心 | 回测引擎 |

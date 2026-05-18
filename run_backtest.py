@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,7 @@ import yaml
 from analytics.metrics import calculate_metrics
 from analytics.plotter import Plotter
 from analytics.report import generate_html_report
-from data_layer.akshare_source import AKShareDataSource
-from data_layer.tushare_source import TushareDataSource
+from data_layer.maxcompute_source import MaxComputeDataSource
 from engine.backtest import BacktestEngine
 from strategy.base_strategy import BaseStrategy
 from utils.logger import setup_logging
@@ -26,6 +26,46 @@ from utils.logger import setup_logging
 def load_config(config_path: str = "config/backtest.yaml") -> dict:
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def load_secrets(secrets_path: str = "config/secrets.yaml") -> dict:
+    """加载敏感配置（API key 等）。文件不存在则返回空 dict，由上层退化为环境变量。"""
+    p = Path(secrets_path)
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def build_maxcompute_data_source(cfg: dict) -> MaxComputeDataSource:
+    """根据 config + secrets + 环境变量构造 MaxCompute 数据源。
+
+    凭据优先级：环境变量 > secrets.yaml。
+    """
+    secrets = load_secrets()
+    data_cfg = cfg.get("data", {})
+    mc_cfg = data_cfg.get("maxcompute", {})
+    mc_secrets = secrets.get("maxcompute", {})
+
+    access_id = os.environ.get("MAXCOMPUTE_ACCESS_ID") or mc_secrets.get("access_id", "")
+    access_key = os.environ.get("MAXCOMPUTE_ACCESS_KEY") or mc_secrets.get("access_key", "")
+
+    if not access_id or not access_key:
+        raise RuntimeError(
+            "缺少 MaxCompute 凭据：请在 config/secrets.yaml 中配置 access_id / access_key，"
+            "或设置环境变量 MAXCOMPUTE_ACCESS_ID / MAXCOMPUTE_ACCESS_KEY。"
+        )
+
+    cache_cfg = data_cfg.get("cache", {})
+    return MaxComputeDataSource(
+        access_id=access_id,
+        access_key=access_key,
+        project=mc_cfg.get("project", ""),
+        endpoint=mc_cfg.get("endpoint", ""),
+        cache_retention_days=cache_cfg.get("retention_days", 7),
+        cache_max_size_gb=cache_cfg.get("max_size_gb", 1.0),
+        tables=mc_cfg.get("tables", {}),
+    )
 
 
 def resolve_strategy(strategy_path: str):
@@ -50,13 +90,12 @@ def main() -> int:
     cfg = load_config(args.config)
     setup_logging(level=cfg.get("logging", {}).get("level", "INFO"))
 
-    # 初始化数据源
-    data_cfg = cfg.get("data", {})
-    source_type = data_cfg.get("source", "akshare")
-    if source_type == "tushare":
-        data_source = TushareDataSource(token=data_cfg.get("tushare_token", ""))
-    else:
-        data_source = AKShareDataSource()
+    # 初始化数据源（当前固定使用 MaxCompute）
+    try:
+        data_source = build_maxcompute_data_source(cfg)
+    except RuntimeError as e:
+        print(str(e))
+        return 1
 
     # 解析策略类
     try:
