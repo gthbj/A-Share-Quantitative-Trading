@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -19,15 +19,25 @@ class DoubleMAStrategy(BaseStrategy):
     卖出信号：MA5 下穿 MA20（死叉）
     """
 
-    def __init__(self, short_window: int = 5, long_window: int = 20) -> None:
+    # 默认标的：沪深300 ETF（CLI 未指定时使用）
+    DEFAULT_UNIVERSE = ["510300.SH"]
+
+    def __init__(
+        self,
+        short_window: int = 5,
+        long_window: int = 20,
+        universe: Optional[List[str]] = None,
+    ) -> None:
         super().__init__()
         self.short_window = short_window
         self.long_window = long_window
+        # 通过构造函数注入 universe；为空时回退到默认
+        self._init_universe = list(universe) if universe else list(self.DEFAULT_UNIVERSE)
 
     def initialize(self, context: Context) -> None:
         super().initialize(context)
-        # 演示：使用少量股票作为 universe
-        self.set_universe(["510300.SH"])
+        self.set_universe(self._init_universe)
+        logger.info(f"策略 universe 已设置: {self._init_universe}")
 
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
         for code in self._universe:

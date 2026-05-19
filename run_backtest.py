@@ -79,6 +79,79 @@ def resolve_strategy(strategy_path: str):
     return getattr(module, class_name)
 
 
+# 上交所代码前缀（沪市主板 / 科创板 / ETF / LOF / 转债）
+_SH_PREFIXES = ("60", "68", "51", "56", "58", "11")
+# 深交所代码前缀（深市主板 / 创业板 / ETF / LOF）
+_SZ_PREFIXES = ("00", "30", "15", "16")
+
+
+def _normalize_code(raw: str) -> str:
+    """把用户输入归一化为框架代码格式 'XXXXXX.SH' / 'XXXXXX.SZ'。
+
+    支持的输入：
+      - '510300.SH' / '510300.sh'  → '510300.SH'
+      - '510300'                   → '510300.SH'（按前缀推断）
+      - '000001'                   → '000001.SZ'
+    """
+    s = raw.strip().upper()
+    if not s:
+        raise ValueError("代码为空")
+    if "." in s:
+        bare, _, suffix = s.partition(".")
+        if suffix not in ("SH", "SZ"):
+            raise ValueError(f"未知交易所后缀: {raw}（应为 .SH 或 .SZ）")
+        if not bare.isdigit() or len(bare) != 6:
+            raise ValueError(f"代码格式错误: {raw}（应为 6 位数字）")
+        return f"{bare}.{suffix}"
+    # 裸 6 位代码：按前缀推断
+    if not s.isdigit() or len(s) != 6:
+        raise ValueError(f"代码格式错误: {raw}（应为 6 位数字 + 可选 .SH/.SZ 后缀）")
+    if s.startswith(_SH_PREFIXES):
+        return f"{s}.SH"
+    if s.startswith(_SZ_PREFIXES):
+        return f"{s}.SZ"
+    raise ValueError(f"无法识别代码所属交易所: {raw}（请显式写明 .SH 或 .SZ）")
+
+
+def _parse_universe(raw: str) -> list:
+    """把逗号/空格分隔的字符串解析为代码列表，并归一化。"""
+    if not raw:
+        return []
+    parts = [p for p in raw.replace(",", " ").split() if p]
+    return [_normalize_code(p) for p in parts]
+
+
+def resolve_universe(cli_value: str, default: str = "510300.SH") -> list:
+    """确定本次回测的标的列表：
+
+      - CLI 提供了 --universe → 直接用
+      - 否则交互式提示用户输入（按回车使用默认值）
+    """
+    if cli_value:
+        codes = _parse_universe(cli_value)
+        if not codes:
+            raise ValueError("--universe 解析后为空")
+        return codes
+
+    print("\n" + "=" * 50)
+    print("请输入本次回测的标的（多个用逗号或空格分隔）")
+    print(f"示例: 510300.SH    或   510300.SH,510500.SH")
+    print(f"直接回车使用默认: {default}")
+    print("=" * 50)
+    try:
+        raw = input("标的代码: ").strip()
+    except EOFError:
+        raw = ""
+
+    if not raw:
+        codes = _parse_universe(default)
+    else:
+        codes = _parse_universe(raw)
+
+    print(f"→ 本次回测标的: {codes}\n")
+    return codes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="A股模拟量化交易回测")
     parser.add_argument("--strategy", required=True, help="策略类路径，如 strategy.double_ma.DoubleMAStrategy")
@@ -97,6 +170,12 @@ def main() -> int:
         help="可选的运行标签，加在时间戳后作为子目录后缀，例如 20260519_181500_doublema",
     )
     parser.add_argument("--frequency", default=None, help="回测频率：daily / 1min / 5min / 15min / 30min / 60min")
+    parser.add_argument(
+        "--universe",
+        default="",
+        help="回测标的代码（多个用逗号分隔，如 510300.SH,510500.SH）；"
+        "留空时会进入交互式询问",
+    )
     args = parser.parse_args()
 
     # 加载配置
@@ -119,6 +198,14 @@ def main() -> int:
 
     if not issubclass(strategy_cls, BaseStrategy):
         print(f"{args.strategy} 不是 BaseStrategy 的子类")
+        return 1
+
+    # 确定本次回测的标的（CLI > 交互式输入 > 默认值）
+    default_universe = ",".join(getattr(strategy_cls, "DEFAULT_UNIVERSE", ["510300.SH"]))
+    try:
+        universe = resolve_universe(args.universe, default=default_universe)
+    except ValueError as e:
+        print(f"标的解析失败: {e}")
         return 1
 
     # 确定频率与止损配置
@@ -153,6 +240,7 @@ def main() -> int:
         frequency=frequency,
         stop_loss_enabled=stop_loss_cfg.get("enabled", False),
         stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
+        strategy_kwargs={"universe": universe},
     )
     nav_df = engine.run()
 

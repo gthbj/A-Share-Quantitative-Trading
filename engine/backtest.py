@@ -51,6 +51,7 @@ class BacktestEngine:
         frequency: str = "daily",
         stop_loss_enabled: bool = False,
         stop_loss_threshold: float = 0.05,
+        strategy_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.data_source = data_source
@@ -62,6 +63,8 @@ class BacktestEngine:
         self.frequency = frequency
         self.stop_loss_enabled = stop_loss_enabled
         self.stop_loss_threshold = stop_loss_threshold
+        # 策略构造函数参数（如 universe / short_window / long_window 等）
+        self.strategy_kwargs: Dict[str, Any] = strategy_kwargs or {}
 
         # 校验止损阈值
         if self.stop_loss_enabled and self.stop_loss_threshold <= 0:
@@ -94,7 +97,7 @@ class BacktestEngine:
             current_date=trading_days[0].strftime("%Y%m%d"),
             frequency=self.frequency,
         )
-        strategy = self.strategy_cls()
+        strategy = self.strategy_cls(**self.strategy_kwargs)
         strategy.initialize(context)
         self.strategy_instance = strategy  # 暴露给外层（universe / docstring 用）
 
