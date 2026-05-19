@@ -36,6 +36,16 @@ def _fmt_int(v: float) -> str:
     return f"{int(v):,}"
 
 
+def _fmt_date(date_str: str) -> str:
+    """YYYYMMDDHHMM 或 YYYYMMDD → 可读日期字符串。"""
+    s = str(date_str)
+    if len(s) == 12:
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}"
+    if len(s) == 8:
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
 def _classify_excess(actual_annual: float, bench_total: float) -> str:
     """根据策略年化 vs 基准累计给出一句话评价。"""
     if actual_annual > bench_total:
@@ -43,6 +53,58 @@ def _classify_excess(actual_annual: float, bench_total: float) -> str:
     if actual_annual > 0:
         return "策略整体盈利，但未能跑赢基准买入持有"
     return "策略整体亏损，**显著跑输基准买入持有**"
+
+
+# ---------- 章节辅助函数 ----------
+
+
+def _fee_summary_section(trade_rows: Optional[List[Dict]]) -> str:
+    """生成费用汇总章节（Markdown 字符串）。"""
+    if not trade_rows:
+        return "## 七、费用汇总\n\n> 暂无成交记录。\n"
+    total_comm = sum(r["commission"] for r in trade_rows)
+    total_stamp = sum(r["stamp_duty"] for r in trade_rows)
+    total_transfer = sum(r["transfer_fee"] for r in trade_rows)
+    total_fee = total_comm + total_stamp + total_transfer
+    total_amount = sum(r["amount"] for r in trade_rows)
+    fee_rate = total_fee / total_amount if total_amount > 0 else 0.0
+    return f"""## 七、费用汇总
+
+| 费用类型 | 金额（元） |
+|---|---|
+| 佣金合计 | {total_comm:,.2f} |
+| 印花税合计 | {total_stamp:,.2f} |
+| 过户费合计 | {total_transfer:,.2f} |
+| **总交易费用** | **{total_fee:,.2f}** |
+| 成交金额合计 | {total_amount:,.2f} |
+| 综合费率 | {fee_rate:.4%} |"""
+
+
+def _trade_log_section(trade_rows: Optional[List[Dict]]) -> str:
+    """生成完整交易明细章节（Markdown 字符串）。"""
+    if not trade_rows:
+        return "## 八、交易明细\n\n> 暂无成交记录。\n"
+
+    header = (
+        "## 八、交易明细\n\n"
+        "| 时间 | 方向 | 代码 | 数量（股） | 成交价 | 成交金额 | 佣金 | 印花税 | 过户费 | 合计费用 |\n"
+        "|---|---|---|---|---|---|---|---|---|---|\n"
+    )
+    lines = [header]
+    for r in trade_rows:
+        lines.append(
+            f"| {_fmt_date(r['date'])} "
+            f"| {r['side']} "
+            f"| {r['code']} "
+            f"| {r['qty']:,} "
+            f"| {r['price']:.4f} "
+            f"| {r['amount']:,.2f} "
+            f"| {r['commission']:.2f} "
+            f"| {r['stamp_duty']:.2f} "
+            f"| {r['transfer_fee']:.2f} "
+            f"| {r['total_fee']:.2f} |\n"
+        )
+    return "".join(lines)
 
 
 # ---------- 主入口 ----------
@@ -65,6 +127,7 @@ def generate_markdown_summary(
     fills_buy_count: int,
     fills_sell_count: int,
     data_source_name: str = "MaxCompute",
+    trade_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     """生成 summary.md 文件，返回路径。"""
     output_dir = Path(output_dir)
@@ -111,7 +174,7 @@ def generate_markdown_summary(
 | 数据源 | {data_source_name} |
 | 项目 (project) | `{mc_cfg.get('project', '')}` |
 | 主表 (period={frequency}) | `{used_table or '(未配置)'}` |
-| 复权方式 | 暂未接入（使用原始价） |
+| 复权方式 | 前复权（qfq），从 `cn_etf_adj_factor` 即时计算 |
 
 ## 三、回测参数
 
@@ -166,9 +229,14 @@ def generate_markdown_summary(
 | 卖出成交笔数 | {fills_sell_count:,} |
 | 合计成交笔数 | {fills_buy_count + fills_sell_count:,} |
 
-## 七、产物清单
+{_fee_summary_section(trade_rows)}
 
-- `summary.md` — 本说明文件
+{_trade_log_section(trade_rows)}
+
+## 九、产物清单
+
+- `summary.md` — 本说明文件（含交易明细）
+- `trades.csv` — 完整成交流水（CSV 格式）
 - `report.html` — HTML 可视化报告
 - `cum_returns.png` — 策略 vs 基准累计收益曲线
 - `drawdown.png` — 回撤曲线

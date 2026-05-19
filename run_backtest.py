@@ -21,6 +21,7 @@ from analytics.report import generate_html_report
 from analytics.summary import generate_markdown_summary
 from data_layer.maxcompute_source import MaxComputeDataSource
 from engine.backtest import BacktestEngine
+from engine.backtest import DailyRecord
 from engine.trade_engine import OrderSide, TradeEngine
 from strategy.base_strategy import BaseStrategy
 from utils.logger import setup_logging
@@ -168,6 +169,23 @@ def main() -> int:
     print(f"夏普比率:   {metrics.sharpe_ratio:.2f}")
     print(f"{'='*40}\n")
 
+    # 提取全部成交流水（用于报告中的交易明细和费用汇总）
+    trade_rows = []
+    for record in engine.records:
+        for fill in record.fills:
+            trade_rows.append({
+                "date": record.date,
+                "side": "买入" if fill.side == OrderSide.BUY else "卖出",
+                "code": fill.code,
+                "qty": fill.qty,
+                "price": round(fill.price, 4),
+                "amount": round(fill.qty * fill.price, 2),
+                "commission": round(fill.commission, 2),
+                "stamp_duty": round(fill.stamp_duty, 2),
+                "transfer_fee": round(fill.transfer_fee, 2),
+                "total_fee": round(fill.total_cost, 2),
+            })
+
     # ── 输出目录：每次运行创建独立子目录，不覆盖历史 ──
     # 子目录命名：YYYYMMDD_HHMMSS[_run-name]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -183,6 +201,12 @@ def main() -> int:
 
     # HTML 报告
     report_path = generate_html_report(metrics, output_dir=str(out))
+
+    # 保存完整成交流水 CSV
+    if trade_rows:
+        import pandas as _pd
+        trades_df = _pd.DataFrame(trade_rows)
+        trades_df.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
 
     # Markdown 说明文件（策略 / 数据 / 参数 / 绩效）
     buy_count = sum(
@@ -208,6 +232,7 @@ def main() -> int:
         fills_buy_count=buy_count,
         fills_sell_count=sell_count,
         data_source_name="阿里云 MaxCompute",
+        trade_rows=trade_rows,
     )
 
     print(f"输出目录: {out}")

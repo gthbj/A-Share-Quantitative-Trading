@@ -247,24 +247,155 @@ class MaxComputeDataSource(BaseDataSource):
                 m = 1
         return result
 
+    # ------------------------------------------------------------------ #
+    # 复权支持
+    # ------------------------------------------------------------------ #
+
+    def _adj_cache_path(self, norm_code: str) -> Path:
+        """复权因子本地缓存路径：data/raw/daily/{code}_adj.parquet。"""
+        return self._cache_root() / "daily" / f"{norm_code}_adj.parquet"
+
+    def _fetch_adjust_factors(
+        self, code: str, start_date: str, end_date: str
+    ) -> pd.DataFrame:
+        """从 cn_etf_adj_factor 拉取复权因子，返回 DataFrame[date(YYYYMMDD), adj_factor]。
+
+        表结构假设（基于阿里云 MaxCompute ETF 复权因子表惯例）：
+          code STRING, trade_date STRING, adj_factor DOUBLE, year_month STRING(partition)
+        adj_factor 为累计后复权因子（上市日=1.0，随分红/拆股增大）。
+        """
+        norm_code = code.split(".")[0]
+
+        # ── 本地缓存优先 ──
+        if self.use_cache:
+            adj_path = self._adj_cache_path(norm_code)
+            if adj_path.exists():
+                try:
+                    cached = pd.read_parquet(adj_path)
+                    if not cached.empty and "date" in cached.columns:
+                        cmin = str(cached["date"].min())
+                        cmax = str(cached["date"].max())
+                        if cmin <= str(start_date) and cmax >= str(end_date):
+                            mask = (cached["date"] >= str(start_date)) & (
+                                cached["date"] <= str(end_date)
+                            )
+                            return cached.loc[mask].copy().reset_index(drop=True)
+                except Exception as e:
+                    logger.warning(f"复权因子缓存读取失败: {e}")
+
+        # ── MaxCompute 查询 ──
+        table = self._require_table("adjust_factor")
+        year_months = self._year_months_in_range(start_date, end_date)
+        if not year_months:
+            return pd.DataFrame()
+
+        ym_list = ", ".join(f"'{ym}'" for ym in year_months)
+        sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+        ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+        sql = (
+            f"SELECT code, trade_date, adj_factor\n"
+            f"FROM {table}\n"
+            f"WHERE code = '{code}'\n"
+            f"  AND year_month IN ({ym_list})\n"
+            f"  AND trade_date >= '{sd}'\n"
+            f"  AND trade_date <= '{ed}'\n"
+            f"ORDER BY trade_date"
+        )
+        df = self._execute_sql(sql)
+        if df.empty:
+            return df
+
+        df["date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y%m%d")
+        df["adj_factor"] = df["adj_factor"].astype(float)
+        result = df[["date", "adj_factor"]].copy().sort_values("date").reset_index(drop=True)
+
+        # ── 写缓存 ──
+        if self.use_cache:
+            try:
+                adj_path = self._adj_cache_path(norm_code)
+                adj_path.parent.mkdir(parents=True, exist_ok=True)
+                if adj_path.exists():
+                    existing = pd.read_parquet(adj_path)
+                    merged = pd.concat([existing, result], ignore_index=True)
+                    merged = merged.drop_duplicates(subset=["date"], keep="last")
+                    merged = merged.sort_values("date").reset_index(drop=True)
+                    merged.to_parquet(adj_path, index=False)
+                else:
+                    result.to_parquet(adj_path, index=False)
+            except Exception as e:
+                logger.warning(f"复权因子缓存写入失败: {e}")
+
+        return result
+
     def _apply_adjust(
         self, df: pd.DataFrame, code: str, adjust: Optional[str]
     ) -> pd.DataFrame:
-        """复权占位。
+        """前/后复权：从 cn_etf_adj_factor 获取因子并调整 OHLC 列。
 
-        当前 MaxCompute 数据源尚未接入复权因子表（config: tables.adjust_factor），
-        本方法**直接返回原始价**，仅在 adjust ∈ {qfq, hfq} 时打 WARNING 日志。
+        前复权（qfq）：调整历史价格，使最新收盘价与原始价一致。
+            adj_price = raw_price * adj_factor_on_date / adj_factor_latest
 
-        后续复权表 PRD 落地时，此方法需扩展为：
-          1. 从 tables.adjust_factor 查询 code + 日期范围的 adj_factor
-          2. 按前/后复权公式对 OHLC 列做比例调整
+        后复权（hfq）：以上市日价格为基准，历史价向上调整。
+            adj_price = raw_price * adj_factor_on_date
         """
-        if adjust in ("qfq", "hfq"):
+        if adjust not in ("qfq", "hfq") or df.empty:
+            return df
+
+        raw_dates = df["date"].astype(str)
+        first_date = raw_dates.iloc[0]
+        is_minute = len(first_date) == 12  # YYYYMMDDHHMM vs YYYYMMDD
+
+        if is_minute:
+            day_series = raw_dates.str[:8]
+        else:
+            day_series = raw_dates
+
+        start_day = day_series.min()
+        end_day = day_series.max()
+
+        try:
+            adj_df = self._fetch_adjust_factors(code, start_day, end_day)
+        except NotImplementedError:
             logger.warning(
-                f"当前 MaxCompute 数据源未接入复权表，code={code} adjust={adjust}，"
-                f"返回原始价（待复权因子表接入后修正）"
+                f"复权因子表未配置（adjust_factor 为空），code={code} adjust={adjust}，"
+                f"返回原始价"
             )
-        return df
+            return df
+        except Exception as e:
+            logger.warning(f"复权因子获取失败，使用原始价: code={code}, error={e}")
+            return df
+
+        if adj_df.empty:
+            logger.warning(f"未获取到复权因子数据，使用原始价: code={code} adjust={adjust}")
+            return df
+
+        adj_df = adj_df.sort_values("date").reset_index(drop=True)
+        latest_factor = float(adj_df["adj_factor"].iloc[-1])
+
+        temp = df.copy()
+        temp["_day"] = day_series.values
+        temp = temp.merge(
+            adj_df.rename(columns={"date": "_day"}),
+            on="_day",
+            how="left",
+        )
+        # 节假日可能无因子：前向填充后后向填充
+        temp["adj_factor"] = temp["adj_factor"].ffill().bfill().astype(float)
+
+        if adjust == "qfq":
+            ratio = temp["adj_factor"] / latest_factor
+        else:  # hfq
+            ratio = temp["adj_factor"]
+
+        for col in ("open", "high", "low", "close"):
+            if col in temp.columns:
+                temp[col] = (temp[col] * ratio).round(4)
+
+        logger.info(
+            f"复权完成: code={code} adjust={adjust} bars={len(temp)} "
+            f"latest_factor={latest_factor:.6f}"
+        )
+        return temp.drop(columns=["_day", "adj_factor"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------ #
     # BaseDataSource 接口实现
@@ -280,18 +411,19 @@ class MaxComputeDataSource(BaseDataSource):
     ) -> pd.DataFrame:
         norm_code = code.split(".")[0]
 
-        # 1) 本地缓存优先
+        # 1) 本地缓存优先（缓存存储原始价，复权在读取后即时计算）
         if self.use_cache:
             cached_full = self.storage.load_bars_raw(norm_code, period=period)
             if not cached_full.empty and "date" in cached_full.columns:
                 cmin = str(cached_full["date"].min())
                 cmax = str(cached_full["date"].max())
                 if cmin <= str(start_date) and cmax >= str(end_date):
-                    return self.storage.load_bars(
+                    df = self.storage.load_bars(
                         norm_code, start_date, end_date, period=period
                     )
+                    return self._apply_adjust(df, code, adjust)
 
-        # 2) 路由
+        # 2) 路由（拉取原始价，不传 adjust）
         if period == "daily":
             df = self._fetch_daily_bars(code, start_date, end_date, adjust)
         elif period in ("1min", "5min", "15min", "30min", "60min"):
@@ -302,10 +434,7 @@ class MaxComputeDataSource(BaseDataSource):
         if df.empty:
             return df
 
-        # 3) 复权（当前为占位，仅 warning）
-        df = self._apply_adjust(df, code, adjust)
-
-        # 4) 写缓存（用裸代码作为缓存键，与既有约定一致）
+        # 3) 写缓存（存原始价，复权因子另存）
         if self.use_cache:
             existing = self.storage.load_bars_raw(norm_code, period=period)
             if not existing.empty:
@@ -316,9 +445,10 @@ class MaxComputeDataSource(BaseDataSource):
             else:
                 self.storage.save_bars(norm_code, df, period=period)
 
-        # 5) 按请求区间过滤后返回
+        # 4) 按请求区间过滤，施加复权，返回
         mask = (df["date"] >= str(start_date)) & (df["date"] <= str(end_date) + "9999")
-        return df.loc[mask].copy()
+        df_filtered = df.loc[mask].copy()
+        return self._apply_adjust(df_filtered, code, adjust)
 
     def get_stock_list(self) -> pd.DataFrame:
         """从 5min 表派生股票列表（SELECT DISTINCT code, name）。

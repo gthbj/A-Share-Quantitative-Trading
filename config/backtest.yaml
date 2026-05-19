@@ -51,7 +51,7 @@ data:
       # —— 已建表（已接入）——
       kline_5min: "cn_stock_kline_5min"
       # —— 复权因子表（接口已预留，待复权 PRD 接入）——
-      adjust_factor: ""
+      adjust_factor: "cn_etf_adj_factor"
       # —— 以下表尚未建立，对应 period 调用会抛 NotImplementedError ——
       daily: ""                # 日K表
       kline_1min: ""           # 1 分钟K表
