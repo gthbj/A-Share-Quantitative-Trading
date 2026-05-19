@@ -1,0 +1,26 @@
+# 双均线策略实验包配置
+#
+# 用法：python run_backtest.py --preset double_ma
+# CLI 参数（--start / --end / --universe / --capital 等）会覆盖本文件的对应字段。
+
+# ── 元信息 ──
+name: "double_ma"
+class: "strategy.double_ma.DoubleMAStrategy"
+description: "MA5/MA20 双均线交叉策略，金叉买入、死叉卖出，附带 5% 止损。"
+
+# ── 策略构造参数（传给 DoubleMAStrategy.__init__）──
+params:
+  short_window: 5
+  long_window: 20
+  universe:
+    - "510300.SH"   # 沪深300 ETF
+
+# ── 推荐回测区间与频率 ──
+backtest:
+  start_date: "20160101"
+  end_date: "20251231"
+  frequency: "15min"
+  initial_capital: 1000000
+  benchmark: "000300.SH"
+
+# ── 备注：止损/滑点等市场级参数继承自全局 config/backtest.yaml ──

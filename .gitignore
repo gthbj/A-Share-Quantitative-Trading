@@ -13,8 +13,12 @@ venv/
 .vscode/
 .idea/
 
-# 运行时输出：每次回测在 output/ 下创建 YYYYMMDD_HHMMSS[_label]/ 子目录，不入库
+# 运行时输出：每次回测会落到以下两处之一，默认都不入库
+#   - 旧路径（无 --preset 时的兜底）：output/{timestamp}/
+#   - 新路径（--preset 模式）：strategy/{name}/runs/{timestamp}/
+# 如需长期保留某次回测，用 `git add -f` 强制收录具体文件即可。
 output/
+strategy/*/runs/
 
 # 敏感配置（含 API Key 等凭据，禁止入库）
 config/secrets.yaml

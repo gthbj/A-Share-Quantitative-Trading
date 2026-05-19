@@ -79,6 +79,27 @@ def resolve_strategy(strategy_path: str):
     return getattr(module, class_name)
 
 
+def load_strategy_preset(preset_name: str) -> dict:
+    """加载 strategy/{name}/config.yaml，作为该策略实验包的默认配置。
+
+    返回 dict 结构示例:
+        {
+            "name": "double_ma",
+            "class": "strategy.double_ma.DoubleMAStrategy",
+            "params": {"short_window": 5, "long_window": 20, "universe": [...]},
+            "backtest": {"start_date": "20160101", "frequency": "15min", ...},
+        }
+    """
+    path = Path("strategy") / preset_name / "config.yaml"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"策略 preset 不存在: {path}\n"
+            f"可用 preset 位于 strategy/<name>/config.yaml；当前可用列表请看 strategy/ 目录。"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
 # 上交所代码前缀（沪市主板 / 科创板 / ETF / LOF / 转债）
 _SH_PREFIXES = ("60", "68", "51", "56", "58", "11")
 # 深交所代码前缀（深市主板 / 创业板 / ETF / LOF）
@@ -154,15 +175,26 @@ def resolve_universe(cli_value: str, default: str = "510300.SH") -> list:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="A股模拟量化交易回测")
-    parser.add_argument("--strategy", required=True, help="策略类路径，如 strategy.double_ma.DoubleMAStrategy")
-    parser.add_argument("--start", default="20210101", help="回测起始日期 YYYYMMDD")
-    parser.add_argument("--end", default="20231231", help="回测结束日期 YYYYMMDD")
-    parser.add_argument("--capital", type=float, default=1_000_000, help="初始资金")
-    parser.add_argument("--config", default="config/backtest.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--preset",
+        default=None,
+        help="策略实验包名称（对应 strategy/<name>/config.yaml）。"
+        "指定后会加载该 preset 作为默认值；其他 CLI 参数仍可覆盖。",
+    )
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        help="策略类路径，如 strategy.double_ma.DoubleMAStrategy。"
+        "如使用 --preset 则可省略（会从 preset 中读取）。",
+    )
+    parser.add_argument("--start", default=None, help="回测起始日期 YYYYMMDD（默认从 preset 或 20210101）")
+    parser.add_argument("--end", default=None, help="回测结束日期 YYYYMMDD（默认从 preset 或 20231231）")
+    parser.add_argument("--capital", type=float, default=None, help="初始资金（默认从 preset 或 1,000,000）")
+    parser.add_argument("--config", default="config/backtest.yaml", help="全局配置文件路径")
     parser.add_argument(
         "--output",
-        default="output",
-        help="报告输出根目录；每次运行会在其下创建带时间戳的子目录 YYYYMMDD_HHMMSS/",
+        default=None,
+        help="报告输出根目录。默认逻辑：--preset 模式 → strategy/<name>/runs/，否则 → output/",
     )
     parser.add_argument(
         "--run-name",
@@ -174,13 +206,29 @@ def main() -> int:
         "--universe",
         default="",
         help="回测标的代码（多个用逗号分隔，如 510300.SH,510500.SH）；"
-        "留空时会进入交互式询问",
+        "留空时优先用 preset 里的 universe，否则进入交互式询问",
     )
     args = parser.parse_args()
 
-    # 加载配置
+    # 加载全局配置
     cfg = load_config(args.config)
     setup_logging(level=cfg.get("logging", {}).get("level", "INFO"))
+
+    # ── 加载 preset（若指定）──
+    preset_cfg: dict = {}
+    if args.preset:
+        try:
+            preset_cfg = load_strategy_preset(args.preset)
+            print(f"已加载 preset: {args.preset} ({preset_cfg.get('description', '')})")
+        except FileNotFoundError as e:
+            print(str(e))
+            return 1
+
+    # ── 确定策略类路径（CLI --strategy > preset.class）──
+    strategy_path = args.strategy or preset_cfg.get("class")
+    if not strategy_path:
+        print("错误：必须指定 --strategy 或 --preset 之一")
+        return 1
 
     # 初始化数据源（当前固定使用 MaxCompute）
     try:
@@ -191,25 +239,51 @@ def main() -> int:
 
     # 解析策略类
     try:
-        strategy_cls = resolve_strategy(args.strategy)
+        strategy_cls = resolve_strategy(strategy_path)
     except Exception as e:
         print(f"策略加载失败: {e}")
         return 1
 
     if not issubclass(strategy_cls, BaseStrategy):
-        print(f"{args.strategy} 不是 BaseStrategy 的子类")
+        print(f"{strategy_path} 不是 BaseStrategy 的子类")
         return 1
 
-    # 确定本次回测的标的（CLI > 交互式输入 > 默认值）
-    default_universe = ",".join(getattr(strategy_cls, "DEFAULT_UNIVERSE", ["510300.SH"]))
-    try:
-        universe = resolve_universe(args.universe, default=default_universe)
-    except ValueError as e:
-        print(f"标的解析失败: {e}")
-        return 1
+    # ── 确定 universe（CLI > preset.params.universe > 类默认 / 交互式）──
+    preset_params = preset_cfg.get("params", {}) or {}
+    preset_universe = preset_params.get("universe", [])
+    if args.universe:
+        try:
+            universe = _parse_universe(args.universe)
+        except ValueError as e:
+            print(f"--universe 解析失败: {e}")
+            return 1
+    elif preset_universe:
+        try:
+            universe = [_normalize_code(c) for c in preset_universe]
+        except ValueError as e:
+            print(f"preset 中 universe 解析失败: {e}")
+            return 1
+        print(f"使用 preset 标的: {universe}")
+    else:
+        default_universe = ",".join(getattr(strategy_cls, "DEFAULT_UNIVERSE", ["510300.SH"]))
+        try:
+            universe = resolve_universe("", default=default_universe)
+        except ValueError as e:
+            print(f"标的解析失败: {e}")
+            return 1
 
-    # 确定频率与止损配置
-    frequency = args.frequency or cfg.get("backtest", {}).get("frequency", "daily")
+    # ── 确定回测参数（CLI > preset.backtest > 全局 cfg.backtest > 内置默认）──
+    preset_bt = preset_cfg.get("backtest", {}) or {}
+    global_bt = cfg.get("backtest", {}) or {}
+    start_date = args.start or preset_bt.get("start_date") or global_bt.get("start_date", "20210101")
+    end_date = args.end or preset_bt.get("end_date") or global_bt.get("end_date", "20231231")
+    capital = args.capital or preset_bt.get("initial_capital") or global_bt.get("initial_capital", 1_000_000)
+    frequency = (
+        args.frequency
+        or preset_bt.get("frequency")
+        or global_bt.get("frequency", "daily")
+    )
+    benchmark = preset_bt.get("benchmark") or global_bt.get("benchmark", "000300.SH")
     stop_loss_cfg = cfg.get("stop_loss", {})
 
     # 用配置文件构造撮合引擎（佣金/印花税/滑点/撮合规则等）
@@ -228,19 +302,23 @@ def main() -> int:
         price_type=exec_cfg.get("price_type", "next_open"),
     )
 
+    # 策略构造参数：preset.params 里除 universe 之外的字段透传给策略构造函数
+    strategy_kwargs = {k: v for k, v in preset_params.items() if k != "universe"}
+    strategy_kwargs["universe"] = universe
+
     # 运行回测
     engine = BacktestEngine(
         strategy_cls=strategy_cls,
         data_source=data_source,
-        start_date=args.start,
-        end_date=args.end,
-        initial_capital=args.capital,
-        benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=capital,
+        benchmark=benchmark,
         trade_engine=trade_engine,
         frequency=frequency,
         stop_loss_enabled=stop_loss_cfg.get("enabled", False),
         stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
-        strategy_kwargs={"universe": universe},
+        strategy_kwargs=strategy_kwargs,
     )
     nav_df = engine.run()
 
@@ -275,10 +353,17 @@ def main() -> int:
             })
 
     # ── 输出目录：每次运行创建独立子目录，不覆盖历史 ──
-    # 子目录命名：YYYYMMDD_HHMMSS[_run-name]
+    # 优先级：--output > strategy/<preset>/runs/（preset 模式）> output/（兜底）
+    if args.output:
+        output_root = Path(args.output)
+    elif args.preset:
+        output_root = Path("strategy") / args.preset / "runs"
+    else:
+        output_root = Path("output")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_label = timestamp if not args.run_name else f"{timestamp}_{args.run_name}"
-    out = Path(args.output) / run_label
+    out = output_root / run_label
     out.mkdir(parents=True, exist_ok=True)
 
     # 可视化
@@ -307,14 +392,14 @@ def main() -> int:
     summary_path = generate_markdown_summary(
         output_dir=out,
         metrics=metrics,
-        strategy_class_path=args.strategy,
+        strategy_class_path=strategy_path,
         strategy_doc=(strategy_inst.__class__.__doc__ or "") if strategy_inst else "",
         universe=strategy_inst.get_universe() if strategy_inst else [],
-        start_date=args.start,
-        end_date=args.end,
-        initial_capital=args.capital,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=capital,
         frequency=frequency,
-        benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
+        benchmark=benchmark,
         config=cfg,
         nav_records_count=len(nav_df),
         fills_buy_count=buy_count,
