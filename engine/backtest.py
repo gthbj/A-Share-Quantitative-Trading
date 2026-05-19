@@ -90,6 +90,7 @@ class BacktestEngine:
             portfolio=portfolio,
             data_source=self.data_source,
             current_date=trading_days[0].strftime("%Y%m%d"),
+            frequency=self.frequency,
         )
         strategy = self.strategy_cls()
         strategy.initialize(context)
@@ -101,8 +102,9 @@ class BacktestEngine:
             f"区间={self.start_date}~{self.end_date}, 频率={self.frequency}"
         )
 
-        # 预加载所有行情数据
+        # 预加载所有行情数据，并注入到 Context（get_price 优先查内存）
         all_bars = self._preload_bars(universe, trading_days)
+        context.all_bars = all_bars
         self.benchmark_df = self._load_benchmark(trading_days)
 
         if self._is_intraday():
@@ -273,7 +275,10 @@ class BacktestEngine:
                     if order.side == OrderSide.BUY:
                         price = current_bars.get(order.code, {}).get("open", 0.0)
                         if price > 0:
-                            est_amount = order.qty * price
+                            # 预留金额不超过可用现金（策略用 close 算量，open 可能略高）
+                            est_amount = min(
+                                order.qty * price, portfolio.available_cash
+                            )
                             ok = portfolio.reserve_cash(est_amount)
                             if not ok:
                                 order.qty = 0

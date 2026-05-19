@@ -6,7 +6,7 @@ backtest:
   end_date: "20231231"
   initial_capital: 1000000  # 初始资金：100万人民币
   benchmark: "000300.SH"   # 沪深300
-  frequency: "daily"       # 回测频率：daily / 1min / 5min / 15min / 30min / 60min
+  frequency: "15min"       # 回测频率：daily / 1min / 5min / 15min / 30min / 60min
 
 # 交易费率
 trading:
@@ -43,14 +43,24 @@ data:
   maxcompute:
     endpoint: "http://service.cn-beijing.maxcompute.aliyun.com/api"
     project: "a_share_historical_data"
-    # 表名与字段映射 —— 待补充
-    # 项目 a_share_historical_data 的具体表结构尚未确认，下列字段先留空，
-    # 由 MaxComputeDataSource 在调用时校验。详见 data_layer/maxcompute_source.py 的 TODO。
+    # 表名映射
+    # 项目 a_share_historical_data 目前仅 cn_stock_kline_5min 一张表已建立，其余周期/
+    # 元信息/指数成分股表待后续 PRD 建立。未配置（空字符串）的项在被调用时会抛出
+    # NotImplementedError，错误信息会明确指出对应 key。
     tables:
-      daily: ""                # 日K表名，例如 stock_daily
-      minute: ""               # 分钟K表名（可选），例如 stock_minute
-      stock_info: ""           # 股票基础信息表名，例如 stock_info
-      index_constituent: ""    # 指数成分股表名，例如 index_constituent
+      # —— 已建表（已接入）——
+      kline_5min: "cn_stock_kline_5min"
+      # —— 复权因子表（接口已预留，待复权 PRD 接入）——
+      adjust_factor: ""
+      # —— 以下表尚未建立，对应 period 调用会抛 NotImplementedError ——
+      daily: ""                # 日K表
+      kline_1min: ""           # 1 分钟K表
+      kline_etf_15min: "cn_etf_kline_15min"  # ETF 15min K 表（代码格式为框架格式 XXXXXX.SH）
+      kline_15min: ""          # 15 分钟K表（普通股票，待建）
+      kline_30min: ""          # 30 分钟K表
+      kline_60min: ""          # 60 分钟K表
+      stock_info: ""           # 股票基础信息表（若空，get_stock_list 会从 5min 表派生）
+      index_constituent: ""    # 指数成分股表（若空，get_index_constituents 返回空列表）
 
 # 止损配置
 stop_loss:

@@ -48,8 +48,15 @@ class Portfolio:
     # ---------- 每日更新 ----------
 
     def before_trading(self, date: str) -> None:
-        """每日开盘前调用：解冻 T+1 持仓。"""
+        """每日开盘前调用：释放前日未用冻结资金 + 解冻 T+1 持仓。
+
+        冻结资金（frozen_cash）是当日买入预留的估算金额。成交后
+        apply_buy_fill 只扣实际成交额，剩余部分留在 frozen_cash。
+        下一交易日开盘前统一释放回 available_cash，避免资金隐性丢失。
+        """
         self.current_date = date
+        # 释放前日剩余冻结资金（未成交 / 超额预留部分）回可用现金
+        self.available_cash += self.frozen_cash
         self.frozen_cash = 0.0
         for pos in self.positions.values():
             pos.update_sellable(date)

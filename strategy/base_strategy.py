@@ -29,6 +29,10 @@ class Context:
     portfolio: Portfolio
     data_source: BaseDataSource
     current_date: str
+    # 回测频率：daily / 1min / 5min / 15min / 30min / 60min
+    frequency: str = "daily"
+    # 引擎预加载的全量行情（注入后 get_price 直接查内存，不再查数据源）
+    all_bars: Dict[str, pd.DataFrame] = field(default_factory=dict, repr=False)
     # 私有：待处理订单队列
     _orders: List[Order] = field(default_factory=list, repr=False)
     # 用户可存储自定义状态
@@ -63,8 +67,21 @@ class Context:
     # ---------- 数据查询接口 ----------
 
     def get_price(self, code: str, count: int = 20) -> pd.DataFrame:
-        """获取最近 N 根 Bar 的历史行情。"""
-        # 计算日期范围：向前取 count*1.5 个自然日，再过滤 Bar
+        """获取最近 N 根 Bar 的历史行情（截至 current_date，含当前 Bar）。
+
+        优先使用引擎预加载的 all_bars（内存查询，无额外 IO）。
+        若 all_bars 未注入（如单元测试），则降级为直接查询数据源。
+        """
+        # 优先路径：引擎预加载数据（日线与分钟级回测均可用）
+        if self.all_bars and code in self.all_bars:
+            df = self.all_bars[code]
+            # current_date 格式：YYYYMMDD（日线）或 YYYYMMDDHHMM（分钟级）
+            # 两种格式均支持字符串字典序截断，因为短字符串在同前缀下字典序更小
+            mask = df["date"].astype(str) <= str(self.current_date)
+            hist = df.loc[mask]
+            return hist.tail(count).reset_index(drop=True)
+
+        # 降级路径：直接查询数据源（all_bars 未注入时的兜底）
         from datetime import datetime, timedelta
 
         # current_date 可能是 YYYYMMDD（日线）或 YYYYMMDDHHMM（分钟级）
@@ -72,7 +89,7 @@ class Context:
         end = datetime.strptime(date_str, "%Y%m%d")
         start = end - timedelta(days=int(count * 1.5))
         df = self.data_source.get_bars(
-            code, start.strftime("%Y%m%d"), date_str
+            code, start.strftime("%Y%m%d"), date_str, period=self.frequency
         )
         if not df.empty:
             df = df.tail(count)

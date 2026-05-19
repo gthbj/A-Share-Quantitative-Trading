@@ -50,7 +50,7 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `maxcompute_source.py` | **当前默认数据源**。通过 pyodps 连接阿里云 MaxCompute（项目 `a_share_historical_data`，北京区 endpoint）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。**注意**：当前 SQL 查询逻辑为骨架，需补充项目中实际表结构（表名/字段名/代码格式/分区方式/复权方式）后才能产出数据，详见模块顶部 TODO。 |
+| `maxcompute_source.py` | **当前默认数据源**。通过 pyodps 连接阿里云 MaxCompute（项目 `a_share_historical_data`，北京区 endpoint）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。接入进度：✅ 5min K 线（`cn_stock_kline_5min` 表）；✅ 15min ETF K 线（`cn_etf_kline_15min` 表，含 510300.SH）；✅ 股票列表（从 5min 表 DISTINCT 派生）；⚠️ 复权接口预留（待因子表接入）；⚠️ 指数成分股暂返回空列表；❌ daily / 1/30/60min 周期及普通股票 15min 表尚未建立。详见 §4.7 / §4.8 / §4.9。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
 
@@ -217,21 +217,77 @@ context.order(code, target_qty - current_qty)
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免 SQL 重复计费。
 - `akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 装载，以便后续按需切换。
 
-### 4.7 MaxCompute 表结构待补充清单
+### 4.7 MaxCompute 表结构与接入进度
 
-> **当前状态**：`MaxComputeDataSource` 的 `_fetch_daily_bars` / `_fetch_minute_bars` / `get_stock_list` / `get_index_constituents` 均会抛出 `NotImplementedError`，提示需要补充以下信息才能产出数据。
+> **当前状态**（截至 PRD_20260519_03 完成）：
 
-| 用途 | 配置键（`config/backtest.yaml`） | 待确认信息 |
-|------|----------------------------------|------------|
-| 日K | `data.maxcompute.tables.daily` | 表名；股票代码列名；日期列名与类型（STRING/DATE/DATETIME）；OHLCV 列名；股票代码格式（带后缀/裸代码）；分区字段；复权处理方式 |
-| 分钟K（可选） | `data.maxcompute.tables.minute` | 表名；period 字段；时间戳列格式；OHLCV 列名 |
-| 股票列表 | `data.maxcompute.tables.stock_info` | 表名；字段映射（code / name / list_date / industry） |
-| 指数成分股 | `data.maxcompute.tables.index_constituent` | 表名；字段映射（index_code / code） |
+| 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
+|------|----------------------------------|------|------|
+| 5min K 线 | `data.maxcompute.tables.kline_5min` | ✅ **已接入** | 表 `cn_stock_kline_5min`，详见 §4.8 |
+| ETF 15min K 线 | `data.maxcompute.tables.kline_etf_15min` | ✅ **已接入** | 表 `cn_etf_kline_15min`，详见 §4.9 |
+| 复权因子 | `data.maxcompute.tables.adjust_factor` | 🟡 接口预留 | `_apply_adjust()` 占位，待复权 PRD 接入 |
+| 股票列表 | （无需配置） | ✅ 已接入（派生） | 由 5min 表 `SELECT DISTINCT code, name` 派生；`list_date / industry` 为空 |
+| 指数成分股 | `data.maxcompute.tables.index_constituent` | 🟡 暂返回空 | 调用 `get_index_constituents()` 返回 `[]` + WARNING，不阻塞策略 |
+| 日K | `data.maxcompute.tables.daily` | ❌ 待建表 | 调用 `get_bars(period="daily")` 抛 `NotImplementedError` |
+| 1min K | `data.maxcompute.tables.kline_1min` | ❌ 待建表 | 同上 |
+| 普通股票 15min K | `data.maxcompute.tables.kline_15min` | ❌ 待建表 | ETF 15min 已有专表；普通股票 15min 待建 |
+| 30/60min K | `data.maxcompute.tables.kline_30/60min` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
+| 专用 stock_info | `data.maxcompute.tables.stock_info` | ❌ 待建表 | 若建立则替代 5min 派生路径；当前未启用 |
 
-补充上述信息后，需在 `data_layer/maxcompute_source.py` 的对应方法中：
-1. 在 `_fetch_daily_bars` / `_fetch_minute_bars` 中按实际字段名拼接 SQL；
-2. 将查询结果重命名为框架标准列 `[code, date, open, high, low, close, volume, amount]`；
-3. 在 `get_stock_list` / `get_index_constituents` 中同样填充 SQL 与列映射。
+后续每一项接入时，对应方法 `_fetch_daily_bars` / `_fetch_minute_bars` 内分支需按实际字段名拼接 SQL，列名映射到框架标准列 `[code, date, open, high, low, close, volume, amount]`。
+
+### 4.8 5min 表 (`cn_stock_kline_5min`) 接入细节
+
+**表结构**（PRD_20260519_02 调研结果）：
+
+| 列 | 类型 | 含义 |
+|---|---|---|
+| `trade_time` | DATETIME | K 线时间，精确到分钟 |
+| `code` | STRING | 股票代码，**表内格式为 `shXXXXXX` / `szXXXXXX`**（小写前缀） |
+| `name` | STRING | 股票中文名 |
+| `open / close / high / low` | DOUBLE | OHLC |
+| `volume` | BIGINT | 成交量（股） |
+| `amount` | DOUBLE | 成交额（元） |
+| `change_pct / amplitude` | DOUBLE | 涨跌幅 / 振幅（框架不返回） |
+| `year_month` | STRING | **分区字段**，格式 `YYYYMM` |
+
+**关键约定**：
+
+1. **代码格式双向映射**：上层调用始终用框架格式 `XXXXXX.SH` / `XXXXXX.SZ`；`_to_exchange_code()` 在拼 SQL 前转为表格式 `shXXXXXX` / `szXXXXXX`；`_to_framework_code()` 在 DataFrame 返回前转回框架格式。**对策略层完全透明。**
+2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `year_month` 列表（`_year_months_in_range()`），SQL 中以 `year_month IN ('200006', '200007', ...)` 触发分区裁剪。**不裁剪则全表扫描，计费成本约 1000 倍。**
+3. **时间格式化**：SQL 直接 `SELECT trade_time`（DATETIME），由 Python 侧 `pd.to_datetime(...).strftime("%Y%m%d%H%M")` 转为 12 位 `YYYYMMDDHHMM` 字符串，与框架分钟级 `date` 列约定一致。避免对 MaxCompute SQL 函数版本差异的依赖。
+4. **复权当前不支持**：5min 表为不复权原始价。`adjust ∈ {qfq, hfq}` 时 `_apply_adjust()` 仅打 WARNING 日志，**返回原始价**。待复权因子表接入后扩展该方法。
+5. **数据时间覆盖**：当前 5min 表仅含 `200006 ~ 200212` 共 31 个分区（约 2.5 年）。超出范围的请求返回空 DataFrame，不报错。数据扩充由独立 PRD 负责。
+
+### 4.9 ETF 15min 表 (`cn_etf_kline_15min`) 接入细节
+
+**表结构**（PRD_20260519_03 调研结果）：
+
+| 列 | 类型 | 含义 |
+|---|---|---|
+| `trade_time` | DATETIME | K 线时间，精确到分钟 |
+| `code` | STRING | ETF 代码，**表内格式已是框架格式 `XXXXXX.SH` / `XXXXXX.SZ`**，与 5min 表不同 |
+| `name` | STRING | ETF 中文名 |
+| `open / close / high / low` | DOUBLE | OHLC |
+| `volume` | BIGINT | 成交量（股） |
+| `amount` | DOUBLE | 成交额（元） |
+| `change_pct / amplitude` | DOUBLE | 涨跌幅 / 振幅（框架不返回） |
+| `year_month` | STRING | **分区字段**，格式 `YYYYMM` |
+
+**数据覆盖**：分区范围 200502 ～ 202512，共 251 个分区。  
+**510300.SH**（沪深300ETF华泰柏瑞）数据起始：2012-07。
+
+**与 5min 表的关键区别**：
+
+| 维度 | cn_stock_kline_5min | cn_etf_kline_15min |
+|---|---|---|
+| 标的类型 | A 股普通股票 | ETF 基金 |
+| 代码格式 | 表内 `shXXXXXX`，需双向映射 | 已是框架格式，**无需映射** |
+| 时间粒度 | 5 分钟 | 15 分钟 |
+| 分区键 | `year_month` | `year_month` |
+| 全表扫描 | 被禁止，需带分区条件 | 同左 |
+
+**实现**：`_fetch_etf_15min_bars()` — code 参数直接透传至 SQL，返回时亦原样保留。
 
 ---
 

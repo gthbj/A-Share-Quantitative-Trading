@@ -76,7 +76,10 @@ class Plotter:
     ) -> None:
         """绘制月度收益热力图。"""
         returns = nav_df["returns"].fillna(0)
-        monthly = returns.resample("ME").apply(lambda x: (1 + x).prod() - 1) * 100
+        # pandas < 2.2 用 "M"，>= 2.2 改为 "ME"（Month End）
+        import pandas as pd
+        _me_freq = "ME" if pd.__version__ >= "2.2" else "M"
+        monthly = returns.resample(_me_freq).apply(lambda x: (1 + x).prod() - 1) * 100
         monthly.index = monthly.index.to_period("M")
 
         # 转为 pivot 表 (year x month)
