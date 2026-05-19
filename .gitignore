@@ -22,3 +22,7 @@ strategy/*/runs/
 
 # 敏感配置（含 API Key 等凭据，禁止入库）
 config/secrets.yaml
+
+# 行情数据本地缓存：从 MaxCompute 拉取的 K 线、复权因子等都落盘到这里。
+# 可重新生成（首次回测会触发 SQL 查询），不入库以避免泄露付费数据 + 仓库膨胀。
+data/raw/
