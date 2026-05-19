@@ -4,121 +4,87 @@
 
 ---
 
-## 🔴 P0 — 高优先级（影响核心功能正确性）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 07）
 
-### P0-1: 收益曲线/回撤图出现大面积水平线段（纯平）
+| 编号 | 问题 | 解决方案 |
+|------|------|---------|
+| P0-1 | 收益曲线/回撤图水平线段 | 此前已在 PRD_20260519_03 之前修复（按日期长度分别解析 YYYYMMDD / YYYYMMDDHHMM） |
+| P0-2 | 止损单未来函数 | 此前已在 PRD_20260510_02 中改为次日开盘成交 |
+| P1-1 | AKShare 分钟数据不可达 | 默认切换到 MaxCompute（PRD_20260519_01） |
+| P1-2 | Matplotlib 中文字体 | PRD_20260520_05：`Plotter` 模块加载时自动探测系统中文字体 |
+| P2-1 | 交易日历硬编码 | PRD_20260520_05：接入 `chinese_calendar`，硬编码保留为 fallback |
+| P2-2 | 缺少单元测试 | PRD_20260520_07：tests/ 共 64 个用例，覆盖 TradeEngine / Position / Portfolio / metrics / code |
+| —    | metrics.fills 永远收不到 fills | PRD_20260520_02：FIFO 配对实现 win_rate / pl_ratio |
+| —    | get_price fallback 分钟级日期估算过宽 | PRD_20260520_02：按 frequency 调整 days_back 估算 |
+| —    | Order qty < 100 静默截断 | PRD_20260520_02：截断时 WARNING |
+| —    | order_target_percent 静默不做事 | PRD_20260520_02：改为抛 NotImplementedError |
+| —    | 代码归一化两份维护 | PRD_20260520_03：提取到 `utils/code.py`，CLI / data_layer / engine / strategy 共享 |
+| —    | 基准用回测频率拉数据导致 metrics 失真 | PRD_20260520_03：基准优先 daily，失败降级到 frequency |
+| —    | HTML 报告内容过简 | PRD_20260520_04：对齐 summary.md 全部 9 节内容（chip + 折叠明细表） |
+| —    | engine/__init__ 未导出 PaperTrader | PRD_20260520_01：已导出 |
+| —    | README/ARCHITECTURE 与现状不一致 | PRD_20260520_01：全文同步 |
+| —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
+
+---
+
+## 🟢 待优化（建议优先级）
+
+### TBD-1: paper_trader 缺少策略信号驱动
 
 **现象**  
-HTML 报告中的累计收益折线图与回撤曲线图出现明显的大段水平直线。例如 `cum_returns.png` 中 2023-01 之后近 10 个月净值完全不变，2022 年中也有多段长达数周的水平线。
+`PaperTrader.run_once` 仅做"持仓估值与状态更新"，没有真正调用策略 `handle_data` 生成订单。
 
 **根因分析**  
-`_build_result_df()` 中日期解析逻辑存在缺陷：
-
-```python
-raw_dates = df["date"].astype(str)
-df["date"] = pd.to_datetime(raw_dates, format="%Y%m%d%H%M", errors="coerce")
-mask = df["date"].isna()
-if mask.any():
-    df.loc[mask, "date"] = pd.to_datetime(
-        raw_dates[mask].str.slice(0, 8), format="%Y%m%d", errors="coerce"
-    )
-```
-
-日线回测的日期格式为 `YYYYMMDD`（8 位），但代码优先尝试用 `%Y%m%d%H%M`（12 位）解析。在 Python 3.9 + pandas 2.3.3 环境下，`strptime('20231218', '%Y%m%d%H%M')` 不会抛出 `ValueError`，而是被错误解析为 `2023-01-02 01:08:00`。这导致：
-1. 大量不同交易日的记录被映射到同一个错误时间戳（如 `2023-01-02` 的多个分钟）；
-2. 同一日的多条记录 nav 值相同，matplotlib 连线后表现为水平线段；
-3. 真实交易日期间的记录缺失，导致曲线中间出现断裂或长平线。
-
-**验证**  
-```python
->>> pd.to_datetime('20231218', format='%Y%m%d%H%M', errors='coerce')
-2023-01-02 01:08:00   # 应为 NaT
-```
+当前实现是占位骨架，未把策略循环挂接到虚拟盘日常调度上。
 
 **修复方向**  
-- 根据字符串长度显式路由：长度 8 → `%Y%m%d`；长度 12 → `%Y%m%d%H%M`；其他长度 → 报错或 `NaT`。
-- 或者不再用 `format` + `errors='coerce'` 的 fallback 模式，直接按长度选择解析器。
-
-**影响范围**  
-所有日报/周报的可视化输出，导致用户无法正确判断策略收益走势与回撤节奏。
+- 在 `run_once` 中加载策略类、构造 `Context`，调用 `handle_data` 并把订单交给 `TradeEngine` 撮合
+- 状态文件中持久化策略 `user_data`（多日间状态续接）
 
 ---
 
-### P0-2: 止损单执行时机存在未来函数（Lookahead Bias）
+### TBD-2: 限价单 / 止损单缺少过期与取消机制
 
 **现象**  
-PRD_20260510_02 要求"次日开盘价执行"，但当前实现中止损检查发生在当日收盘后/当日最后一个 Bar 后，生成的 MARKET 卖出单在同一日的 `TradeEngine.execute_orders()` 中被撮合。这意味着止损触发时已经知道了当日收盘价，却以当日价格成交。
-
-**根因分析**  
-`_check_stop_loss()` 在 `_run_daily` 的当日循环末尾调用，止损单被直接追加到当日订单列表中执行，没有延迟到下一交易日。
+PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未成交的挂单会一直在 `Context._orders` 中（实际上每次 `pop_orders()` 都清空了，所以现在的实现等于"挂单当根 bar 不成交就消失"）。
 
 **修复方向**  
-- 将止损检查生成的订单存入 `_stop_loss_pending` 队列；
-- 下一交易日开盘前（`before_trading_start` 之后，第一个 Bar 之前）将 pending 订单加入 context；
-- 分钟级回测同理：在下一交易日第一个分钟 Bar 时执行前一日收盘触发的止损单。
-
-**影响范围**  
-止损开启的回测结果可能过于乐观，低估实际滑点与次日跳空风险。
+- `Order` 新增 `expire_date` / `time_in_force`（GTC / DAY）
+- 引擎层维护一个"未成交挂单池"，每根 bar 检查触发条件直到过期
 
 ---
 
-## 🟡 P1 — 中优先级（影响体验或特定场景）
-
-### P1-1: AKShare 分钟级数据网络不可达
+### TBD-3: chinese_calendar 覆盖范围有限
 
 **现象**  
-当前运行环境无法访问 AKShare 的分钟级行情接口（EastMoney API 被屏蔽），回测被迫使用 `_simulate_minute_bars_from_daily()` 生成的模拟分钟数据（seed=42）。
-
-**根因分析**  
-网络环境限制，非代码问题。
+`chinese_calendar` 当前版本（1.11.0）覆盖到 2026 年。2027+ 会降级到"非周末"启发式，导致 2027 假期判定错误。
 
 **修复方向**  
-- 短期：增加更多 fallback 数据源（如 Tushare Pro、本地 CSV 导入）；
-- 长期：接入付费数据商或自建数据中心。
-
-**影响范围**  
-仅影响分钟级回测的真实性；日线回测使用 AKShare 日 K 接口，不受此影响。
+- 每年初 `pip install -U chinese-calendar`
+- 或接入 `exchange_calendars` 库的 XSHG 日历（更长期覆盖）
 
 ---
 
-### P1-2: Matplotlib 中文标签渲染为警告/方框
+### TBD-4: 涨跌停规则简化为 ±10%
 
 **现象**  
-图表标题、轴标签中的中文字符（如"累计收益率"）因系统缺少 CJK 字体，渲染为方框或触发 `UserWarning: Glyph ... missing from font(s) DejaVu Sans.`
-
-**根因分析**  
-macOS 默认未安装支持中文的 Matplotlib 字体。
+`TradeEngine._try_fill` 中涨跌停判定固定 ±10%，未区分科创板 ±20%、ST ±5%、北交所 ±30%。
 
 **修复方向**  
-- 在 `Plotter` 初始化时自动检测并设置系统可用的中文字体（如 `Arial Unicode MS`、`PingFang SC`、`SimHei` 等）；
-- 或打包一个开源中文字体到项目中，并在运行时动态加载。
-
-**影响范围**  
-纯视觉问题，不影响数据计算，但降低报告可读性。
+- 在 Code 工具层维护一个 `price_limit_pct(code)` 函数：根据前缀返回涨跌停幅度
+- `TradeEngine` 调用该函数动态获取
 
 ---
 
-## 🟢 P2 — 低优先级（建议优化）
-
-### P2-1: 交易日历为硬编码假期
+### TBD-5: 缺少行业 / 财务因子数据
 
 **现象**  
-`utils/calendar.py` 中 2020-2024 年的长假为硬编码列表，2025 年及以后的数据需要手动维护。
+`MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
 
 **修复方向**  
-接入 `exchange_calendars` 库或 AKShare 的交易日历接口，自动获取全量历史与未来交易日历。
+- 等待 MaxCompute 中财务表、行业表、指数成分股表上线
+- `MultiFactorStrategy` 接入真实因子数据
 
 ---
 
-### P2-2: 缺少单元测试覆盖
-
-**现象**  
-项目目前无自动化测试，回归验证依赖手工运行全量回测。
-
-**修复方向**  
-- 为 `TradeEngine`、`Portfolio`、`Position` 等核心类编写 pytest 单元测试；
-- 为 `_build_result_df`、止损逻辑等易出 bug 的边界场景增加专项测试。
-
----
-
-*本文档最后更新：2026-05-10*
+*本文档最后更新：2026-05-20*

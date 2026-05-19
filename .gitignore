@@ -13,6 +13,9 @@ venv/
 .vscode/
 .idea/
 
+# Claude Code 个人配置（权限策略等，因人而异不入库）
+.claude/settings.local.json
+
 # 运行时输出：每次回测会落到以下两处之一，默认都不入库
 #   - 旧路径（无 --preset 时的兜底）：output/{timestamp}/
 #   - 新路径（--preset 模式）：strategy/{name}/runs/{timestamp}/

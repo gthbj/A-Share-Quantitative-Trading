@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
@@ -341,16 +340,46 @@ class BacktestEngine:
         return self.data_source.get_multi_bars(codes, start, end, period=self.frequency)
 
     def _load_benchmark(self, trading_days: List[Any]) -> pd.DataFrame:
-        """加载基准指数行情。"""
+        """加载基准指数行情。
+
+        优先按**日线**获取（基准只用于收益对比与 Beta/Alpha，日线精度足够，
+        且分钟级指数表当前未建）。日线表未配置时降级到回测频率作 fallback。
+        """
         start = trading_days[0].strftime("%Y%m%d")
         end = trading_days[-1].strftime("%Y%m%d")
+
+        # 优先：日线
+        try:
+            df = self.data_source.get_bars(
+                self.benchmark, start, end, period="daily", adjust=None
+            )
+            if not df.empty:
+                return df
+            logger.info("基准日线返回空，尝试降级到回测频率")
+        except NotImplementedError:
+            logger.info(
+                f"基准日线表未配置，降级到 period={self.frequency} 加载基准"
+            )
+        except Exception as e:
+            logger.warning(f"基准指数日线加载失败: {e}")
+
+        # 降级：回测频率
         try:
             df = self.data_source.get_bars(
                 self.benchmark, start, end, period=self.frequency, adjust=None
             )
+            if df.empty:
+                logger.warning(
+                    f"基准 {self.benchmark} 在 daily 与 {self.frequency} 数据源中均无数据。"
+                    f"benchmark_return / Beta / Alpha 等指标将为 0。"
+                    f"建议：将 preset/config 中 benchmark 改为有数据的代码（如 510300.SH）。"
+                )
             return df
-        except Exception:
-            logger.warning("基准指数数据加载失败")
+        except Exception as e:
+            logger.warning(
+                f"基准 {self.benchmark} {self.frequency} 加载也失败: {e}。"
+                f"benchmark_return / Beta / Alpha 等指标将为 0。"
+            )
             return pd.DataFrame()
 
     def _build_result_df(self) -> pd.DataFrame:

@@ -34,15 +34,11 @@ import pandas as pd
 
 from .base_data_source import BaseDataSource
 from .local_storage import LocalStorage
+from utils.code import to_exchange_code as _utils_to_exchange_code
+from utils.code import to_framework_code as _utils_to_framework_code
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-# 上交所代码前缀（沪市主板 / 科创板 / ETF / LOF / 转债）
-_SH_PREFIXES = ("60", "68", "51", "56", "58", "11")
-# 深交所代码前缀（深市主板 / 创业板 / ETF / LOF）
-_SZ_PREFIXES = ("00", "30", "15", "16")
 
 
 class MaxComputeDataSource(BaseDataSource):
@@ -181,51 +177,25 @@ class MaxComputeDataSource(BaseDataSource):
     # ------------------------------------------------------------------ #
 
     def _to_exchange_code(self, framework_code: str) -> str:
-        """框架代码 → 表代码：`600000.SH` → `sh600000`、`000001.SZ` → `sz000001`。
+        """框架代码 → 表代码：``600000.SH`` → ``sh600000``。
 
-        - 已是表格式（小写前缀）保持原样（幂等）。
-        - 裸代码按前缀推断；无法识别则默认 `sh` + WARNING。
+        实现委托给 ``utils.code.to_exchange_code``；该函数对未知交易所抛 ValueError
+        而非默认 sh，避免数据查询拿错表后静默失败。
         """
-        if not framework_code:
-            raise ValueError("股票代码为空")
-        code = framework_code.strip()
-        lower = code.lower()
-
-        if lower.startswith(("sh", "sz")):
-            return lower
-
-        if "." in code:
-            bare, _, suffix = code.partition(".")
-            suffix = suffix.upper()
-            if suffix == "SH":
-                return f"sh{bare}"
-            if suffix == "SZ":
-                return f"sz{bare}"
-            logger.warning(f"未知交易所后缀 {suffix}（code={framework_code}），默认按 sh 处理")
-            return f"sh{bare}"
-
-        bare = code
-        if bare.startswith(_SH_PREFIXES):
-            logger.info(f"裸代码 {bare} 按前缀推断为沪市 → sh{bare}")
-            return f"sh{bare}"
-        if bare.startswith(_SZ_PREFIXES):
-            logger.info(f"裸代码 {bare} 按前缀推断为深市 → sz{bare}")
-            return f"sz{bare}"
-
-        logger.warning(f"无法识别股票代码 {framework_code} 的交易所，默认按 sh 处理")
-        return f"sh{bare}"
+        return _utils_to_exchange_code(framework_code)
 
     def _to_framework_code(self, exchange_code: str) -> str:
-        """表代码 → 框架代码：`sh600000` → `600000.SH`、`sz000001` → `000001.SZ`。"""
+        """表代码 → 框架代码：``sh600000`` → ``600000.SH``。
+
+        实现委托给 ``utils.code.to_framework_code``。
+        """
         if not exchange_code:
             return exchange_code
-        code = exchange_code.strip().lower()
-        if code.startswith("sh"):
-            return f"{code[2:]}.SH"
-        if code.startswith("sz"):
-            return f"{code[2:]}.SZ"
-        logger.warning(f"表中存在异常前缀代码 {exchange_code!r}，原样返回")
-        return exchange_code
+        try:
+            return _utils_to_framework_code(exchange_code)
+        except ValueError:
+            logger.warning(f"表中存在异常前缀代码 {exchange_code!r}，原样返回")
+            return exchange_code
 
     def _year_months_in_range(self, start_date: str, end_date: str) -> List[str]:
         """根据 [YYYYMMDD, YYYYMMDD] 返回覆盖的 year_month 列表（YYYYMM 字符串）。

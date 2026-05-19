@@ -2,15 +2,45 @@
 
 from __future__ import annotations
 
+import platform
+import warnings
 from pathlib import Path
 from typing import Optional
 
 import matplotlib
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import pandas as pd
 
 # 非交互环境使用 Agg 后端
 matplotlib.use("Agg")
+
+
+def _setup_chinese_font() -> None:
+    """探测系统中可用的中文字体并配置 matplotlib，避免 CJK 字符渲染为方框。
+
+    探测顺序按系统优先级排列；都找不到时仅 WARNING，不影响绘图。
+    """
+    system = platform.system()
+    candidates = {
+        "Darwin": ["PingFang SC", "Heiti TC", "STHeiti", "Arial Unicode MS"],
+        "Linux": ["Noto Sans CJK SC", "WenQuanYi Zen Hei", "WenQuanYi Micro Hei"],
+        "Windows": ["Microsoft YaHei", "SimHei", "SimSun"],
+    }.get(system, [])
+
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            plt.rcParams["font.sans-serif"] = [name] + plt.rcParams.get("font.sans-serif", [])
+            plt.rcParams["axes.unicode_minus"] = False  # 避免负号渲染问题
+            return
+    warnings.warn(
+        f"未在 {system} 系统中找到可用的中文字体，图表中文可能渲染为方框。"
+        f"可尝试安装 Noto Sans CJK SC / PingFang SC / Microsoft YaHei 等字体。"
+    )
+
+
+_setup_chinese_font()
 
 
 class Plotter:

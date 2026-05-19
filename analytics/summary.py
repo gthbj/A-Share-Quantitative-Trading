@@ -21,19 +21,28 @@ from analytics.metrics import MetricsResult
 
 
 def _fmt_pct(v: float, sign: bool = True) -> str:
-    if v != v:  # NaN
+    if v is None or v != v:  # NaN
         return "n/a"
     return f"{v:+.2%}" if sign else f"{v:.2%}"
 
 
 def _fmt_float(v: float, digits: int = 2) -> str:
-    if v != v:
+    import math
+    if v is None or v != v:
         return "n/a"
+    if isinstance(v, float) and math.isinf(v):
+        return "∞" if v > 0 else "-∞"
     return f"{v:.{digits}f}"
 
 
 def _fmt_int(v: float) -> str:
     return f"{int(v):,}"
+
+
+def _fmt_benchmark_return(v: float, benchmark_loaded: bool) -> str:
+    if not benchmark_loaded:
+        return "n/a（基准数据未加载）"
+    return _fmt_pct(v)
 
 
 def _fmt_date(date_str: str) -> str:
@@ -46,8 +55,15 @@ def _fmt_date(date_str: str) -> str:
     return s
 
 
-def _classify_excess(actual_annual: float, bench_total: float) -> str:
+def _classify_excess(
+    actual_annual: float, bench_total: float, benchmark_loaded: bool = True
+) -> str:
     """根据策略年化 vs 基准累计给出一句话评价。"""
+    if not benchmark_loaded:
+        # 基准缺失时不做相对评价
+        if actual_annual > 0:
+            return "策略整体盈利（基准数据未加载，无法对比）"
+        return "策略整体亏损（基准数据未加载，无法对比）"
     if actual_annual > bench_total:
         return "策略年化跑赢基准累计收益"
     if actual_annual > 0:
@@ -128,6 +144,7 @@ def generate_markdown_summary(
     fills_sell_count: int,
     data_source_name: str = "MaxCompute",
     trade_rows: Optional[List[Dict[str, Any]]] = None,
+    benchmark_loaded: bool = True,
 ) -> Path:
     """生成 summary.md 文件，返回路径。"""
     output_dir = Path(output_dir)
@@ -206,20 +223,20 @@ def generate_markdown_summary(
 |---|---|
 | **累计收益率** | {_fmt_pct(metrics.total_return)} |
 | **年化收益率** | {_fmt_pct(metrics.annual_return)} |
-| 基准累计收益 | {_fmt_pct(metrics.benchmark_return)} |
-| 年化超额收益 | {_fmt_pct(metrics.excess_return)} |
+| 基准累计收益 | {_fmt_benchmark_return(metrics.benchmark_return, benchmark_loaded)} |
+| 年化超额收益 | {_fmt_benchmark_return(metrics.excess_return, benchmark_loaded)} |
 | 最大回撤 | {_fmt_pct(metrics.max_drawdown, sign=False)} |
 | 最大回撤持续天数 | {metrics.max_drawdown_duration} 天 |
 | 年化波动率 | {_fmt_pct(metrics.volatility, sign=False)} |
 | 夏普比率 | {_fmt_float(metrics.sharpe_ratio)} |
 | 索提诺比率 | {_fmt_float(metrics.sortino_ratio)} |
-| Beta | {_fmt_float(metrics.beta)} |
-| Alpha | {_fmt_pct(metrics.alpha)} |
-| 信息比率 | {_fmt_float(metrics.information_ratio)} |
+| Beta | {_fmt_float(metrics.beta) if benchmark_loaded else "n/a（基准未加载）"} |
+| Alpha | {_fmt_pct(metrics.alpha) if benchmark_loaded else "n/a（基准未加载）"} |
+| 信息比率 | {_fmt_float(metrics.information_ratio) if benchmark_loaded else "n/a（基准未加载）"} |
 
 ### 一句话评价
 
-{_classify_excess(metrics.annual_return, metrics.benchmark_return)}。
+{_classify_excess(metrics.annual_return, metrics.benchmark_return, benchmark_loaded)}。
 
 ## 六、交易统计
 
@@ -228,6 +245,9 @@ def generate_markdown_summary(
 | 买入成交笔数 | {fills_buy_count:,} |
 | 卖出成交笔数 | {fills_sell_count:,} |
 | 合计成交笔数 | {fills_buy_count + fills_sell_count:,} |
+| 配对交易数（FIFO） | {metrics.total_trades:,} |
+| 胜率 | {_fmt_pct(metrics.win_rate, sign=False) if metrics.total_trades else "n/a"} |
+| 盈亏比 | {_fmt_float(metrics.profit_loss_ratio) if metrics.total_trades else "n/a"} |
 
 {_fee_summary_section(trade_rows)}
 

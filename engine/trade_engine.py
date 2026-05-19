@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -10,6 +9,9 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from account.portfolio import Portfolio
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class OrderType(Enum):
@@ -37,8 +39,12 @@ class Order:
     def __post_init__(self):
         # A股最小交易单位为100股
         if self.qty % 100 != 0:
-            # 向下取整到100的倍数
+            original = self.qty
             self.qty = (self.qty // 100) * 100
+            logger.warning(
+                f"订单数量 {original} 不是 100 的倍数，已截断为 {self.qty}（A股最小交易单位）。"
+                f"qty=0 时该订单将不会被撮合。code={self.code} side={self.side.value}"
+            )
 
 
 @dataclass
@@ -118,6 +124,52 @@ class TradeEngine:
                 self._apply_fill(fill, portfolio, current_date)
         return fills
 
+    def _resolve_trigger_and_price(
+        self,
+        order: Order,
+        bar: pd.Series,
+    ) -> Optional[float]:
+        """根据 order_type 与 bar 解析"是否触发 + 成交基准价（未叠滑点）"。
+
+        返回 None 表示未触发。返回的价格还未叠加滑点。
+        - MARKET: 按 self.price_type 选 open 或 close
+        - LIMIT: 价格区间满足时按 order.price 成交
+        - STOP: 触发后按"更不利"价（min/max(open, stop_price)）
+        """
+        bar_open = float(bar.get("open", 0.0))
+        bar_high = float(bar.get("high", bar_open))
+        bar_low = float(bar.get("low", bar_open))
+        bar_close = float(bar.get("close", bar_open))
+
+        if order.order_type == OrderType.MARKET:
+            ref = bar_open if self.price_type == "next_open" else bar_close
+            return ref if ref > 0 else None
+
+        if order.order_type == OrderType.LIMIT:
+            if order.price is None or order.price <= 0:
+                return None
+            if order.side == OrderSide.BUY:
+                # 买入限价：bar.low 触及限价才成交
+                return order.price if bar_low <= order.price else None
+            else:
+                return order.price if bar_high >= order.price else None
+
+        if order.order_type == OrderType.STOP:
+            if order.stop_price is None or order.stop_price <= 0:
+                return None
+            if order.side == OrderSide.SELL:
+                # 卖出止损：bar.low 触及止损价才触发，取更不利价（更低）
+                if bar_low <= order.stop_price:
+                    return min(bar_open, order.stop_price) if bar_open > 0 else order.stop_price
+                return None
+            else:
+                # 买入止损（突破）：bar.high 触及触发价
+                if bar_high >= order.stop_price:
+                    return max(bar_open, order.stop_price) if bar_open > 0 else order.stop_price
+                return None
+
+        return None
+
     def _try_fill(
         self,
         order: Order,
@@ -130,18 +182,14 @@ class TradeEngine:
         if bar is None or bar.empty:
             return None
 
-        # 价格选择
-        if self.price_type == "next_open":
-            price = bar.get("open", 0.0)
-        else:
-            price = bar.get("close", 0.0)
-
-        if price <= 0:
+        # 价格解析（含 LIMIT / STOP 触发判断）
+        price = self._resolve_trigger_and_price(order, bar)
+        if price is None or price <= 0:
             return None
 
-        # 涨跌停限制
+        # 涨跌停限制（对所有订单类型均生效）
         prev_close = bar.get("prev_close", price)
-        if prev_close > 0:
+        if prev_close and prev_close > 0:
             up_limit = prev_close * 1.1
             down_limit = prev_close * 0.9
             # 简化：主板10%，实际需区分科创板20%、ST 5%
@@ -173,8 +221,11 @@ class TradeEngine:
             if portfolio.available_cash + portfolio.frozen_cash < required:
                 return None
 
-        # 滑点
-        fill_price = self._apply_slippage(price, order.side)
+        # 滑点：仅 MARKET 单叠加滑点；LIMIT / STOP 自带价格约束不再额外加滑点
+        if order.order_type == OrderType.MARKET:
+            fill_price = self._apply_slippage(price, order.side)
+        else:
+            fill_price = price
 
         # 计算费用
         amount = order.qty * fill_price

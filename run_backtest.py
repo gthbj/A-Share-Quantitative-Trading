@@ -24,6 +24,8 @@ from engine.backtest import BacktestEngine
 from engine.backtest import DailyRecord
 from engine.trade_engine import OrderSide, TradeEngine
 from strategy.base_strategy import BaseStrategy
+from utils.code import normalize_code as _normalize_code
+from utils.code import parse_universe as _parse_universe
 from utils.logger import setup_logging
 
 
@@ -98,48 +100,6 @@ def load_strategy_preset(preset_name: str) -> dict:
         )
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
-
-
-# 上交所代码前缀（沪市主板 / 科创板 / ETF / LOF / 转债）
-_SH_PREFIXES = ("60", "68", "51", "56", "58", "11")
-# 深交所代码前缀（深市主板 / 创业板 / ETF / LOF）
-_SZ_PREFIXES = ("00", "30", "15", "16")
-
-
-def _normalize_code(raw: str) -> str:
-    """把用户输入归一化为框架代码格式 'XXXXXX.SH' / 'XXXXXX.SZ'。
-
-    支持的输入：
-      - '510300.SH' / '510300.sh'  → '510300.SH'
-      - '510300'                   → '510300.SH'（按前缀推断）
-      - '000001'                   → '000001.SZ'
-    """
-    s = raw.strip().upper()
-    if not s:
-        raise ValueError("代码为空")
-    if "." in s:
-        bare, _, suffix = s.partition(".")
-        if suffix not in ("SH", "SZ"):
-            raise ValueError(f"未知交易所后缀: {raw}（应为 .SH 或 .SZ）")
-        if not bare.isdigit() or len(bare) != 6:
-            raise ValueError(f"代码格式错误: {raw}（应为 6 位数字）")
-        return f"{bare}.{suffix}"
-    # 裸 6 位代码：按前缀推断
-    if not s.isdigit() or len(s) != 6:
-        raise ValueError(f"代码格式错误: {raw}（应为 6 位数字 + 可选 .SH/.SZ 后缀）")
-    if s.startswith(_SH_PREFIXES):
-        return f"{s}.SH"
-    if s.startswith(_SZ_PREFIXES):
-        return f"{s}.SZ"
-    raise ValueError(f"无法识别代码所属交易所: {raw}（请显式写明 .SH 或 .SZ）")
-
-
-def _parse_universe(raw: str) -> list:
-    """把逗号/空格分隔的字符串解析为代码列表，并归一化。"""
-    if not raw:
-        return []
-    parts = [p for p in raw.replace(",", " ").split() if p]
-    return [_normalize_code(p) for p in parts]
 
 
 def resolve_universe(cli_value: str, default: str = "510300.SH") -> list:
@@ -326,19 +286,12 @@ def main() -> int:
         print("回测结果为空")
         return 1
 
-    # 绩效分析
-    metrics = calculate_metrics(nav_df, engine.benchmark_df, frequency=frequency)
-    print(f"\n{'='*40}")
-    print(f"累计收益率: {metrics.total_return:.2%}")
-    print(f"年化收益率: {metrics.annual_return:.2%}")
-    print(f"最大回撤:   {metrics.max_drawdown:.2%}")
-    print(f"夏普比率:   {metrics.sharpe_ratio:.2f}")
-    print(f"{'='*40}\n")
-
-    # 提取全部成交流水（用于报告中的交易明细和费用汇总）
+    # 提取全部成交流水（先于 metrics，因为 metrics 需要 fills 计算交易统计）
     trade_rows = []
+    all_fills = []  # 喂给 metrics 用于 FIFO 配对的胜率/盈亏比
     for record in engine.records:
         for fill in record.fills:
+            all_fills.append(fill)
             trade_rows.append({
                 "date": record.date,
                 "side": "买入" if fill.side == OrderSide.BUY else "卖出",
@@ -351,6 +304,17 @@ def main() -> int:
                 "transfer_fee": round(fill.transfer_fee, 2),
                 "total_fee": round(fill.total_cost, 2),
             })
+
+    # 绩效分析（带 fills 才能算出胜率与盈亏比）
+    metrics = calculate_metrics(
+        nav_df, engine.benchmark_df, fills=all_fills, frequency=frequency
+    )
+    print(f"\n{'='*40}")
+    print(f"累计收益率: {metrics.total_return:.2%}")
+    print(f"年化收益率: {metrics.annual_return:.2%}")
+    print(f"最大回撤:   {metrics.max_drawdown:.2%}")
+    print(f"夏普比率:   {metrics.sharpe_ratio:.2f}")
+    print(f"{'='*40}\n")
 
     # ── 输出目录：每次运行创建独立子目录，不覆盖历史 ──
     # 优先级：--output > strategy/<preset>/runs/（preset 模式）> output/（兜底）
@@ -372,29 +336,26 @@ def main() -> int:
     plotter.plot_drawdown(nav_df, save_path=out / "drawdown.png")
     plotter.plot_monthly_returns(nav_df, save_path=out / "monthly_returns.png")
 
-    # HTML 报告
-    report_path = generate_html_report(metrics, output_dir=str(out))
-
-    # 保存完整成交流水 CSV
-    if trade_rows:
-        import pandas as _pd
-        trades_df = _pd.DataFrame(trade_rows)
-        trades_df.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
-
-    # Markdown 说明文件（策略 / 数据 / 参数 / 绩效）
+    # 准备策略元信息（HTML 与 Markdown 报告共用）
+    strategy_inst = engine.strategy_instance
+    universe_for_report = strategy_inst.get_universe() if strategy_inst else []
+    strategy_doc_for_report = (
+        (strategy_inst.__class__.__doc__ or "") if strategy_inst else ""
+    )
     buy_count = sum(
         1 for r in engine.records for f in r.fills if f.side == OrderSide.BUY
     )
     sell_count = sum(
         1 for r in engine.records for f in r.fills if f.side == OrderSide.SELL
     )
-    strategy_inst = engine.strategy_instance
-    summary_path = generate_markdown_summary(
-        output_dir=out,
-        metrics=metrics,
+
+    # HTML 报告（完整元信息 + 图表 + 交易明细）
+    report_path = generate_html_report(
+        metrics,
+        output_dir=str(out),
         strategy_class_path=strategy_path,
-        strategy_doc=(strategy_inst.__class__.__doc__ or "") if strategy_inst else "",
-        universe=strategy_inst.get_universe() if strategy_inst else [],
+        strategy_doc=strategy_doc_for_report,
+        universe=universe_for_report,
         start_date=start_date,
         end_date=end_date,
         initial_capital=capital,
@@ -406,6 +367,37 @@ def main() -> int:
         fills_sell_count=sell_count,
         data_source_name="阿里云 MaxCompute",
         trade_rows=trade_rows,
+    )
+
+    # 保存完整成交流水 CSV
+    if trade_rows:
+        import pandas as _pd
+        trades_df = _pd.DataFrame(trade_rows)
+        trades_df.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
+
+    benchmark_loaded = (
+        engine.benchmark_df is not None and not engine.benchmark_df.empty
+    )
+
+    # Markdown 说明文件（策略 / 数据 / 参数 / 绩效）
+    summary_path = generate_markdown_summary(
+        output_dir=out,
+        metrics=metrics,
+        strategy_class_path=strategy_path,
+        strategy_doc=strategy_doc_for_report,
+        universe=universe_for_report,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=capital,
+        frequency=frequency,
+        benchmark=benchmark,
+        config=cfg,
+        nav_records_count=len(nav_df),
+        fills_buy_count=buy_count,
+        fills_sell_count=sell_count,
+        data_source_name="阿里云 MaxCompute",
+        trade_rows=trade_rows,
+        benchmark_loaded=benchmark_loaded,
     )
 
     print(f"输出目录: {out}")

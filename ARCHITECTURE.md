@@ -80,31 +80,64 @@
 
 | 文件 | 职责 |
 |------|------|
-| `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 计算成交价（支持开盘价/收盘价模式，叠加滑点）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
+| `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
 | `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。 |
-| `paper_trader.py` | **虚拟盘**。状态持久化到 `data/paper_state.json`，支持断点续跑。每日收盘后读取最新行情，更新持仓市值，可扩展为定时自动运行。 |
+| `paper_trader.py` | **虚拟盘**。状态持久化到 `data/paper_state.json`，支持断点续跑。每日收盘后读取最新行情，更新持仓市值，可扩展为定时自动运行。该类已在 `engine/__init__.py` 中导出，可通过 `from engine import PaperTrader` 使用。 |
 
 **设计要点**：
 - `TradeEngine` 与 `BacktestEngine` 分离：前者只负责"一笔订单能否成交"，后者负责"何时调用策略、如何组织交易日历"。
 - 回测默认采用 **T+1 开盘价成交**（`price_type="next_open"`），避免未来函数（Lookahead Bias）。
 - 涨跌停判定基于 `prev_close` 与当日 `open` 计算，主板简化为 ±10%（实际可通过配置扩展科创板 ±20%、ST ±5%）。
 - 分钟级回测保持 T+1 以**交易日**为维度：当日买入的股票在当日剩余所有分钟内均不可卖，下一交易日开盘后解冻。
-- **全局止损**：引擎每日/每 Bar 在策略信号之后、撮合之前自动检查持仓浮亏。仅对 `sellable_qty > 0` 的仓位生效（T+1 当日买入不会被止），止损单以 `OrderType.MARKET` 发出，与策略订单一起进入 `TradeEngine` 按 A 股规则撮合。 |
+- **全局止损**：引擎每日/每 Bar 在策略信号之后、撮合之前自动检查持仓浮亏。仅对 `sellable_qty > 0` 的仓位生效（T+1 当日买入不会被止），止损单以 `OrderType.MARKET` 发出，与策略订单一起进入 `TradeEngine` 按 A 股规则撮合。
+- **订单类型撮合规则**（详见 §4.10）：
+  - `MARKET`：按 `price_type` 选 open/close，叠加滑点
+  - `LIMIT`：买入 `bar.low ≤ price` 时按 price 成交；卖出 `bar.high ≥ price` 时按 price 成交；不叠加滑点
+  - `STOP`：卖出 `bar.low ≤ stop_price` 触发，按 `min(open, stop_price)`（更不利价）；买入 `bar.high ≥ stop_price` 触发，按 `max(open, stop_price)`
 
 ---
 
 ### 2.4 strategy/ — 策略层
 
+策略可以是单文件，也可以是**实验包**（推荐长期保留策略采用）。
+
+**单文件示例**（直接放在 `strategy/` 下）：
+
 | 文件 | 职责 |
 |------|------|
-| `base_strategy.py` | 策略抽象基类。定义生命周期钩子（`initialize` / `before_trading_start` / `handle_data` / `after_trading_end`）。`Context` 对象封装下单接口（`order`）与数据查询（`get_price`）。 |
-| `double_ma.py` | 双均线策略示例：MA5 金叉买入、死叉卖出。 |
+| `base_strategy.py` | 策略抽象基类。定义生命周期钩子（`initialize` / `before_trading_start` / `handle_data` / `after_trading_end`）。`Context` 对象封装下单接口（`order` / `limit_order` / `stop_order`）与数据查询（`get_price`）。 |
 | `momentum.py` | 月度动量策略示例：每月初买入上月涨幅前 N 名，等权持有。 |
 | `multi_factor.py` | 多因子策略示例：基于 PE/PB/ROE 综合评分选股（演示框架，实际需接入财务数据库）。 |
+| `intraday_ma.py` | 日内双均线策略示例：分钟级 MA5/MA15 金叉买入、死叉卖出 + 收盘前强制平仓。 |
+
+**实验包结构**（推荐）：
+
+```
+strategy/<name>/
+├── strategy.py           # 策略类实现（带 DEFAULT_UNIVERSE）
+├── __init__.py           # 重新导出策略类（保持原 import 路径）
+├── config.yaml           # preset 默认参数：universe / 时间区间 / 频率 / 基准
+├── README.md             # 策略说明（信号 / 参数 / 适用市场 / 局限）
+└── runs/                 # 历次回测产物（默认 gitignore，可强制保留）
+```
+
+**当前可用 preset**：
+
+| preset | 类 | 说明 |
+|---|---|---|
+| `double_ma` | `strategy.double_ma.DoubleMAStrategy` | 双均线（MA5/MA20）金叉买入、死叉卖出，默认 510300.SH × 15min |
+
+**preset 加载机制**：
+
+- `python run_backtest.py --preset double_ma` → 加载 `strategy/double_ma/config.yaml`
+- 参数优先级（高到低）：**CLI 参数 > preset config > 全局 `config/backtest.yaml` > 内置默认**
+- 输出目录优先级：`--output` > `strategy/<preset>/runs/`（preset 模式）> `output/`（兜底）
 
 **设计要点**：
 - 策略与引擎完全解耦：策略只知道 `Context` 接口，不感知回测循环细节。
-- `order_target_percent` / `order_target_value` 目前为预留接口，建议用户手动计算目标数量后调用 `order()`，避免框架隐式行为导致不可预期。
+- 策略可通过构造函数接收参数（如 `universe / short_window`），CLI 与 preset 都可以注入。
+- `Context.order` 下市价单；`Context.limit_order(code, qty, price)` 下限价单；`Context.stop_order(code, qty, stop_price)` 下止损单。
+- `order_target_percent` / `order_target_value` **当前抛 NotImplementedError**（PRD_20260520_02）：自动计算会引入对最新价格的隐式依赖，易触发 Lookahead Bias，请手动计算目标数量后调用 `order()`。
 
 ---
 
@@ -112,9 +145,10 @@
 
 | 文件 | 职责 |
 |------|------|
-| `metrics.py` | 绩效指标计算。包括累计/年化收益率、最大回撤、波动率、夏普比率、索提诺比率、Beta、Alpha、信息比率等。 |
-| `plotter.py` | 可视化绘图。使用 Matplotlib 生成累计收益对比图、回撤曲线、月度收益热力图。 |
-| `report.py` | HTML 报告生成器。基于模板引擎渲染静态报告，内含图表嵌入，便于分享。 |
+| `metrics.py` | 绩效指标计算。包括累计/年化收益率、最大回撤、波动率、夏普比率、索提诺比率、Beta、Alpha、信息比率，以及**基于 FIFO 配对的胜率与盈亏比**（PRD_20260520_02）。分钟级回测时会自动把策略净值重采样到日线后再与日线基准对齐，避免因频率不匹配导致 Beta/Alpha 失真。 |
+| `plotter.py` | 可视化绘图。使用 Matplotlib 生成累计收益对比图、回撤曲线、月度收益热力图。**模块加载时自动探测系统中文字体**（PingFang SC / Noto Sans CJK / Microsoft YaHei 等），避免中文渲染为方框。 |
+| `report.py` | HTML 报告生成器。**完整对齐 `summary.md` 内容**（PRD_20260520_04）：策略元信息、数据来源、回测参数、交易规则、12 项绩效指标卡片、图表、交易统计、费用汇总、完整交易明细（折叠展示）。 |
+| `summary.py` | Markdown 报告生成器。9 节结构：策略 / 数据 / 参数 / 规则 / 绩效 / 交易统计（含胜率盈亏比）/ 费用 / 交易明细 / 产物清单。基准未加载时显示 "n/a（基准数据未加载）"。 |
 
 ---
 
@@ -122,7 +156,8 @@
 
 | 文件 | 职责 |
 |------|------|
-| `calendar.py` | A 股交易日历。提供 `is_trading_day`、`get_trading_days`、`next_trading_day` 等方法。当前为简化实现（硬编码 2020-2024 长假），后续可接入 `exchange_calendars` 或 AKShare 精确日历。 |
+| `calendar.py` | A 股交易日历。优先调用 `chinese_calendar` 处理法定假日与调休补班（每年初需 `pip install -U chinese-calendar`）；超出范围或库缺失时降级为"非周末 + 硬编码 2020-2024 假期" + WARNING。注意：chinese_calendar 把"周末补班"标为 workday，但 A 股不在补班日开市，已二次过滤。 |
+| `code.py` | **股票代码归一化**（PRD_20260520_03）：`normalize_code('510300')` → `'510300.SH'`，按前缀推断交易所；`to_exchange_code` / `to_framework_code` 处理框架格式与 MaxCompute 表内 `shXXXXXX` 格式的双向转换。统一由 CLI / data_layer / engine / strategy 共享。 |
 | `logger.py` | 统一日志配置。支持控制台 + 文件双输出，UTF-8 编码。 |
 
 ---
@@ -259,6 +294,51 @@ context.order(code, target_qty - current_qty)
 4. **复权当前不支持**：5min 表为不复权原始价。`adjust ∈ {qfq, hfq}` 时 `_apply_adjust()` 仅打 WARNING 日志，**返回原始价**。待复权因子表接入后扩展该方法。
 5. **数据时间覆盖**：当前 5min 表仅含 `200006 ~ 200212` 共 31 个分区（约 2.5 年）。超出范围的请求返回空 DataFrame，不报错。数据扩充由独立 PRD 负责。
 
+### 4.10 订单类型撮合规则（PRD_20260520_06）
+
+`engine.trade_engine.TradeEngine._try_fill` 按 `order.order_type` 分支处理：
+
+| OrderType | 触发条件（买入） | 触发条件（卖出） | 成交价 | 是否叠加滑点 |
+|---|---|---|---|---|
+| `MARKET` | 总是 | 总是 | `next_open` 模式取 `bar.open`，`current_close` 模式取 `bar.close` | ✓ |
+| `LIMIT` | `bar.low ≤ order.price` | `bar.high ≥ order.price` | `order.price` | ✗（限价单自带价格约束）|
+| `STOP` | `bar.high ≥ order.stop_price` | `bar.low ≤ order.stop_price` | 买入：`max(bar.open, stop_price)`；卖出：`min(bar.open, stop_price)`（保守取更不利价）| ✗ |
+
+涨跌停判定（基于 `prev_close ± 10%`）与成交量限制（`volume_limit`）对所有订单类型均生效。
+
+策略侧用法：
+
+```python
+context.order(code, qty)                            # MARKET
+context.limit_order(code, qty, price=10.0)          # LIMIT
+context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
+```
+
+### 4.11 基准加载策略（PRD_20260520_03）
+
+`BacktestEngine._load_benchmark()` 优先按 **`period="daily"`** 加载基准行情：
+
+- 基准只用于收益对比与 Beta/Alpha 计算，日线精度足够
+- 分钟级指数表当前未建，强制用 frequency 会触发 NotImplementedError 被静默吞掉，导致 metrics 失真
+
+若 daily 表未配置则**降级**到回测频率作 fallback。两路都失败时打 WARNING 并提示用户基准 `benchmark_return / Beta / Alpha` 将为 0。
+
+`analytics.metrics.calculate_metrics` 中：当 `frequency != "daily"` 且基准为日线时，策略 nav 会自动重采样到日线再对齐 benchmark；并要求至少 20 个对齐日线点才计算 Beta，否则保持 0。
+
+### 4.12 单元测试（PRD_20260520_07）
+
+`tests/` 目录覆盖核心模块的边界场景：
+
+| 测试文件 | 覆盖模块 | 关键用例 |
+|---|---|---|
+| `test_position.py` | `Position` | T+1 解冻、FIFO 同步消减 _buy_records（防 sellable_qty 虚高）、清仓归零 |
+| `test_portfolio.py` | `Portfolio` | 冻结/释放、买入扣 frozen、卖出回笼 cash |
+| `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告 |
+| `test_code.py` | `utils.code` | 代码归一化、前缀推断、未知交易所抛错 |
+| `test_metrics.py` | `analytics.metrics._pair_fifo` + `calculate_metrics` | 全盈/全亏/混合配对、未平仓忽略、FIFO 顺序、inf 盈亏比 |
+
+运行：`pytest tests/ -v`（共 64 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
+
 ### 4.9 ETF 15min 表 (`cn_etf_kline_15min`) 接入细节
 
 **表结构**（PRD_20260519_03 调研结果）：
@@ -321,25 +401,36 @@ context.order(code, target_qty - current_qty)
 
 | 文件 | 类型 | 说明 |
 |------|------|------|
-| `run_backtest.py` | 入口 | CLI 命令行入口 |
+| `run_backtest.py` | 入口 | CLI 命令行入口（含 `--preset` 模式） |
 | `config/backtest.yaml` | 配置 | 回测参数与费率 |
+| `config/secrets.yaml` | 配置 | MaxCompute 凭据，**不入 git** |
+| `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（默认） |
 | `data_layer/akshare_source.py` | 实现 | AKShare 数据源（保留备选） |
+| `data_layer/tushare_source.py` | 实现 | Tushare 数据源（保留备选） |
 | `data_layer/local_storage.py` | 工具 | 本地缓存读写 |
-| `config/secrets.yaml` | 配置 | MaxCompute 凭据，**不入 git** |
-| `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `account/portfolio.py` | 核心 | 虚拟账户 |
 | `account/position.py` | 核心 | 单股持仓（T+1） |
 | `engine/backtest.py` | 核心 | 回测引擎 |
-| `engine/trade_engine.py` | 核心 | 撮合引擎 |
-| `engine/paper_trader.py` | 核心 | 虚拟盘 |
+| `engine/trade_engine.py` | 核心 | 撮合引擎（MARKET/LIMIT/STOP） |
+| `engine/paper_trader.py` | 核心 | 虚拟盘（已在 engine.__init__ 导出） |
 | `strategy/base_strategy.py` | 抽象 | 策略基类与 Context |
-| `analytics/metrics.py` | 工具 | 绩效指标 |
-| `analytics/plotter.py` | 工具 | 可视化 |
-| `analytics/report.py` | 工具 | HTML 报告 |
-| `utils/calendar.py` | 工具 | 交易日历 |
+| `strategy/double_ma/` | 实验包 | 双均线策略（strategy.py + config.yaml + README.md + runs/） |
+| `strategy/momentum.py` | 单文件 | 月度动量策略示例 |
+| `strategy/multi_factor.py` | 单文件 | 多因子选股策略示例 |
+| `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
+| `analytics/metrics.py` | 工具 | 绩效指标（含 FIFO 配对胜率/盈亏比） |
+| `analytics/plotter.py` | 工具 | 可视化（自动探测中文字体） |
+| `analytics/report.py` | 工具 | HTML 报告（对齐 summary.md） |
+| `analytics/summary.py` | 工具 | Markdown 报告 |
+| `utils/calendar.py` | 工具 | A 股交易日历（chinese_calendar 接入） |
+| `utils/code.py` | 工具 | 股票代码归一化与双向映射 |
 | `utils/logger.py` | 工具 | 日志配置 |
+| `tests/` | 测试 | 64 个单元用例 |
+| `requirements.txt` | 依赖 | 运行依赖 |
+| `requirements-dev.txt` | 依赖 | 开发依赖（pytest） |
+| `pytest.ini` | 配置 | pytest 配置 |
 
 ---
 
