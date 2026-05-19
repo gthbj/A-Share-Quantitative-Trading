@@ -72,6 +72,8 @@ class BacktestEngine:
         self.benchmark_df: Optional[pd.DataFrame] = None
         # 待执行的止损队列：code -> qty，由前一日收盘后检查写入
         self._stop_loss_pending: Dict[str, int] = {}
+        # 暴露给外层报告/总结使用：策略实例（含 universe、docstring）
+        self.strategy_instance: Optional[BaseStrategy] = None
 
     def _is_intraday(self) -> bool:
         """判断当前是否为分钟级回测。"""
@@ -94,6 +96,7 @@ class BacktestEngine:
         )
         strategy = self.strategy_cls()
         strategy.initialize(context)
+        self.strategy_instance = strategy  # 暴露给外层（universe / docstring 用）
 
         # 获取Universe列表
         universe = strategy.get_universe()

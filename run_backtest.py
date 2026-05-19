@@ -10,6 +10,7 @@ import argparse
 import importlib
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -17,8 +18,10 @@ import yaml
 from analytics.metrics import calculate_metrics
 from analytics.plotter import Plotter
 from analytics.report import generate_html_report
+from analytics.summary import generate_markdown_summary
 from data_layer.maxcompute_source import MaxComputeDataSource
 from engine.backtest import BacktestEngine
+from engine.trade_engine import OrderSide, TradeEngine
 from strategy.base_strategy import BaseStrategy
 from utils.logger import setup_logging
 
@@ -82,7 +85,16 @@ def main() -> int:
     parser.add_argument("--end", default="20231231", help="回测结束日期 YYYYMMDD")
     parser.add_argument("--capital", type=float, default=1_000_000, help="初始资金")
     parser.add_argument("--config", default="config/backtest.yaml", help="配置文件路径")
-    parser.add_argument("--output", default="output/report", help="报告输出目录")
+    parser.add_argument(
+        "--output",
+        default="output",
+        help="报告输出根目录；每次运行会在其下创建带时间戳的子目录 YYYYMMDD_HHMMSS/",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="可选的运行标签，加在时间戳后作为子目录后缀，例如 20260519_181500_doublema",
+    )
     parser.add_argument("--frequency", default=None, help="回测频率：daily / 1min / 5min / 15min / 30min / 60min")
     args = parser.parse_args()
 
@@ -112,6 +124,22 @@ def main() -> int:
     frequency = args.frequency or cfg.get("backtest", {}).get("frequency", "daily")
     stop_loss_cfg = cfg.get("stop_loss", {})
 
+    # 用配置文件构造撮合引擎（佣金/印花税/滑点/撮合规则等）
+    # 否则会退化到 TradeEngine 的默认值（滑点 0.001 等），与 backtest.yaml 不一致。
+    trading_cfg = cfg.get("trading", {})
+    slip_cfg = cfg.get("slippage", {})
+    exec_cfg = cfg.get("execution", {})
+    trade_engine = TradeEngine(
+        commission_rate=trading_cfg.get("commission_rate", 0.00025),
+        min_commission=trading_cfg.get("min_commission", 5.0),
+        stamp_duty_rate=trading_cfg.get("stamp_duty_rate", 0.0005),
+        transfer_fee_rate=trading_cfg.get("transfer_fee_rate", 0.00001),
+        slippage_type=slip_cfg.get("type", "percent"),
+        slippage_value=slip_cfg.get("value", 0.001),
+        volume_limit=exec_cfg.get("volume_limit", 0.10),
+        price_type=exec_cfg.get("price_type", "next_open"),
+    )
+
     # 运行回测
     engine = BacktestEngine(
         strategy_cls=strategy_cls,
@@ -120,6 +148,7 @@ def main() -> int:
         end_date=args.end,
         initial_capital=args.capital,
         benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
+        trade_engine=trade_engine,
         frequency=frequency,
         stop_loss_enabled=stop_loss_cfg.get("enabled", False),
         stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
@@ -139,18 +168,51 @@ def main() -> int:
     print(f"夏普比率:   {metrics.sharpe_ratio:.2f}")
     print(f"{'='*40}\n")
 
-    # 可视化
-    plotter = Plotter()
-    out = Path(args.output)
+    # ── 输出目录：每次运行创建独立子目录，不覆盖历史 ──
+    # 子目录命名：YYYYMMDD_HHMMSS[_run-name]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_label = timestamp if not args.run_name else f"{timestamp}_{args.run_name}"
+    out = Path(args.output) / run_label
     out.mkdir(parents=True, exist_ok=True)
 
+    # 可视化
+    plotter = Plotter()
     plotter.plot_cumulative_returns(nav_df, engine.benchmark_df, save_path=out / "cum_returns.png")
     plotter.plot_drawdown(nav_df, save_path=out / "drawdown.png")
     plotter.plot_monthly_returns(nav_df, save_path=out / "monthly_returns.png")
 
-    # 生成报告
+    # HTML 报告
     report_path = generate_html_report(metrics, output_dir=str(out))
-    print(f"报告已生成: {report_path}")
+
+    # Markdown 说明文件（策略 / 数据 / 参数 / 绩效）
+    buy_count = sum(
+        1 for r in engine.records for f in r.fills if f.side == OrderSide.BUY
+    )
+    sell_count = sum(
+        1 for r in engine.records for f in r.fills if f.side == OrderSide.SELL
+    )
+    strategy_inst = engine.strategy_instance
+    summary_path = generate_markdown_summary(
+        output_dir=out,
+        metrics=metrics,
+        strategy_class_path=args.strategy,
+        strategy_doc=(strategy_inst.__class__.__doc__ or "") if strategy_inst else "",
+        universe=strategy_inst.get_universe() if strategy_inst else [],
+        start_date=args.start,
+        end_date=args.end,
+        initial_capital=args.capital,
+        frequency=frequency,
+        benchmark=cfg.get("backtest", {}).get("benchmark", "000300.SH"),
+        config=cfg,
+        nav_records_count=len(nav_df),
+        fills_buy_count=buy_count,
+        fills_sell_count=sell_count,
+        data_source_name="阿里云 MaxCompute",
+    )
+
+    print(f"输出目录: {out}")
+    print(f"  - HTML 报告: {report_path}")
+    print(f"  - Markdown 说明: {summary_path}")
     return 0
 
 

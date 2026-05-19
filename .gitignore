@@ -13,9 +13,8 @@ venv/
 .vscode/
 .idea/
 
-# 运行时输出（保留目录结构示例，但不跟踪每次生成的结果）
-# output/report/*.png
-# output/report/*.html
+# 运行时输出：每次回测在 output/ 下创建 YYYYMMDD_HHMMSS[_label]/ 子目录，不入库
+output/
 
 # 敏感配置（含 API Key 等凭据，禁止入库）
 config/secrets.yaml
