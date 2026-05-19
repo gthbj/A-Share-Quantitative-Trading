@@ -123,7 +123,13 @@ class BacktestEngine:
         portfolio: Portfolio,
         all_bars: Dict[str, pd.DataFrame],
     ) -> None:
-        """日线回测主循环（与修改前逻辑完全一致）。"""
+        """日线回测主循环。
+
+        订单执行顺序遵循 next_open 语义：
+          - 策略在 day T 的 close 数据上产生信号（handle_data）
+          - 订单在 day T+1 的 open 成交（下一轮循环 pop_orders）
+        止损订单同理：day T 收盘后触发 → day T+1 开盘前生成 → day T+1 开盘成交。
+        """
         for i, date_obj in enumerate(trading_days):
             date_str = date_obj.strftime("%Y%m%d")
             context.current_date = date_str
@@ -152,17 +158,15 @@ class BacktestEngine:
             stop_loss_orders = self._generate_stop_loss_orders(portfolio)
             strategy.before_trading_start(context, today_bars)
 
-            # 4. 盘中处理
-            strategy.handle_data(context, today_bars)
-
-            # 5. 获取订单并撮合（策略订单 + 止损订单）
+            # 4. 执行上一交易日 handle_data 产生的订单（next_open 语义）
+            #    以及上一日收盘后触发的止损订单，均在今日开盘价成交。
             orders = context.pop_orders()
             orders.extend(stop_loss_orders)
             for order in orders:
                 if order.side == OrderSide.BUY:
                     price = today_bars.get(order.code, {}).get("open", 0.0)
                     if price > 0:
-                        est_amount = order.qty * price
+                        est_amount = min(order.qty * price, portfolio.available_cash)
                         ok = portfolio.reserve_cash(est_amount)
                         if not ok:
                             order.qty = 0
@@ -171,6 +175,9 @@ class BacktestEngine:
             fills = self.trade_engine.execute_orders(
                 orders, portfolio, today_bars, date_str
             )
+
+            # 5. 盘中处理：策略基于今日 close 产生信号，订单留存至明日开盘执行
+            strategy.handle_data(context, today_bars)
 
             # 6. 收盘后
             strategy.after_trading_end(context, today_bars)
@@ -201,7 +208,14 @@ class BacktestEngine:
         portfolio: Portfolio,
         all_bars: Dict[str, pd.DataFrame],
     ) -> None:
-        """分钟级回测主循环：逐交易日加载分钟 Bar，逐条推进。"""
+        """分钟级回测主循环：逐交易日加载分钟 Bar，逐条推进。
+
+        订单执行顺序遵循 next_open 语义：
+          - 策略在 bar T 的 close 数据上产生信号（handle_data）
+          - 订单在 bar T+1 的 open 成交（下一根 bar 开始时 pop_orders）
+        止损订单：day T 最后一根 bar 收盘后检查触发 → day T+1 第一根 bar 开盘前生成
+                  → day T+1 第一根 bar 开盘价成交（与策略延迟订单一同执行）。
+        """
         universe = strategy.get_universe()
 
         for i, date_obj in enumerate(trading_days):
@@ -230,9 +244,6 @@ class BacktestEngine:
             if not sorted_times:
                 continue
 
-            # 上一日遗留的止损订单，仅在第一个 Bar 加入
-            pending_stop_loss_orders: List[Order] = []
-
             for t_idx, time_str in enumerate(sorted_times):
                 context.current_date = time_str
                 is_first_bar_of_day = t_idx == 0
@@ -260,22 +271,21 @@ class BacktestEngine:
                 # 开盘前（仅每天第一个 Bar）
                 if is_first_bar_of_day:
                     portfolio.before_trading(date_str)
-                    pending_stop_loss_orders = self._generate_stop_loss_orders(portfolio)
+                    # 上一日收盘后产生的止损订单在今日第一根 bar 开盘时执行
+                    stop_loss_orders = self._generate_stop_loss_orders(portfolio)
                     strategy.before_trading_start(context, current_bars)
+                else:
+                    stop_loss_orders = []
 
-                # 盘中处理
-                strategy.handle_data(context, current_bars)
-
-                # 获取订单并撮合（策略订单 + 上一日止损订单）
+                # ── 执行上一根 bar 产生的挂单（next_open 语义）──
+                # pop_orders() 取出的是上一次 handle_data 留存的订单
                 orders = context.pop_orders()
-                if is_first_bar_of_day:
-                    orders.extend(pending_stop_loss_orders)
-                    pending_stop_loss_orders = []
+                orders.extend(stop_loss_orders)
                 for order in orders:
                     if order.side == OrderSide.BUY:
                         price = current_bars.get(order.code, {}).get("open", 0.0)
                         if price > 0:
-                            # 预留金额不超过可用现金（策略用 close 算量，open 可能略高）
+                            # 预留金额不超过可用现金（策略用 close 估量，open 可能略高）
                             est_amount = min(
                                 order.qty * price, portfolio.available_cash
                             )
@@ -287,6 +297,10 @@ class BacktestEngine:
                 fills = self.trade_engine.execute_orders(
                     orders, portfolio, current_bars, time_str
                 )
+
+                # ── 盘中策略处理：基于当前 bar 的 close 产生信号 ──
+                # 新订单留存在 context._orders，下一根 bar 开盘时才执行
+                strategy.handle_data(context, current_bars)
 
                 # 收盘后（仅每天最后一个 Bar）
                 if is_last_bar_of_day:

@@ -37,12 +37,34 @@ class Position:
         self._buy_records[date] = self._buy_records.get(date, 0) + qty
 
     def apply_sell(self, qty: int, price: float) -> None:
-        """执行卖出，更新持仓。"""
+        """执行卖出，更新持仓。
+
+        关键：必须按 FIFO 顺序同步减少 ``_buy_records``，否则下一交易日
+        ``update_sellable`` 会从陈旧的 ``_buy_records`` 把已卖份额重新计入
+        ``sellable_qty``，导致可卖数量虚高（凭空创造份额，进而虚增成交金额）。
+        """
         if qty <= 0:
             return
         qty = min(qty, self.total_qty)
         self.total_qty -= qty
         self.sellable_qty -= qty
+        # 保护：sellable_qty 不应为负（防御性）
+        if self.sellable_qty < 0:
+            self.sellable_qty = 0
+
+        # FIFO 同步消减 _buy_records，按日期升序优先卖最早买入
+        remaining = qty
+        for date in sorted(self._buy_records.keys()):
+            if remaining <= 0:
+                break
+            record_qty = self._buy_records[date]
+            if record_qty > remaining:
+                self._buy_records[date] = record_qty - remaining
+                remaining = 0
+            else:
+                remaining -= record_qty
+                del self._buy_records[date]
+
         # 成本价不变（加权平均法），若清仓则归零
         if self.total_qty == 0:
             self.cost_price = 0.0

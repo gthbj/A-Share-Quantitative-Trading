@@ -19,7 +19,7 @@ trading:
 slippage:
   enabled: true
   type: "percent"  # percent | fixed
-  value: 0.001     # 0.1%
+  value: 0.003     # 0.3%（调高以更保守估计实盘摩擦）
 
 # 撮合规则
 execution:

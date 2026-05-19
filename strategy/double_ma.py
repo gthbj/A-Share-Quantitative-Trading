@@ -28,11 +28,8 @@ class DoubleMAStrategy(BaseStrategy):
         super().initialize(context)
         # 演示：使用少量股票作为 universe
         self.set_universe(["510300.SH"])
-        context.user_data["holding"] = set()
 
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
-        holding = context.user_data["holding"]
-
         for code in self._universe:
             hist = context.get_price(code, count=self.long_window + 5)
             if len(hist) < self.long_window:
@@ -47,24 +44,26 @@ class DoubleMAStrategy(BaseStrategy):
             prev = hist.iloc[-2]
             curr = hist.iloc[-1]
 
+            # 用实际持仓状态作为 holding 判断依据，避免止损平仓后 holding 集合
+            # 与真实仓位不一致而导致策略永远不再买入的 bug。
+            has_pos = context.portfolio.has_position(code)
+
             # 金叉
             if prev["ma_short"] <= prev["ma_long"] and curr["ma_short"] > curr["ma_long"]:
-                if code not in holding:
-                    # 买入：每只股票分配 1/3 资金
-                    budget = context.portfolio.available_cash / max(len(self._universe) - len(holding), 1)
+                if not has_pos:
+                    # 买入：把全部可用资金押注在单一品种
+                    budget = context.portfolio.available_cash
                     price = curr["close"]
                     if price > 0:
                         qty = int((budget / price) // 100) * 100
                         if qty > 0:
                             context.order(code, qty)
-                            holding.add(code)
                             logger.info(f"{context.current_date} 金叉买入 {code} {qty}股")
 
             # 死叉
             elif prev["ma_short"] >= prev["ma_long"] and curr["ma_short"] < curr["ma_long"]:
-                if code in holding:
+                if has_pos:
                     pos = context.portfolio.get_position(code)
                     if pos and pos.sellable_qty > 0:
                         context.order(code, -pos.sellable_qty)
-                        holding.discard(code)
                         logger.info(f"{context.current_date} 死叉卖出 {code} {pos.sellable_qty}股")
