@@ -91,6 +91,64 @@ class TestLimitsAndStops:
         assert fills[0].qty == 100  # 截断到 volume_limit
 
 
+class TestBoardSpecificPriceLimit:
+    """板块涨跌停规则集成测试（PRD_20260520_08）。"""
+
+    def test_star_market_allows_15_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 科创板 ±20%：prev_close=100，open=115（+15%）应放行
+        b = bar_factory(open_=115.0, high=115.0, low=115.0, close=115.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="688981.SH", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"688981.SH": b}, "20240101")
+        assert len(fills) == 1
+
+    def test_star_market_blocks_at_20_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 科创板涨停：prev_close=100，open=120（+20%）应拦截
+        b = bar_factory(open_=120.0, high=120.0, low=120.0, close=120.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="688981.SH", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"688981.SH": b}, "20240101")
+        assert fills == []
+
+    def test_chinext_after_reform_allows_15_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 创业板 2020-08-24 后 ±20%：+15% 应放行
+        b = bar_factory(open_=115.0, high=115.0, low=115.0, close=115.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="300750.SZ", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"300750.SZ": b}, "20240101")
+        assert len(fills) == 1
+
+    def test_chinext_before_reform_blocks_at_12_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 创业板 2020-08-23 前仍是 ±10%：+12% 应拦截
+        b = bar_factory(open_=112.0, high=112.0, low=112.0, close=112.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="300750.SZ", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"300750.SZ": b}, "20200823")
+        assert fills == []
+
+    def test_chinext_on_reform_day_allows_15_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 创业板 2020-08-24 当天起 ±20%：+15% 应放行
+        b = bar_factory(open_=115.0, high=115.0, low=115.0, close=115.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="300750.SZ", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"300750.SZ": b}, "20200824")
+        assert len(fills) == 1
+
+    def test_main_board_blocks_at_12_percent(self, trade_engine, portfolio: Portfolio, bar_factory):
+        # 主板始终 ±10%：+12% 应拦截
+        b = bar_factory(open_=112.0, high=112.0, low=112.0, close=112.0,
+                        prev_close=100.0, volume=1_000_000)
+        portfolio.reserve_cash(50_000)
+        order = Order(code="600000.SH", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"600000.SH": b}, "20240101")
+        assert fills == []
+
+
 class TestLimitOrder:
     def test_limit_buy_triggers(self, trade_engine, portfolio: Portfolio, bar_factory):
         b = bar_factory(open_=10.5, high=11.0, low=9.5, close=10.8, prev_close=10.5)

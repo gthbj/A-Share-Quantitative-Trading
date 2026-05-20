@@ -87,7 +87,7 @@
 **设计要点**：
 - `TradeEngine` 与 `BacktestEngine` 分离：前者只负责"一笔订单能否成交"，后者负责"何时调用策略、如何组织交易日历"。
 - 回测默认采用 **T+1 开盘价成交**（`price_type="next_open"`），避免未来函数（Lookahead Bias）。
-- 涨跌停判定基于 `prev_close` 与当日 `open` 计算，主板简化为 ±10%（实际可通过配置扩展科创板 ±20%、ST ±5%）。
+- 涨跌停判定基于 `prev_close` 与当日 `open` 计算，按板块细分（PRD_20260520_08）：主板 ±10%、科创板 ±20%、创业板 ±20%（2020-08-24 起，之前 ±10%）、ETF/LOF/可转债 ±10%；由 `utils.code.price_limit_pct(code, current_date)` 统一返回。ST ±5%、北交所 ±30%、新股首日特殊涨跌幅暂不支持（见 TODO）。
 - 分钟级回测保持 T+1 以**交易日**为维度：当日买入的股票在当日剩余所有分钟内均不可卖，下一交易日开盘后解冻。
 - **全局止损**：引擎每日/每 Bar 在策略信号之后、撮合之前自动检查持仓浮亏。仅对 `sellable_qty > 0` 的仓位生效（T+1 当日买入不会被止），止损单以 `OrderType.MARKET` 发出，与策略订单一起进入 `TradeEngine` 按 A 股规则撮合。
 - **订单类型撮合规则**（详见 §4.10）：
@@ -304,7 +304,7 @@ context.order(code, target_qty - current_qty)
 | `LIMIT` | `bar.low ≤ order.price` | `bar.high ≥ order.price` | `order.price` | ✗（限价单自带价格约束）|
 | `STOP` | `bar.high ≥ order.stop_price` | `bar.low ≤ order.stop_price` | 买入：`max(bar.open, stop_price)`；卖出：`min(bar.open, stop_price)`（保守取更不利价）| ✗ |
 
-涨跌停判定（基于 `prev_close ± 10%`）与成交量限制（`volume_limit`）对所有订单类型均生效。
+涨跌停判定（按板块取自 `utils.code.price_limit_pct`）与成交量限制（`volume_limit`）对所有订单类型均生效。详见 §4.13。
 
 策略侧用法：
 
@@ -325,7 +325,7 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 
 `analytics.metrics.calculate_metrics` 中：当 `frequency != "daily"` 且基准为日线时，策略 nav 会自动重采样到日线再对齐 benchmark；并要求至少 20 个对齐日线点才计算 Beta，否则保持 0。
 
-### 4.12 单元测试（PRD_20260520_07）
+### 4.12 单元测试（PRD_20260520_07 / 08）
 
 `tests/` 目录覆盖核心模块的边界场景：
 
@@ -333,9 +333,27 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 |---|---|---|
 | `test_position.py` | `Position` | T+1 解冻、FIFO 同步消减 _buy_records（防 sellable_qty 虚高）、清仓归零 |
 | `test_portfolio.py` | `Portfolio` | 冻结/释放、买入扣 frozen、卖出回笼 cash |
-| `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告 |
+| `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截（含板块细分）、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告 |
 | `test_code.py` | `utils.code` | 代码归一化、前缀推断、未知交易所抛错 |
 | `test_metrics.py` | `analytics.metrics._pair_fifo` + `calculate_metrics` | 全盈/全亏/混合配对、未平仓忽略、FIFO 顺序、inf 盈亏比 |
+| `test_price_limit.py` | `utils.code.price_limit_pct` | 主板 / 科创板 / 创业板（含 2020-08-24 切换）/ ETF / 异常输入 fallback |
+
+### 4.13 板块涨跌停规则（PRD_20260520_08）
+
+`utils.code.price_limit_pct(code, current_date)` 统一按代码前缀返回涨跌停比例：
+
+| 代码模式 | 板块 | 涨跌幅 |
+|---|---|---|
+| `60xxxx.SH` | 沪市主板 | 0.10 |
+| `000/001/002/003xxxx.SZ` | 深市主板（含原中小板） | 0.10 |
+| `688/689xxxx.SH` | 科创板 | 0.20 |
+| `300/301xxxx.SZ` | 创业板 | 0.20*（2020-08-24 起；之前 0.10）|
+| `51/56/58/11xxxx.SH` / `15/16xxxx.SZ` | ETF / LOF / 可转债 | 0.10 |
+| 其他 / 异常输入 | fallback | 0.10 |
+
+`TradeEngine._try_fill` 调用该函数时传入 `current_date`，由其内部 `_parse_date` 解析（兼容 `YYYYMMDD` / `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDDHHMM`）。
+
+**未来扩展**（TODO 已记录）：ST/*ST ±5%（缺数据源）、北交所 ±30%（`normalize_code` 暂不接受 4/8 前缀）、新股首日特殊涨跌幅（缺 `list_date`）。
 
 运行：`pytest tests/ -v`（共 64 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
 
@@ -393,7 +411,7 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 - `stop_loss.enabled`：是否启用全局止损
 - `stop_loss.threshold`：止损阈值（如 `0.05` 表示浮亏达到 5% 触发）
 
-如需修改涨跌停幅度（如科创板 20%），编辑 `engine/trade_engine.py` 的 `_try_fill` 方法。
+涨跌停幅度由 `utils.code.price_limit_pct(code, current_date)` 按板块返回（主板 10%、科创板/创业板 20%、ETF 10%）。如需扩展（如 ST ±5%、北交所 ±30%），改该函数即可，`TradeEngine` 调用方不变。
 
 ---
 

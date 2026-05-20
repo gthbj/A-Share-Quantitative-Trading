@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from account.portfolio import Portfolio
+from utils.code import price_limit_pct
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -188,11 +189,14 @@ class TradeEngine:
             return None
 
         # 涨跌停限制（对所有订单类型均生效）
+        # 板块细分：主板 ±10%、科创板/创业板 ±20%、ETF/LOF/可转债 ±10%
+        # 创业板按 current_date 切换（2020-08-24 起 ±20%）
+        # ST ±5% / 北交所 ±30% / 新股首日：本期不支持，见 TODO
         prev_close = bar.get("prev_close", price)
         if prev_close and prev_close > 0:
-            up_limit = prev_close * 1.1
-            down_limit = prev_close * 0.9
-            # 简化：主板10%，实际需区分科创板20%、ST 5%
+            limit_pct = price_limit_pct(order.code, current_date)
+            up_limit = prev_close * (1.0 + limit_pct)
+            down_limit = prev_close * (1.0 - limit_pct)
             if order.side == OrderSide.BUY and price >= up_limit:
                 return None  # 涨停无法买入
             if order.side == OrderSide.SELL and price <= down_limit:

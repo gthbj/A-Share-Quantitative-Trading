@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 07）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 08）
 
 | 编号 | 问题 | 解决方案 |
 |------|------|---------|
@@ -24,6 +24,7 @@
 | —    | engine/__init__ 未导出 PaperTrader | PRD_20260520_01：已导出 |
 | —    | README/ARCHITECTURE 与现状不一致 | PRD_20260520_01：全文同步 |
 | —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
+| P2-3 | 涨跌停固定 ±10%（未区分科创板/创业板/ETF） | PRD_20260520_08：抽 `utils.code.price_limit_pct(code, date)`；主板 10% / 科创板创业板 20% / ETF 10%；创业板按 2020-08-24 切换 |
 
 ---
 
@@ -65,18 +66,46 @@ PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未�
 
 ---
 
-### TBD-4: 涨跌停规则简化为 ±10%
+### TBD-4: ST/*ST 股票涨跌停 ±5% 未支持
 
 **现象**  
-`TradeEngine._try_fill` 中涨跌停判定固定 ±10%，未区分科创板 ±20%、ST ±5%、北交所 ±30%。
+PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、ETF 10%），但 ST/*ST 股票应为 ±5%，目前一律按板块默认值放行。
+
+**根因分析**  
+当前数据源（MaxCompute 5min K 线表）不包含 ST 标签字段；`Order` 也没有 `is_st` 字段。
 
 **修复方向**  
-- 在 Code 工具层维护一个 `price_limit_pct(code)` 函数：根据前缀返回涨跌停幅度
-- `TradeEngine` 调用该函数动态获取
+- 等股票列表 / 基本面表上线后接入 ST 状态（按日期生效）
+- 或给 `Order` 加 `is_st: bool` 字段由策略层显式标注
+- 修改点集中在 `utils.code.price_limit_pct`，调用方不变
 
 ---
 
-### TBD-5: 缺少行业 / 财务因子数据
+### TBD-5: 北交所代码 / 涨跌停 ±30% 未支持
+
+**现象**  
+`utils.code.normalize_code` 当前不接受北交所前缀（4/8 开头），所以 `price_limit_pct` 即使加了北交所分支也不会被触发。
+
+**修复方向**  
+- 扩展 `_SH_PREFIXES` / `_SZ_PREFIXES` 或新增 `_BJ_PREFIXES`，让框架代码支持 `.BJ` 后缀
+- `price_limit_pct` 加北交所分支返回 0.30
+- `data_layer` 需相应支持北交所数据源（MaxCompute 表是否覆盖待确认）
+
+---
+
+### TBD-6: 新股上市首日涨跌幅未支持
+
+**现象**  
+A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无限制），目前一律按板块常规规则。
+
+**修复方向**  
+- 需先接入股票 `list_date` 字段
+- `price_limit_pct` 增加 `list_date` 参数；当 `current_date == list_date` 时返回特殊值
+- 撮合逻辑需要区分"无限制"（创业板首日）与"特殊比例"（主板 44%）
+
+---
+
+### TBD-7: 缺少行业 / 财务因子数据
 
 **现象**  
 `MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
