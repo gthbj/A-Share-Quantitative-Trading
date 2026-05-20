@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 10）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 11）
 
 | 编号 | 问题 | 解决方案 |
 |------|------|---------|
@@ -29,6 +29,7 @@
 | TBD-2 | 限价单/止损单无过期与取消机制（挂单当根 bar 不成交即消失） | PRD_20260520_10：`TradeEngine.pending_orders` 挂单池；`sweep_pending` 每根 bar 扫描；`time_in_force` DAY/GTC + `expire_date`；`Context.cancel_order`；`BacktestEngine` 两条循环路径均已集成；新增 21 个单元测试（AC-9.1~9.7）|
 | TBD-4 | 北交所代码 / 涨跌停 ±30% 未支持 | PRD_20260520_10：`_BJ_PREFIXES` + `normalize_code` / `to_exchange_code` / `to_framework_code` 全支持 `.BJ`；`price_limit_pct` 北交所分支返回 0.30 |
 | TBD-5 | 新股上市首日涨跌幅未支持 | PRD_20260520_10：`price_limit_pct` 加 `list_date` 参数；`_is_within_first_n_trading_days` 用 TradingCalendar 判定；首 5 交易日返回 1.0；`Order.list_date` 字段 + `TradeEngine.listing_dates` / `set_listing_dates` 双通道注入 |
+| TBD-5（缓存） | MaxCompute 缓存命中路径 `load_bars` end_date 裁剪丢分钟数据 | PRD_20260520_11：`LocalStorage.load_bars()` 过滤改为 `date <= end_date + "9999"`，对齐非缓存路径行为 |
 
 ---
 
@@ -71,27 +72,6 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 
 ---
 
-### TBD-5: MaxCompute 数据源 get_bars 缓存裁剪丢数据
-
-**现象**  
-PRD_20260520_09 端到端验证时发现：当 `get_multi_bars(start, end)` 请求的 `end` 接近缓存数据范围末尾时，返回结果可能少最后 1~2 个交易日。例如本地缓存覆盖到 20240130，请求 `end=20240115` 实际只拉到 20240112。
-
-**根因（待确认）**  
-`MaxComputeDataSource.get_bars` 第 386–394 行的缓存命中逻辑：
-```python
-if cmin <= str(start_date) and cmax >= str(end_date):
-    df = self.storage.load_bars(norm_code, start_date, end_date, period=period)
-```
-怀疑 `storage.load_bars` 对分钟级数据按 `YYYYMMDD` 字符串严格 ≤ end_date 过滤，没像 `get_bars` 主路径那样用 `end_date + "9999"` 兜底。
-
-**修复方向**  
-- 排查 `storage.load_bars` 的 end_date 过滤逻辑
-- 对分钟级数据，过滤时统一使用 `date <= end_date + "9999"`
-
-**影响**  
-- 回测无感（回测一次性预加载整段区间，缓存命中后 end 在范围内不会触发该问题）
-- PaperTrader 每次 `run_once` 都拉一段窄区间，更容易撞上这个边界，导致"无任何当日行情，跳过"
-
 ---
 
-*本文档最后更新：2026-05-20（PRD_20260520_09/10 全部关闭）*
+*本文档最后更新：2026-05-20（PRD_20260520_11 TBD-5 缓存 bug 已关闭）*

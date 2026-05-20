@@ -88,7 +88,7 @@ class LocalStorage:
         if start_date:
             df = df[df["date"] >= start_date]
         if end_date:
-            df = df[df["date"] <= end_date]
+            df = df[df["date"] <= end_date + "9999"]
         return df.reset_index(drop=True)
 
     def save_stock_list(self, df: pd.DataFrame, fmt: str = "parquet") -> None:
