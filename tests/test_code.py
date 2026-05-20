@@ -95,3 +95,56 @@ class TestToFrameworkCode:
 
     def test_uppercase_input(self):
         assert to_framework_code("SH600000") == "600000.SH"
+
+
+class TestBeiJingExchange:
+    """北交所代码归一化与互转（PRD_20260520_10）。"""
+
+    # --- normalize_code ---
+
+    def test_normalize_with_bj_suffix_upper(self):
+        assert normalize_code("832000.BJ") == "832000.BJ"
+
+    def test_normalize_with_bj_suffix_lower(self):
+        assert normalize_code("832000.bj") == "832000.BJ"
+
+    def test_normalize_bare_83_prefix(self):
+        # 普通北交所代码（83 字头）
+        assert normalize_code("832000") == "832000.BJ"
+
+    def test_normalize_bare_43_prefix(self):
+        # 老三板（43 字头）
+        assert normalize_code("430718") == "430718.BJ"
+
+    def test_normalize_bare_87_prefix(self):
+        assert normalize_code("873726") == "873726.BJ"
+
+    def test_normalize_bare_88_prefix(self):
+        assert normalize_code("880188") == "880188.BJ"
+
+    def test_normalize_bare_92_prefix(self):
+        # 精选层（92 字头）
+        assert normalize_code("920001") == "920001.BJ"
+
+    def test_normalize_invalid_bj_suffix_raises(self):
+        with pytest.raises(ValueError):
+            normalize_code("832000.XY")
+
+    # --- to_exchange_code ---
+
+    def test_to_exchange_code_bj(self):
+        assert to_exchange_code("832000.BJ") == "bj832000"
+
+    def test_to_exchange_code_already_bj_format(self):
+        assert to_exchange_code("bj832000") == "bj832000"
+
+    def test_to_exchange_code_bare_bj(self):
+        assert to_exchange_code("832000") == "bj832000"
+
+    # --- to_framework_code ---
+
+    def test_to_framework_code_bj(self):
+        assert to_framework_code("bj832000") == "832000.BJ"
+
+    def test_to_framework_code_bj_uppercase(self):
+        assert to_framework_code("BJ832000") == "832000.BJ"

@@ -36,6 +36,7 @@ class Order:
     order_type: OrderType = OrderType.MARKET
     price: Optional[float] = None  # 限价单/止损单有效
     stop_price: Optional[float] = None  # 止损单触发价
+    list_date: Optional[str] = None  # 上市日期（YYYYMMDD），用于新股首日无涨跌幅判定
 
     def __post_init__(self):
         # A股最小交易单位为100股
@@ -56,6 +57,7 @@ class Order:
             "order_type": self.order_type.value,
             "price": self.price,
             "stop_price": self.stop_price,
+            "list_date": self.list_date,
         }
 
     @classmethod
@@ -68,6 +70,7 @@ class Order:
             order_type=OrderType(data.get("order_type", "market")),
             price=data.get("price"),
             stop_price=data.get("stop_price"),
+            list_date=data.get("list_date"),
         )
 
 
@@ -117,6 +120,17 @@ class TradeEngine:
         self.slippage_value = slippage_value
         self.volume_limit = volume_limit
         self.price_type = price_type
+        # 上市日期映射表：code → YYYYMMDD；用于全局注入新股首日规则
+        # 优先级：order.list_date > listing_dates[code] > ""（不判断）
+        self.listing_dates: Dict[str, str] = {}
+
+    def set_listing_dates(self, mapping: Dict[str, str]) -> None:
+        """批量注入股票上市日期映射，供 _try_fill 判定新股首日涨跌幅。
+
+        Args:
+            mapping: ``{"688999.SH": "20240105", "832000.BJ": "20240108"}``
+        """
+        self.listing_dates.update(mapping)
 
     # ---------- 费用计算 ----------
 
@@ -212,12 +226,14 @@ class TradeEngine:
             return None
 
         # 涨跌停限制（对所有订单类型均生效）
-        # 板块细分：主板 ±10%、科创板/创业板 ±20%、ETF/LOF/可转债 ±10%
+        # 板块细分：主板 ±10%、科创板/创业板 ±20%、北交所 ±30%、ETF/LOF/可转债 ±10%
         # 创业板按 current_date 切换（2020-08-24 起 ±20%）
-        # ST ±5% / 北交所 ±30% / 新股首日：本期不支持，见 TODO
+        # 新股首日：传入 list_date 后由 price_limit_pct 判定，前 5 个交易日返回 1.0（等效无限制）
+        # ST ±5%：当前数据源无 ST 标签，暂不支持（见 TODO）
+        eff_list_date = order.list_date or self.listing_dates.get(order.code) or ""
         prev_close = bar.get("prev_close", price)
         if prev_close and prev_close > 0:
-            limit_pct = price_limit_pct(order.code, current_date)
+            limit_pct = price_limit_pct(order.code, current_date, eff_list_date)
             up_limit = prev_close * (1.0 + limit_pct)
             down_limit = prev_close * (1.0 - limit_pct)
             if order.side == OrderSide.BUY and price >= up_limit:

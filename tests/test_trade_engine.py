@@ -1,5 +1,6 @@
 """TradeEngine 单元测试。"""
 
+import pandas as pd
 import pytest
 
 from account.portfolio import Portfolio
@@ -222,3 +223,107 @@ class TestOrderQtyWarning:
 
         assert o.qty == 0
         assert any("不是 100 的倍数" in r.message for r in caplog.records)
+
+
+class TestListingDates:
+    """新股首日 + listing_dates 注入（PRD_20260520_10）。"""
+
+    def _make_engine(self, **kwargs):
+        return TradeEngine(
+            commission_rate=0.00025,
+            min_commission=5.0,
+            stamp_duty_rate=0.0005,
+            transfer_fee_rate=0.00001,
+            slippage_type="percent",
+            slippage_value=0.0,
+            volume_limit=1.0,
+            price_type="next_open",
+            **kwargs,
+        )
+
+    def _make_bar(self, open_=10.0, close=10.0, prev_close=10.0) -> pd.Series:
+        """构造一个 prev_close = 5.0 的 bar，用于验证新股涨跌停放行。"""
+        return pd.Series(
+            {
+                "open": open_,
+                "high": open_ * 2,
+                "low": open_,
+                "close": close,
+                "volume": 10_000_000,
+                "prev_close": prev_close,
+            }
+        )
+
+    def test_set_listing_dates_updates_dict(self):
+        engine = self._make_engine()
+        engine.set_listing_dates({"688999.SH": "20240105", "832000.BJ": "20240108"})
+        assert engine.listing_dates["688999.SH"] == "20240105"
+        assert engine.listing_dates["832000.BJ"] == "20240108"
+
+    def test_new_listing_order_passes_via_engine_dict(self):
+        """engine.listing_dates 注入后，新股首日订单按涨跌幅 ±100% 放行（价格不被拦截）。
+
+        prev_close=5, open=8：
+          - 正常 ±20% 上限 = 5*1.2 = 6 → open=8 > 6，会被拦截
+          - 新股首日 ±100% 上限 = 5*2.0 = 10 → open=8 < 10，不会被拦截
+        """
+        engine = self._make_engine()
+        engine.set_listing_dates({"688999.SH": "20240105"})
+        portfolio = Portfolio(1_000_000.0)
+        portfolio.reserve_cash(500_000)
+
+        bar = self._make_bar(open_=8.0, prev_close=5.0)
+        order = Order(code="688999.SH", side=OrderSide.BUY, qty=100)
+        fills = engine.execute_orders([order], portfolio, {"688999.SH": bar}, "20240105")
+        assert len(fills) == 1, "新股首日订单应成功成交"
+
+    def test_order_list_date_overrides_engine_dict(self):
+        """order.list_date 优先级高于 engine.listing_dates。"""
+        engine = self._make_engine()
+        # engine 字典给了一个更早的 list_date（已过首 5 日窗口）
+        engine.set_listing_dates({"688999.SH": "20231201"})
+        portfolio = Portfolio(1_000_000.0)
+        portfolio.reserve_cash(500_000)
+
+        # prev_close=5, open=8 → 正常 ±20% 上限=6，会被拦截；新股 ±100% 上限=10，不拦截
+        bar = self._make_bar(open_=8.0, prev_close=5.0)
+        # order 自带正确的 list_date = 当天 → 应以 order.list_date 为准，新股首日放行
+        order = Order(code="688999.SH", side=OrderSide.BUY, qty=100, list_date="20240105")
+        fills = engine.execute_orders([order], portfolio, {"688999.SH": bar}, "20240105")
+        assert len(fills) == 1, "order.list_date 应覆盖 engine 字典，新股首日放行"
+
+    def test_normal_order_blocked_at_up_limit(self):
+        """不传 list_date 时科创板 ±20% 正常拦截。"""
+        engine = self._make_engine()
+        portfolio = Portfolio(1_000_000.0)
+        portfolio.reserve_cash(500_000)
+
+        bar = self._make_bar(open_=12.0, prev_close=5.0)
+        order = Order(code="688999.SH", side=OrderSide.BUY, qty=100)
+        fills = engine.execute_orders([order], portfolio, {"688999.SH": bar}, "20240105")
+        assert len(fills) == 0, "科创板 ±20% 拦截：open=12 > prev_close*1.2=6"
+
+    def test_order_list_date_to_dict_roundtrip(self):
+        """Order.list_date 经 to_dict / from_dict 往返不丢失。"""
+        order = Order(
+            code="688999.SH",
+            side=OrderSide.BUY,
+            qty=100,
+            list_date="20240105",
+        )
+        restored = Order.from_dict(order.to_dict())
+        assert restored.list_date == "20240105"
+
+    def test_order_without_list_date_roundtrip(self):
+        """无 list_date 的旧 Order 向后兼容。"""
+        old_dict = {
+            "code": "510300.SH",
+            "side": "buy",
+            "qty": 100,
+            "order_type": "market",
+            "price": None,
+            "stop_price": None,
+            # 无 list_date 字段
+        }
+        order = Order.from_dict(old_dict)
+        assert order.list_date is None

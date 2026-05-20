@@ -87,7 +87,7 @@
 **设计要点**：
 - `TradeEngine` 与 `BacktestEngine` 分离：前者只负责"一笔订单能否成交"，后者负责"何时调用策略、如何组织交易日历"。
 - 回测默认采用 **T+1 开盘价成交**（`price_type="next_open"`），避免未来函数（Lookahead Bias）。
-- 涨跌停判定基于 `prev_close` 与当日 `open` 计算，按板块细分（PRD_20260520_08）：主板 ±10%、科创板 ±20%、创业板 ±20%（2020-08-24 起，之前 ±10%）、ETF/LOF/可转债 ±10%；由 `utils.code.price_limit_pct(code, current_date)` 统一返回。ST ±5%、北交所 ±30%、新股首日特殊涨跌幅暂不支持（见 TODO）。
+- 涨跌停判定基于 `prev_close` 与当日 `open` 计算，按板块细分（PRD_20260520_08/10）：主板 ±10%、科创板 ±20%、创业板 ±20%（2020-08-24 起，之前 ±10%）、北交所 ±30%、ETF/LOF/可转债 ±10%；新股上市首 5 个交易日无涨跌幅限制（返回 1.0）；由 `utils.code.price_limit_pct(code, current_date, list_date)` 统一返回。ST ±5% 暂不支持（见 TODO）。
 - 分钟级回测保持 T+1 以**交易日**为维度：当日买入的股票在当日剩余所有分钟内均不可卖，下一交易日开盘后解冻。
 - **全局止损**：引擎每日/每 Bar 在策略信号之后、撮合之前自动检查持仓浮亏。仅对 `sellable_qty > 0` 的仓位生效（T+1 当日买入不会被止），止损单以 `OrderType.MARKET` 发出，与策略订单一起进入 `TradeEngine` 按 A 股规则撮合。
 - **订单类型撮合规则**（详见 §4.10）：
@@ -336,12 +336,12 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 | `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截（含板块细分）、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告 |
 | `test_code.py` | `utils.code` | 代码归一化、前缀推断、未知交易所抛错 |
 | `test_metrics.py` | `analytics.metrics._pair_fifo` + `calculate_metrics` | 全盈/全亏/混合配对、未平仓忽略、FIFO 顺序、inf 盈亏比 |
-| `test_price_limit.py` | `utils.code.price_limit_pct` | 主板 / 科创板 / 创业板（含 2020-08-24 切换）/ ETF / 异常输入 fallback |
+| `test_price_limit.py` | `utils.code.price_limit_pct` | 主板 / 科创板 / 创业板（含 2020-08-24 切换）/ 北交所 / 新股首日（前 5 交易日 ±100%）/ ETF / 异常输入 fallback |
 | `test_paper_trader.py` | `PaperTrader`（PRD_20260520_09）| 首次启动校验、state 往返序列化、老 state 向后兼容、next_open 延迟成交、user_data 跨日续接、重复运行拦截、止损队列持久化、user_data 不可序列化报错 |
 
-### 4.13 板块涨跌停规则（PRD_20260520_08）
+### 4.13 板块涨跌停规则（PRD_20260520_08 / PRD_20260520_10）
 
-`utils.code.price_limit_pct(code, current_date)` 统一按代码前缀返回涨跌停比例：
+`utils.code.price_limit_pct(code, current_date, list_date="")` 统一按代码前缀返回涨跌停比例：
 
 | 代码模式 | 板块 | 涨跌幅 |
 |---|---|---|
@@ -349,12 +349,16 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 | `000/001/002/003xxxx.SZ` | 深市主板（含原中小板） | 0.10 |
 | `688/689xxxx.SH` | 科创板 | 0.20 |
 | `300/301xxxx.SZ` | 创业板 | 0.20*（2020-08-24 起；之前 0.10）|
+| `43/83/87/88/92xxxx.BJ` | 北交所 | 0.30 |
 | `51/56/58/11xxxx.SH` / `15/16xxxx.SZ` | ETF / LOF / 可转债 | 0.10 |
 | 其他 / 异常输入 | fallback | 0.10 |
+| **任意板块，上市首 5 个交易日**（`list_date` 非空） | 新股无涨跌幅限制 | **1.0**（等效 ±100%）|
 
-`TradeEngine._try_fill` 调用该函数时传入 `current_date`，由其内部 `_parse_date` 解析（兼容 `YYYYMMDD` / `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDDHHMM`）。
+新股首日规则优先级最高，在所有板块分支之前判断。`TradeEngine._try_fill` 取 `list_date` 的优先级：`order.list_date` > `engine.listing_dates[code]` > `""`（不启用新股规则）。
 
-**未来扩展**（TODO 已记录）：ST/*ST ±5%（缺数据源）、北交所 ±30%（`normalize_code` 暂不接受 4/8 前缀）、新股首日特殊涨跌幅（缺 `list_date`）。
+`_parse_date` 兼容 `YYYYMMDD` / `YYYY-MM-DD` / `YYYY/MM/DD` / `YYYYMMDDHHMM` 格式。
+
+**未来扩展**（TODO 已记录）：ST/*ST ±5%（缺数据源）。
 
 ### 4.14 虚拟盘策略循环（PRD_20260520_09）
 
@@ -443,7 +447,7 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 - `stop_loss.enabled`：是否启用全局止损
 - `stop_loss.threshold`：止损阈值（如 `0.05` 表示浮亏达到 5% 触发）
 
-涨跌停幅度由 `utils.code.price_limit_pct(code, current_date)` 按板块返回（主板 10%、科创板/创业板 20%、ETF 10%）。如需扩展（如 ST ±5%、北交所 ±30%），改该函数即可，`TradeEngine` 调用方不变。
+涨跌停幅度由 `utils.code.price_limit_pct(code, current_date, list_date)` 按板块返回（主板 10%、科创板/创业板 20%、北交所 30%、ETF 10%；新股首 5 交易日 100%）。如需扩展（如 ST ±5%），改该函数即可，`TradeEngine` 调用方不变。
 
 ---
 

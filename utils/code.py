@@ -13,13 +13,21 @@ from __future__ import annotations
 import datetime as _dt
 from typing import List
 
+from utils.calendar import TradingCalendar
+
 # 上交所代码前缀（沪市主板 / 科创板 / ETF / LOF / 转债）
 _SH_PREFIXES = ("60", "68", "51", "56", "58", "11")
 # 深交所代码前缀（深市主板 / 创业板 / ETF / LOF）
 _SZ_PREFIXES = ("00", "30", "15", "16")
+# 北交所代码前缀（含老三板 43、普通 83/87/88、精选层 92）
+_BJ_PREFIXES = ("43", "83", "87", "88", "92")
 
 # 创业板注册制改革：2020-08-24 起涨跌幅由 ±10% 调整为 ±20%
 _CHINEXT_REFORM_DATE = _dt.date(2020, 8, 24)
+
+# 新股上市首日规则（2023 全面注册制后统一）：
+# 所有板块上市前 N 个交易日不设涨跌幅，第 N+1 个交易日起恢复常规板块规则。
+_NEW_LISTING_NO_LIMIT_DAYS = 5
 
 
 def normalize_code(raw: str) -> str:
@@ -40,19 +48,21 @@ def normalize_code(raw: str) -> str:
         raise ValueError("代码为空")
     if "." in s:
         bare, _, suffix = s.partition(".")
-        if suffix not in ("SH", "SZ"):
-            raise ValueError(f"未知交易所后缀: {raw}（应为 .SH 或 .SZ）")
+        if suffix not in ("SH", "SZ", "BJ"):
+            raise ValueError(f"未知交易所后缀: {raw}（应为 .SH、.SZ 或 .BJ）")
         if not bare.isdigit() or len(bare) != 6:
             raise ValueError(f"代码格式错误: {raw}（应为 6 位数字）")
         return f"{bare}.{suffix}"
     # 裸 6 位代码：按前缀推断
     if not s.isdigit() or len(s) != 6:
-        raise ValueError(f"代码格式错误: {raw}（应为 6 位数字 + 可选 .SH/.SZ 后缀）")
+        raise ValueError(f"代码格式错误: {raw}（应为 6 位数字 + 可选 .SH/.SZ/.BJ 后缀）")
     if s.startswith(_SH_PREFIXES):
         return f"{s}.SH"
     if s.startswith(_SZ_PREFIXES):
         return f"{s}.SZ"
-    raise ValueError(f"无法识别代码所属交易所: {raw}（请显式写明 .SH 或 .SZ）")
+    if s.startswith(_BJ_PREFIXES):
+        return f"{s}.BJ"
+    raise ValueError(f"无法识别代码所属交易所: {raw}（请显式写明 .SH、.SZ 或 .BJ）")
 
 
 def parse_universe(raw: str) -> List[str]:
@@ -74,7 +84,7 @@ def to_exchange_code(framework_code: str) -> str:
     code = str(framework_code).strip()
     lower = code.lower()
 
-    if lower.startswith(("sh", "sz")) and len(lower) == 8 and lower[2:].isdigit():
+    if lower.startswith(("sh", "sz", "bj")) and len(lower) == 8 and lower[2:].isdigit():
         return lower
 
     if "." in code:
@@ -84,6 +94,8 @@ def to_exchange_code(framework_code: str) -> str:
             return f"sh{bare}"
         if suffix == "SZ":
             return f"sz{bare}"
+        if suffix == "BJ":
+            return f"bj{bare}"
         raise ValueError(f"未知交易所后缀: {framework_code}")
 
     bare = code
@@ -92,6 +104,8 @@ def to_exchange_code(framework_code: str) -> str:
             return f"sh{bare}"
         if bare.startswith(_SZ_PREFIXES):
             return f"sz{bare}"
+        if bare.startswith(_BJ_PREFIXES):
+            return f"bj{bare}"
     raise ValueError(f"无法识别股票代码 {framework_code} 的交易所")
 
 
@@ -109,7 +123,7 @@ def _parse_date(date_str: str) -> _dt.date | None:
     return None
 
 
-def price_limit_pct(code: str, current_date: str = "") -> float:
+def price_limit_pct(code: str, current_date: str = "", list_date: str = "") -> float:
     """根据股票代码（按板块）返回涨跌停幅度（小数，如 0.10 表示 ±10%）。
 
     板块规则（A 股 2026 现行）：
@@ -125,6 +139,8 @@ def price_limit_pct(code: str, current_date: str = "") -> float:
     +------------------------+----------------------+--------+
     | ``300/301xxxx.SZ``     | 创业板               | 0.20*  |
     +------------------------+----------------------+--------+
+    | ``43/83/87/88/92xxxx`` | 北交所               | 0.30   |
+    +------------------------+----------------------+--------+
     | ``51/56/58/11.SH``     | 沪 ETF/LOF/可转债    | 0.10   |
     +------------------------+----------------------+--------+
     | ``15/16xxxx.SZ``       | 深 ETF/LOF           | 0.10   |
@@ -134,9 +150,13 @@ def price_limit_pct(code: str, current_date: str = "") -> float:
 
     \\* 创业板按 ``current_date`` 切换：≥2020-08-24 为 ±20%，之前为 ±10%。
 
+    新股上市首 ``_NEW_LISTING_NO_LIMIT_DAYS`` 个交易日无涨跌幅限制，返回 ``1.0``（即 ±100%，
+    撮合层以 ``prev_close * 2.0`` 为上限，等效不限）。第 N+1 个交易日起恢复常规板块规则。
+
     Args:
-        code: 框架代码（``XXXXXX.SH`` / ``XXXXXX.SZ``）或裸 6 位代码。
-        current_date: 当前回测日期，仅创业板用得到；缺省时按最新规则。
+        code: 框架代码（``XXXXXX.SH`` / ``XXXXXX.SZ`` / ``XXXXXX.BJ``）或裸 6 位代码。
+        current_date: 当前回测日期；创业板切换 + 新股首日均依赖此值；缺省时按最新规则。
+        list_date: 股票上市日期（``YYYYMMDD``）；传入时启用新股首日规则；缺省时跳过。
 
     Returns:
         涨跌停比例（小数）。异常输入返回 0.10 作为兜底。
@@ -145,8 +165,6 @@ def price_limit_pct(code: str, current_date: str = "") -> float:
         本函数暂不支持以下规则（已在 TODO.md 中记录）：
 
         - ST / *ST 股票 ±5%：当前数据源无 ST 标签
-        - 北交所 ±30%：``normalize_code`` 尚未接受北交所代码
-        - 新股上市首日特殊涨跌幅：缺少 ``list_date`` 字段
     """
     if not code:
         return 0.10
@@ -155,6 +173,11 @@ def price_limit_pct(code: str, current_date: str = "") -> float:
 
     if not bare.isdigit() or len(bare) != 6:
         return 0.10
+
+    # 新股首日：前 N 个交易日无涨跌幅限制（所有板块统一，2023 全面注册制后）
+    if list_date and current_date:
+        if _is_within_first_n_trading_days(current_date, list_date, _NEW_LISTING_NO_LIMIT_DAYS):
+            return 1.0
 
     # 科创板：始终 ±20%
     if bare.startswith(("688", "689")):
@@ -167,12 +190,30 @@ def price_limit_pct(code: str, current_date: str = "") -> float:
             return 0.20  # 无日期信息时取最新规则
         return 0.20 if parsed >= _CHINEXT_REFORM_DATE else 0.10
 
+    # 北交所：始终 ±30%
+    if bare.startswith(_BJ_PREFIXES):
+        return 0.30
+
     # 其他（主板、ETF/LOF/可转债）统一 ±10%
     return 0.10
 
 
+def _is_within_first_n_trading_days(current: str, list_date: str, n: int) -> bool:
+    """``current`` 是否在 ``list_date`` 起前 ``n`` 个交易日内（含 ``list_date`` 当天）。
+
+    使用 TradingCalendar 统计闭区间 [list_date, current] 内的交易日数。
+    若 current < list_date（防御性检查），返回 False。
+    """
+    cd = _parse_date(current)
+    ld = _parse_date(list_date)
+    if cd is None or ld is None or cd < ld:
+        return False
+    days = TradingCalendar.get_trading_days(list_date, current)
+    return 1 <= len(days) <= n
+
+
 def to_framework_code(exchange_code: str) -> str:
-    """表代码 → 框架代码：``sh600000`` → ``600000.SH``。"""
+    """表代码 → 框架代码：``sh600000`` → ``600000.SH``，``bj832000`` → ``832000.BJ``。"""
     if not exchange_code:
         return exchange_code
     code = str(exchange_code).strip().lower()
@@ -180,6 +221,8 @@ def to_framework_code(exchange_code: str) -> str:
         return f"{code[2:]}.SH"
     if code.startswith("sz") and len(code) == 8 and code[2:].isdigit():
         return f"{code[2:]}.SZ"
+    if code.startswith("bj") and len(code) == 8 and code[2:].isdigit():
+        return f"{code[2:]}.BJ"
     # 已是框架格式则原样返回
     if "." in code:
         return code.upper()

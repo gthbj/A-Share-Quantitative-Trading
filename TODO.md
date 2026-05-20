@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 09）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 10）
 
 | 编号 | 问题 | 解决方案 |
 |------|------|---------|
@@ -26,6 +26,8 @@
 | —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
 | P2-3 | 涨跌停固定 ±10%（未区分科创板/创业板/ETF） | PRD_20260520_08：抽 `utils.code.price_limit_pct(code, date)`；主板 10% / 科创板创业板 20% / ETF 10%；创业板按 2020-08-24 切换 |
 | P2-4 | paper_trader 缺少策略信号驱动 | PRD_20260520_09：`run_once` 完整接入策略循环（预加载历史 → next_open 撮合 → handle_data → 止损检查 → 状态持久化）；state.json 扩展存储策略类与 kwargs、user_data、待执行订单、待止损队列 |
+| TBD-4 | 北交所代码 / 涨跌停 ±30% 未支持 | PRD_20260520_10：`_BJ_PREFIXES` + `normalize_code` / `to_exchange_code` / `to_framework_code` 全支持 `.BJ`；`price_limit_pct` 北交所分支返回 0.30 |
+| TBD-5 | 新股上市首日涨跌幅未支持 | PRD_20260520_10：`price_limit_pct` 加 `list_date` 参数；`_is_within_first_n_trading_days` 用 TradingCalendar 判定；首 5 交易日返回 1.0；`Order.list_date` 字段 + `TradeEngine.listing_dates` / `set_listing_dates` 双通道注入 |
 
 ---
 
@@ -68,31 +70,7 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 
 ---
 
-### TBD-4: 北交所代码 / 涨跌停 ±30% 未支持
-
-**现象**  
-`utils.code.normalize_code` 当前不接受北交所前缀（4/8 开头），所以 `price_limit_pct` 即使加了北交所分支也不会被触发。
-
-**修复方向**  
-- 扩展 `_SH_PREFIXES` / `_SZ_PREFIXES` 或新增 `_BJ_PREFIXES`，让框架代码支持 `.BJ` 后缀
-- `price_limit_pct` 加北交所分支返回 0.30
-- `data_layer` 需相应支持北交所数据源（MaxCompute 表是否覆盖待确认）
-
----
-
-### TBD-5: 新股上市首日涨跌幅未支持
-
-**现象**  
-A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无限制），目前一律按板块常规规则。
-
-**修复方向**  
-- 需先接入股票 `list_date` 字段
-- `price_limit_pct` 增加 `list_date` 参数；当 `current_date == list_date` 时返回特殊值
-- 撮合逻辑需要区分"无限制"（创业板首日）与"特殊比例"（主板 44%）
-
----
-
-### TBD-6: 缺少行业 / 财务因子数据
+### TBD-4: 缺少行业 / 财务因子数据
 
 **现象**  
 `MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
@@ -103,7 +81,7 @@ A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无�
 
 ---
 
-### TBD-7: MaxCompute 数据源 get_bars 缓存裁剪丢数据
+### TBD-5: MaxCompute 数据源 get_bars 缓存裁剪丢数据
 
 **现象**  
 PRD_20260520_09 端到端验证时发现：当 `get_multi_bars(start, end)` 请求的 `end` 接近缓存数据范围末尾时，返回结果可能少最后 1~2 个交易日。例如本地缓存覆盖到 20240130，请求 `end=20240115` 实际只拉到 20240112。

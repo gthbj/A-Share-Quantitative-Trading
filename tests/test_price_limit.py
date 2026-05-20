@@ -86,6 +86,65 @@ class TestETFAndConvertible:
         assert price_limit_pct("113008.SH") == 0.10  # 可转债
 
 
+class TestBeiJingExchange:
+    """北交所：±30%（PRD_20260520_10）"""
+
+    def test_bj_83_prefix(self):
+        assert price_limit_pct("832000.BJ") == 0.30
+
+    def test_bj_43_prefix(self):
+        assert price_limit_pct("430718.BJ") == 0.30
+
+    def test_bj_92_prefix(self):
+        assert price_limit_pct("920001.BJ") == 0.30
+
+    def test_bj_bare_code(self):
+        # 裸代码前缀推断
+        assert price_limit_pct("832000") == 0.30
+        assert price_limit_pct("430718") == 0.30
+
+
+class TestNewListing:
+    """新股上市首 5 个交易日无涨跌幅限制，第 6 日起恢复常规规则（PRD_20260520_10）。
+
+    基准日期序列（20240105 起的交易日）：
+      day1=20240105(Fri) day2=20240108(Mon) day3=20240109(Tue)
+      day4=20240110(Wed) day5=20240111(Thu) day6=20240112(Fri)
+    """
+
+    def test_star_market_first_day(self):
+        # 科创板新股：上市当天
+        assert price_limit_pct("688999.SH", "20240105", "20240105") == 1.0
+
+    def test_star_market_fifth_day(self):
+        # 第 5 个交易日仍无限制
+        assert price_limit_pct("688999.SH", "20240111", "20240105") == 1.0
+
+    def test_star_market_sixth_day_resumes(self):
+        # 第 6 个交易日起恢复科创板 ±20%
+        assert price_limit_pct("688999.SH", "20240112", "20240105") == 0.20
+
+    def test_main_board_new_listing(self):
+        # 主板新股首日也无限制
+        assert price_limit_pct("600000.SH", "20240108", "20240105") == 1.0
+
+    def test_bj_new_listing(self):
+        # 北交所新股首日也无限制
+        assert price_limit_pct("832000.BJ", "20240108", "20240105") == 1.0
+
+    def test_no_list_date_uses_normal_rules(self):
+        # 不传 list_date → 走常规规则
+        assert price_limit_pct("300750.SZ", "20240101", "") == 0.20
+
+    def test_current_before_list_date_uses_normal_rules(self):
+        # current_date < list_date → 防御性退回常规规则
+        assert price_limit_pct("688999.SH", "20240104", "20240105") == 0.20
+
+    def test_only_current_date_without_list_date(self):
+        # 仅传 current_date，不传 list_date → 常规科创板 ±20%
+        assert price_limit_pct("688999.SH", "20240105") == 0.20
+
+
 class TestFallback:
     """异常输入：fallback 到 ±10%（不抛异常）"""
 
@@ -101,7 +160,6 @@ class TestFallback:
         assert price_limit_pct("1234567") == 0.10
 
     def test_unknown_prefix(self):
-        # 北交所代码（前缀 8/4）：本期不支持，fallback 到 0.10
-        # 等北交所正式接入后再细分（TODO）
-        assert price_limit_pct("832000.BJ") == 0.10
-        assert price_limit_pct("832000") == 0.10
+        # 真正无法识别的前缀（非沪深北）→ fallback 0.10
+        assert price_limit_pct("999999") == 0.10
+        assert price_limit_pct("700000") == 0.10
