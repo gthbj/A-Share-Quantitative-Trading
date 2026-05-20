@@ -26,6 +26,7 @@
 | —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
 | P2-3 | 涨跌停固定 ±10%（未区分科创板/创业板/ETF） | PRD_20260520_08：抽 `utils.code.price_limit_pct(code, date)`；主板 10% / 科创板创业板 20% / ETF 10%；创业板按 2020-08-24 切换 |
 | P2-4 | paper_trader 缺少策略信号驱动 | PRD_20260520_09：`run_once` 完整接入策略循环（预加载历史 → next_open 撮合 → handle_data → 止损检查 → 状态持久化）；state.json 扩展存储策略类与 kwargs、user_data、待执行订单、待止损队列 |
+| TBD-2 | 限价单/止损单无过期与取消机制（挂单当根 bar 不成交即消失） | PRD_20260520_10：`TradeEngine.pending_orders` 挂单池；`sweep_pending` 每根 bar 扫描；`time_in_force` DAY/GTC + `expire_date`；`Context.cancel_order`；`BacktestEngine` 两条循环路径均已集成；新增 21 个单元测试（AC-9.1~9.7）|
 | TBD-4 | 北交所代码 / 涨跌停 ±30% 未支持 | PRD_20260520_10：`_BJ_PREFIXES` + `normalize_code` / `to_exchange_code` / `to_framework_code` 全支持 `.BJ`；`price_limit_pct` 北交所分支返回 0.30 |
 | TBD-5 | 新股上市首日涨跌幅未支持 | PRD_20260520_10：`price_limit_pct` 加 `list_date` 参数；`_is_within_first_n_trading_days` 用 TradingCalendar 判定；首 5 交易日返回 1.0；`Order.list_date` 字段 + `TradeEngine.listing_dates` / `set_listing_dates` 双通道注入 |
 
@@ -33,18 +34,7 @@
 
 ## 🟢 待优化（建议优先级）
 
-### TBD-1: 限价单 / 止损单缺少过期与取消机制
-
-**现象**  
-PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未成交的挂单会一直在 `Context._orders` 中（实际上每次 `pop_orders()` 都清空了，所以现在的实现等于"挂单当根 bar 不成交就消失"）。
-
-**修复方向**  
-- `Order` 新增 `expire_date` / `time_in_force`（GTC / DAY）
-- 引擎层维护一个"未成交挂单池"，每根 bar 检查触发条件直到过期
-
----
-
-### TBD-2: chinese_calendar 覆盖范围有限
+### TBD-1: chinese_calendar 覆盖范围有限
 
 **现象**  
 `chinese_calendar` 当前版本（1.11.0）覆盖到 2026 年。2027+ 会降级到"非周末"启发式，导致 2027 假期判定错误。
@@ -104,4 +94,4 @@ if cmin <= str(start_date) and cmax >= str(end_date):
 
 ---
 
-*本文档最后更新：2026-05-20*
+*本文档最后更新：2026-05-20（PRD_20260520_09/10 全部关闭）*

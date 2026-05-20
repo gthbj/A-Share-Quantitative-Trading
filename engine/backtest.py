@@ -95,6 +95,7 @@ class BacktestEngine:
             data_source=self.data_source,
             current_date=trading_days[0].strftime("%Y%m%d"),
             frequency=self.frequency,
+            _cancel_callback=self.trade_engine.cancel,
         )
         strategy = self.strategy_cls(**self.strategy_kwargs)
         strategy.initialize(context)
@@ -163,6 +164,12 @@ class BacktestEngine:
             stop_loss_orders = self._generate_stop_loss_orders(portfolio)
             strategy.before_trading_start(context, today_bars)
 
+            # 3.5 扫描前期挂单（LIMIT/STOP；PRD_20260520_10）
+            # 日线回测每日只有一根 bar，is_last_bar_of_day 恒为 True，DAY 单当日过期
+            sweep_fills = self.trade_engine.sweep_pending(
+                portfolio, today_bars, date_str, is_last_bar_of_day=True
+            )
+
             # 4. 执行上一交易日 handle_data 产生的订单（next_open 语义）
             #    以及上一日收盘后触发的止损订单，均在今日开盘价成交。
             orders = context.pop_orders()
@@ -180,6 +187,7 @@ class BacktestEngine:
             fills = self.trade_engine.execute_orders(
                 orders, portfolio, today_bars, date_str
             )
+            fills = sweep_fills + fills  # 合并挂单成交与新单成交
 
             # 5. 盘中处理：策略基于今日 close 产生信号，订单留存至明日开盘执行
             strategy.handle_data(context, today_bars)
@@ -282,6 +290,12 @@ class BacktestEngine:
                 else:
                     stop_loss_orders = []
 
+                # 扫描前期挂单（LIMIT/STOP；PRD_20260520_10）
+                # is_last_bar_of_day 由循环顶部已计算，DAY 单在该 bar 后过期
+                sweep_fills = self.trade_engine.sweep_pending(
+                    portfolio, current_bars, time_str, is_last_bar_of_day
+                )
+
                 # ── 执行上一根 bar 产生的挂单（next_open 语义）──
                 # pop_orders() 取出的是上一次 handle_data 留存的订单
                 orders = context.pop_orders()
@@ -302,6 +316,7 @@ class BacktestEngine:
                 fills = self.trade_engine.execute_orders(
                     orders, portfolio, current_bars, time_str
                 )
+                fills = sweep_fills + fills  # 合并挂单成交与新单成交
 
                 # ── 盘中策略处理：基于当前 bar 的 close 产生信号 ──
                 # 新订单留存在 context._orders，下一根 bar 开盘时才执行

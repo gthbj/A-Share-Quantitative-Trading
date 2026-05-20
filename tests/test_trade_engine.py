@@ -12,6 +12,12 @@ from engine.trade_engine import (
     TradeEngine,
 )
 
+# ── 辅助 ──────────────────────────────────────────────────────────────────────
+
+def _make_portfolio(cash: float = 1_000_000.0) -> Portfolio:
+    """创建一个指定初始资金的空账户（不依赖 conftest fixture，方便参数化）。"""
+    return Portfolio(initial_capital=cash)
+
 
 class TestFeeCalc:
     def test_commission_min_floor(self, trade_engine: TradeEngine):
@@ -327,3 +333,333 @@ class TestListingDates:
         }
         order = Order.from_dict(old_dict)
         assert order.list_date is None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRD_20260520_10  限价/止损单挂单池、过期与取消机制
+# 验收标准 AC-9.1 ~ AC-9.7（含若干边界用例）
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPendingOrderPool:
+    """挂单池：LIMIT/STOP 单生命周期——入池、跨 Bar 触发、过期、取消。"""
+
+    # ── AC-9.1: execute_orders 未触发 → 入池 ────────────────────────────────
+
+    def test_ac91_limit_buy_enters_pending(self, trade_engine, portfolio, bar_factory):
+        """LIMIT 买单 bar.low > limit：未触发，进入挂单池。"""
+        # bar.low=9.5 > limit=9.0，不触发
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+        )
+        fills = trade_engine.execute_orders([order], portfolio, {"510300.SH": b}, "20240101")
+        assert fills == []
+        assert order.order_id in trade_engine.pending_orders
+
+    def test_ac91_stop_sell_enters_pending(self, trade_engine, portfolio, bar_factory):
+        """STOP 卖单 bar.low > stop_price：未触发，进入挂单池。"""
+        portfolio.apply_buy_fill("510300.SH", 100, 10.0, "20231231")
+        portfolio.positions["510300.SH"].update_sellable("20240101")
+        # bar.low=9.5 > stop_price=9.0，不触发
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.SELL, qty=100,
+            order_type=OrderType.STOP, stop_price=9.0,
+        )
+        fills = trade_engine.execute_orders([order], portfolio, {"510300.SH": b}, "20240101")
+        assert fills == []
+        assert order.order_id in trade_engine.pending_orders
+
+    # ── AC-9.2: sweep_pending 下一根 bar 触发 ────────────────────────────────
+
+    def test_ac92_limit_sell_fills_next_bar(self, trade_engine, portfolio, bar_factory):
+        """LIMIT 卖单在第二根 bar bar.high ≥ limit 时由 sweep_pending 成交。"""
+        portfolio.apply_buy_fill("510300.SH", 100, 10.0, "20231231")
+        portfolio.positions["510300.SH"].update_sellable("20240101")
+
+        # Bar-1: bar.high=10.3 < limit=10.5 → 不触发，进池
+        b1 = bar_factory(open_=10.0, high=10.3, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.SELL, qty=100,
+            order_type=OrderType.LIMIT, price=10.5,
+        )
+        fills1 = trade_engine.execute_orders([order], portfolio, {"510300.SH": b1}, "20240101")
+        assert fills1 == []
+        assert order.order_id in trade_engine.pending_orders
+
+        # Bar-2: bar.high=11.0 ≥ limit=10.5 → 触发成交
+        b2 = bar_factory(open_=10.6, high=11.0, low=10.4, close=10.8, volume=1_000_000)
+        fills2 = trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b2}, "20240102", is_last_bar_of_day=False
+        )
+        assert len(fills2) == 1
+        assert fills2[0].price == pytest.approx(10.5)
+        assert order.order_id not in trade_engine.pending_orders  # 成交后移除
+
+    def test_ac92_limit_buy_fills_next_bar(self, trade_engine, portfolio, bar_factory):
+        """LIMIT 买单在第二根 bar bar.low ≤ limit 时由 sweep_pending 成交。"""
+        # Bar-1: bar.low=9.5 > limit=9.0 → 不触发
+        b1 = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+        )
+        trade_engine.execute_orders([order], portfolio, {"510300.SH": b1}, "20240101")
+        assert order.order_id in trade_engine.pending_orders
+
+        # Bar-2: bar.low=8.8 ≤ limit=9.0 → 触发，按 limit=9.0 成交
+        b2 = bar_factory(open_=9.2, high=9.4, low=8.8, close=9.0, volume=1_000_000)
+        fills2 = trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b2}, "20240102", is_last_bar_of_day=False
+        )
+        assert len(fills2) == 1
+        assert fills2[0].price == pytest.approx(9.0)
+        assert order.order_id not in trade_engine.pending_orders
+
+    # ── AC-9.3: DAY 单在当日最后 bar 过期 ───────────────────────────────────
+
+    def test_ac93_day_order_expires_at_eod(self, trade_engine, portfolio, bar_factory):
+        """DAY 单 is_last_bar_of_day=True 且未触发时，从挂单池中移除。"""
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="DAY",
+        )
+        trade_engine.add_pending(order)
+        assert order.order_id in trade_engine.pending_orders
+
+        # is_last_bar_of_day=True → DAY 单应在此 bar 结束时过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b}, "20240101", is_last_bar_of_day=True
+        )
+        assert order.order_id not in trade_engine.pending_orders
+
+    def test_ac93_day_order_not_expired_mid_day(self, trade_engine, portfolio, bar_factory):
+        """DAY 单 is_last_bar_of_day=False 时不过期。"""
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="DAY",
+        )
+        trade_engine.add_pending(order)
+
+        # 非最后一根 bar → 不过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b}, "20240101", is_last_bar_of_day=False
+        )
+        assert order.order_id in trade_engine.pending_orders
+
+    # ── AC-9.4: GTC 单跨日存活，直到触发 ────────────────────────────────────
+
+    def test_ac94_gtc_order_survives_across_days_and_fills(
+        self, trade_engine, portfolio, bar_factory
+    ):
+        """GTC 单（无 expire_date）跨越多个 is_last_bar_of_day=True，保留至触发。"""
+        b_miss = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC",
+        )
+        trade_engine.add_pending(order)
+
+        # Day-1 收盘：GTC 不过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b_miss}, "20240101", is_last_bar_of_day=True
+        )
+        assert order.order_id in trade_engine.pending_orders
+
+        # Day-2 收盘：仍不过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b_miss}, "20240102", is_last_bar_of_day=True
+        )
+        assert order.order_id in trade_engine.pending_orders
+
+        # Day-3：bar.low=8.5 ≤ limit=9.0 → 触发成交
+        b_hit = bar_factory(open_=9.2, high=9.4, low=8.5, close=8.8, volume=1_000_000)
+        fills = trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b_hit}, "20240103", is_last_bar_of_day=False
+        )
+        assert len(fills) == 1
+        assert fills[0].price == pytest.approx(9.0)
+        assert order.order_id not in trade_engine.pending_orders
+
+    # ── AC-9.5: GTC 单 expire_date 过期 ─────────────────────────────────────
+
+    def test_ac95_gtc_order_not_expired_on_expire_date(
+        self, trade_engine, portfolio, bar_factory
+    ):
+        """GTC 单 current_date == expire_date：尚未过期，保留在池中。"""
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC", expire_date="20240103",
+        )
+        trade_engine.add_pending(order)
+
+        # current_date == expire_date → "20240103" > "20240103" is False → 不过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b}, "20240103", is_last_bar_of_day=True
+        )
+        assert order.order_id in trade_engine.pending_orders
+
+    def test_ac95_gtc_order_expired_after_expire_date(
+        self, trade_engine, portfolio, bar_factory
+    ):
+        """GTC 单 current_date > expire_date：过期，从池中移除。"""
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC", expire_date="20240103",
+        )
+        trade_engine.add_pending(order)
+
+        # current_date > expire_date → "20240104" > "20240103" is True → 过期
+        trade_engine.sweep_pending(
+            portfolio, {"510300.SH": b}, "20240104", is_last_bar_of_day=False
+        )
+        assert order.order_id not in trade_engine.pending_orders
+
+    def test_ac95_gtc_no_expire_date_never_expires(self, trade_engine, portfolio, bar_factory):
+        """GTC 单 expire_date=None：无论跨多少日，永不因时间而过期。"""
+        b = bar_factory(open_=10.0, high=10.5, low=9.5, close=10.2, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC", expire_date=None,
+        )
+        trade_engine.add_pending(order)
+
+        for date in ["20240101", "20240201", "20241231", "20250101"]:
+            trade_engine.sweep_pending(
+                portfolio, {"510300.SH": b}, date, is_last_bar_of_day=True
+            )
+        # 从未触发也从未过期
+        assert order.order_id in trade_engine.pending_orders
+
+    # ── AC-9.6: cancel() 取消挂单 ────────────────────────────────────────────
+
+    def test_ac96_cancel_removes_from_pool(self, trade_engine):
+        """cancel(order_id) 成功返回 True 并从池中移除。"""
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+        )
+        trade_engine.add_pending(order)
+        assert order.order_id in trade_engine.pending_orders
+
+        result = trade_engine.cancel(order.order_id)
+        assert result is True
+        assert order.order_id not in trade_engine.pending_orders
+
+    def test_ac96_cancel_unknown_id_returns_false(self, trade_engine):
+        """cancel() 对不存在的 order_id 返回 False，不抛错。"""
+        assert trade_engine.cancel("nonexistent_id_xyz") is False
+
+    def test_ac96_cancel_twice_returns_false_second_time(self, trade_engine):
+        """同一 order_id cancel 两次：第一次 True，第二次 False。"""
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+        )
+        trade_engine.add_pending(order)
+        assert trade_engine.cancel(order.order_id) is True
+        assert trade_engine.cancel(order.order_id) is False
+
+    # ── AC-9.7: 回归——市价单行为不变 ─────────────────────────────────────────
+
+    def test_ac97_market_order_fills_immediately(self, trade_engine, portfolio, bar):
+        """（回归）市价单立即成交，不进入挂单池。"""
+        portfolio.reserve_cash(2000)
+        order = Order(code="510300.SH", side=OrderSide.BUY, qty=100)
+        fills = trade_engine.execute_orders([order], portfolio, {"510300.SH": bar}, "20240101")
+        assert len(fills) == 1
+        assert fills[0].price == pytest.approx(10.01)  # next_open + 0.1% slippage
+        assert len(trade_engine.pending_orders) == 0
+
+    # ── 额外边界用例 ──────────────────────────────────────────────────────────
+
+    def test_order_id_auto_generated_and_unique(self):
+        """Order.order_id 在构造时自动生成，且不同 Order 的 ID 彼此不同。"""
+        o1 = Order(code="510300.SH", side=OrderSide.BUY, qty=100)
+        o2 = Order(code="510300.SH", side=OrderSide.BUY, qty=100)
+        assert o1.order_id  # 非空
+        assert o2.order_id  # 非空
+        assert o1.order_id != o2.order_id
+
+    def test_market_order_cannot_enter_pending(self, trade_engine):
+        """add_pending 拒绝 MARKET 单，抛 ValueError。"""
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.MARKET,
+        )
+        with pytest.raises(ValueError, match="MARKET"):
+            trade_engine.add_pending(order)
+
+    def test_invalid_tif_raises(self):
+        """time_in_force 非 DAY/GTC 时，Order 构造抛 ValueError。"""
+        with pytest.raises(ValueError, match="time_in_force"):
+            Order(
+                code="510300.SH", side=OrderSide.BUY, qty=100,
+                order_type=OrderType.LIMIT, price=10.0,
+                time_in_force="FOK",
+            )
+
+    def test_day_order_with_expire_date_raises(self):
+        """DAY 单指定 expire_date 时，Order 构造抛 ValueError。"""
+        with pytest.raises(ValueError):
+            Order(
+                code="510300.SH", side=OrderSide.BUY, qty=100,
+                order_type=OrderType.LIMIT, price=10.0,
+                time_in_force="DAY", expire_date="20240201",
+            )
+
+    def test_sweep_skips_fill_on_insufficient_cash(self, trade_engine, bar_factory):
+        """买单资金不足时 sweep_pending 跳过撮合，但保留挂单（GTC 不过期）。"""
+        tiny_portfolio = _make_portfolio(cash=10.0)  # 远不足 100股×9.0=900元
+        b = bar_factory(open_=9.2, high=9.4, low=8.5, close=8.8, volume=1_000_000)
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC",
+        )
+        trade_engine.add_pending(order)
+        fills = trade_engine.sweep_pending(
+            tiny_portfolio, {"510300.SH": b}, "20240101", is_last_bar_of_day=False
+        )
+        assert fills == []
+        assert order.order_id in trade_engine.pending_orders  # 资金不足但单子保留
+
+    def test_sweep_no_bar_data_order_retained(self, trade_engine, portfolio):
+        """挂单对应代码在当前 bar 无行情时，单子保留（GTC 不过期）。"""
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="GTC",
+        )
+        trade_engine.add_pending(order)
+        # bar_data 里没有该代码
+        fills = trade_engine.sweep_pending(
+            portfolio, {}, "20240101", is_last_bar_of_day=False
+        )
+        assert fills == []
+        assert order.order_id in trade_engine.pending_orders
+
+    def test_sweep_no_bar_day_order_expires(self, trade_engine, portfolio):
+        """无行情时 DAY 单在 is_last_bar_of_day=True 依然过期。"""
+        order = Order(
+            code="510300.SH", side=OrderSide.BUY, qty=100,
+            order_type=OrderType.LIMIT, price=9.0,
+            time_in_force="DAY",
+        )
+        trade_engine.add_pending(order)
+        # bar_data 空，但 is_last_bar_of_day=True → DAY 单应过期
+        trade_engine.sweep_pending(
+            portfolio, {}, "20240101", is_last_bar_of_day=True
+        )
+        assert order.order_id not in trade_engine.pending_orders

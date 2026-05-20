@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
@@ -37,6 +37,9 @@ class Context:
     _orders: List[Order] = field(default_factory=list, repr=False)
     # 用户可存储自定义状态
     user_data: Dict[str, Any] = field(default_factory=dict)
+    # 引擎注入的"取消挂单"回调：由 BacktestEngine 在构造 Context 时绑定到
+    # trade_engine.cancel；测试场景中可不注入（cancel_order 将仅在 _orders 中查找）。
+    _cancel_callback: Optional[Callable[[str], bool]] = field(default=None, repr=False)
 
     # ---------- 下单接口 ----------
 
@@ -73,28 +76,51 @@ class Context:
             "order_target_value 尚未实现：请手动计算目标数量后调用 context.order()。"
         )
 
-    def limit_order(self, code: str, amount: int, price: float) -> None:
+    def limit_order(
+        self,
+        code: str,
+        amount: int,
+        price: float,
+        time_in_force: str = "DAY",
+        expire_date: Optional[str] = None,
+    ) -> str:
         """挂限价单。
 
         Args:
             code: 股票代码。
             amount: 数量，正数为买入、负数为卖出，自动对齐 100 整数倍。
             price: 限价。买入时 bar.low ≤ price 才成交；卖出时 bar.high ≥ price 才成交。
+            time_in_force: "DAY"（当日有效，到日终未成交即过期）或 "GTC"（持续有效）。
+            expire_date: 仅 GTC 单可指定；格式 YYYYMMDD。None 表示无截止日。
+
+        Returns:
+            order_id：用于后续 `cancel_order` 索引；qty 对齐后为 0（amount=0 时）返回空串。
 
         Raises:
-            ValueError: price ≤ 0 时抛出。
+            ValueError: price ≤ 0 / time_in_force 非法 / DAY 单错误地传入 expire_date 时抛出。
         """
         side = OrderSide.BUY if amount > 0 else OrderSide.SELL
         qty = abs(amount)
         if qty == 0:
-            return
+            return ""
         if price is None or price <= 0:
             raise ValueError(f"限价必须为正数，传入 {price}")
-        self._orders.append(
-            Order(code=code, side=side, qty=qty, order_type=OrderType.LIMIT, price=price)
+        self._validate_tif(time_in_force, expire_date)
+        order = Order(
+            code=code, side=side, qty=qty, order_type=OrderType.LIMIT, price=price,
+            time_in_force=time_in_force, expire_date=expire_date,
         )
+        self._orders.append(order)
+        return order.order_id
 
-    def stop_order(self, code: str, amount: int, stop_price: float) -> None:
+    def stop_order(
+        self,
+        code: str,
+        amount: int,
+        stop_price: float,
+        time_in_force: str = "DAY",
+        expire_date: Optional[str] = None,
+    ) -> str:
         """挂止损单。
 
         Args:
@@ -102,22 +128,66 @@ class Context:
             amount: 数量，正数为买入触发、负数为卖出触发，自动对齐 100 整数倍。
             stop_price: 触发价。卖出时 bar.low ≤ stop_price 触发；买入时 bar.high ≥ stop_price 触发。
                 触发后按"更不利"价成交（卖出取 min(open, stop_price)，买入取 max）。
+            time_in_force: "DAY" / "GTC"，语义同 `limit_order`。
+            expire_date: 仅 GTC 单可指定。
+
+        Returns:
+            order_id；amount=0 时返回空串。
 
         Raises:
-            ValueError: stop_price ≤ 0 时抛出。
+            ValueError: stop_price ≤ 0 / time_in_force 非法 / DAY 单错误地传入 expire_date 时抛出。
         """
         side = OrderSide.BUY if amount > 0 else OrderSide.SELL
         qty = abs(amount)
         if qty == 0:
-            return
+            return ""
         if stop_price is None or stop_price <= 0:
             raise ValueError(f"止损价必须为正数，传入 {stop_price}")
-        self._orders.append(
-            Order(
-                code=code, side=side, qty=qty,
-                order_type=OrderType.STOP, stop_price=stop_price,
-            )
+        self._validate_tif(time_in_force, expire_date)
+        order = Order(
+            code=code, side=side, qty=qty,
+            order_type=OrderType.STOP, stop_price=stop_price,
+            time_in_force=time_in_force, expire_date=expire_date,
         )
+        self._orders.append(order)
+        return order.order_id
+
+    def cancel_order(self, order_id: str) -> bool:
+        """取消挂单。
+
+        查找顺序：
+          1. 本根 bar 还没下发的新单（仍在 `_orders` 中）
+          2. 引擎挂单池（通过 `_cancel_callback` 委托给 TradeEngine.cancel）
+
+        Args:
+            order_id: 由 `limit_order` / `stop_order` 返回的订单 ID。
+
+        Returns:
+            True 表示成功取消，False 表示未找到（已成交、已过期、ID 无效，或在无引擎回调的测试场景中只能查 `_orders`）。
+        """
+        if not order_id:
+            return False
+        # 1. 在本根 bar 未下发的新单里查
+        for idx, o in enumerate(self._orders):
+            if o.order_id == order_id:
+                self._orders.pop(idx)
+                return True
+        # 2. 委托给引擎挂单池
+        if self._cancel_callback is not None:
+            return self._cancel_callback(order_id)
+        return False
+
+    @staticmethod
+    def _validate_tif(time_in_force: str, expire_date: Optional[str]) -> None:
+        """校验 time_in_force 与 expire_date 的组合合法性。"""
+        if time_in_force not in ("DAY", "GTC"):
+            raise ValueError(
+                f"time_in_force 仅支持 'DAY' / 'GTC'，传入 {time_in_force!r}"
+            )
+        if time_in_force == "DAY" and expire_date is not None:
+            raise ValueError(
+                "DAY 单不应指定 expire_date（DAY 单当日有效，与日期无关）"
+            )
 
     # ---------- 数据查询接口 ----------
 

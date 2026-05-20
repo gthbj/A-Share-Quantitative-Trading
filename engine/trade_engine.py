@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -28,7 +29,13 @@ class OrderSide(Enum):
 
 @dataclass
 class Order:
-    """订单。"""
+    """订单。
+
+    生命周期字段（PRD_20260520_10）：
+      - time_in_force: "DAY" 当日有效；"GTC" 至 expire_date 当日有效。MARKET 单忽略此字段。
+      - expire_date: YYYYMMDD。仅 GTC 单可设置。None 表示无截止日。
+      - order_id: 自动生成的 12 位十六进制 ID，用于在引擎挂单池中索引。
+    """
 
     code: str
     side: OrderSide
@@ -37,6 +44,9 @@ class Order:
     price: Optional[float] = None  # 限价单/止损单有效
     stop_price: Optional[float] = None  # 止损单触发价
     list_date: Optional[str] = None  # 上市日期（YYYYMMDD），用于新股首日无涨跌幅判定
+    time_in_force: str = "DAY"
+    expire_date: Optional[str] = None
+    order_id: str = ""
 
     def __post_init__(self):
         # A股最小交易单位为100股
@@ -46,6 +56,18 @@ class Order:
             logger.warning(
                 f"订单数量 {original} 不是 100 的倍数，已截断为 {self.qty}（A股最小交易单位）。"
                 f"qty=0 时该订单将不会被撮合。code={self.code} side={self.side.value}"
+            )
+        # 自动生成 order_id（外部已指定则保留，便于反序列化）
+        if not self.order_id:
+            self.order_id = uuid.uuid4().hex[:12]
+        # 校验 time_in_force（容错：上层 Context 已校验，引擎再校一次防止直构 Order）
+        if self.time_in_force not in ("DAY", "GTC"):
+            raise ValueError(
+                f"time_in_force 仅支持 'DAY' / 'GTC'，传入 {self.time_in_force!r}"
+            )
+        if self.time_in_force == "DAY" and self.expire_date is not None:
+            raise ValueError(
+                "DAY 单不应指定 expire_date（DAY 单当日有效，与日期无关）"
             )
 
     def to_dict(self) -> dict:
@@ -58,6 +80,9 @@ class Order:
             "price": self.price,
             "stop_price": self.stop_price,
             "list_date": self.list_date,
+            "time_in_force": self.time_in_force,
+            "expire_date": self.expire_date,
+            "order_id": self.order_id,
         }
 
     @classmethod
@@ -71,6 +96,9 @@ class Order:
             price=data.get("price"),
             stop_price=data.get("stop_price"),
             list_date=data.get("list_date"),
+            time_in_force=data.get("time_in_force", "DAY"),
+            expire_date=data.get("expire_date"),
+            order_id=data.get("order_id", ""),
         )
 
 
@@ -123,6 +151,9 @@ class TradeEngine:
         # 上市日期映射表：code → YYYYMMDD；用于全局注入新股首日规则
         # 优先级：order.list_date > listing_dates[code] > ""（不判断）
         self.listing_dates: Dict[str, str] = {}
+        # 未成交挂单池（仅 LIMIT/STOP 会进入此池；MARKET 立即试一次后丢弃）
+        # key: order_id, value: Order
+        self.pending_orders: Dict[str, Order] = {}
 
     def set_listing_dates(self, mapping: Dict[str, str]) -> None:
         """批量注入股票上市日期映射，供 _try_fill 判定新股首日涨跌幅。
@@ -153,14 +184,148 @@ class TradeEngine:
         bar_data: Dict[str, pd.Series],
         current_date: str,
     ) -> List[Fill]:
-        """批量执行订单，返回成交列表。"""
+        """批量执行本根 bar 的新订单，返回成交列表。
+
+        - MARKET：当根 bar 一次性尝试，不进池
+        - LIMIT/STOP：尝试一次；未触发则加入 `pending_orders` 池，由 `sweep_pending`
+          在后续每根 bar 继续检查直至成交或过期
+        """
         fills: List[Fill] = []
         for order in orders:
             fill = self._try_fill(order, portfolio, bar_data, current_date)
             if fill:
                 fills.append(fill)
                 self._apply_fill(fill, portfolio, current_date)
+            else:
+                # 未成交：LIMIT/STOP 入池，MARKET 直接丢弃
+                if order.order_type in (OrderType.LIMIT, OrderType.STOP) and order.qty > 0:
+                    self.add_pending(order)
         return fills
+
+    # ---------- 挂单池管理（PRD_20260520_10）----------
+
+    def add_pending(self, order: Order) -> None:
+        """将 LIMIT/STOP 未触发单加入挂单池。
+
+        MARKET 单不应入池：MARKET 语义是"立即执行或失败"。
+        """
+        if order.order_type == OrderType.MARKET:
+            raise ValueError("MARKET 单不允许进入挂单池")
+        self.pending_orders[order.order_id] = order
+
+    def cancel(self, order_id: str) -> bool:
+        """从挂单池移除指定订单。命中返回 True，未命中返回 False。"""
+        return self.pending_orders.pop(order_id, None) is not None
+
+    def sweep_pending(
+        self,
+        portfolio: Portfolio,
+        bar_data: Dict[str, pd.Series],
+        current_date: str,
+        is_last_bar_of_day: bool,
+    ) -> List[Fill]:
+        """每根 bar 调用：扫描挂单池，尝试撮合并清理过期单。
+
+        每个挂单的处理路径：
+          1. 无行情（bar 缺失/空）：跳过撮合，仅检查过期
+          2. 买单先尝试 `reserve_cash` 预留资金：
+              - 成功：尝试 `_try_fill`；成交则保留 frozen 由 `apply_buy_fill` 消耗，
+                未成交则 `release_cash` 退回
+              - 失败：本根 bar 不撮合（保留挂单），下一根 bar 资金恢复后再试
+          3. 卖单直接 `_try_fill`（依赖 portfolio 的 T+1 校验）
+
+        过期判定（仅在挂单未成交时执行）：
+          - DAY: `is_last_bar_of_day=True` → 当日有效期到，清除
+          - GTC: `current_date[:8] > expire_date` → 清除
+          - GTC 且 `expire_date is None`：永不过期
+
+        Args:
+            portfolio: 账户对象
+            bar_data: 当前 bar，{code: Series}
+            current_date: YYYYMMDD（日线）或 YYYYMMDDHHMM（分钟）
+            is_last_bar_of_day: 当前是否为该交易日最后一根 bar
+
+        Returns:
+            成交列表
+        """
+        fills: List[Fill] = []
+        date_8 = str(current_date)[:8]
+        for order_id, order in list(self.pending_orders.items()):
+            bar = bar_data.get(order.code)
+            # 1. 无行情：保留挂单，仅判过期
+            if bar is None or (hasattr(bar, "empty") and bar.empty):
+                self._sweep_drop_if_expired(order_id, order, date_8, is_last_bar_of_day)
+                continue
+
+            # 2. 买单预留资金
+            reserved = 0.0
+            if order.side == OrderSide.BUY:
+                est_price = self._estimate_pending_buy_price(order, bar)
+                est_amount = order.qty * est_price
+                if est_amount > 0 and not portfolio.reserve_cash(est_amount):
+                    # 资金不足，保留至下一根 bar；同时按规则判过期
+                    self._sweep_drop_if_expired(
+                        order_id, order, date_8, is_last_bar_of_day,
+                        reason="资金不足且到期",
+                    )
+                    continue
+                reserved = est_amount
+
+            # 3. 尝试撮合
+            fill = self._try_fill(order, portfolio, bar_data, current_date)
+            if fill:
+                fills.append(fill)
+                self._apply_fill(fill, portfolio, current_date)
+                self.pending_orders.pop(order_id, None)
+            else:
+                # 释放预留资金；判过期
+                if reserved > 0:
+                    portfolio.release_cash(reserved)
+                self._sweep_drop_if_expired(order_id, order, date_8, is_last_bar_of_day)
+        return fills
+
+    def _sweep_drop_if_expired(
+        self,
+        order_id: str,
+        order: Order,
+        current_date_8: str,
+        is_last_bar_of_day: bool,
+        reason: str = "到期",
+    ) -> None:
+        """sweep 内部辅助：如挂单过期则从池中移除并记日志。"""
+        if self._is_expired(order, current_date_8, is_last_bar_of_day):
+            self.pending_orders.pop(order_id, None)
+            logger.info(
+                f"挂单过期清除（{reason}）: id={order_id} code={order.code} "
+                f"type={order.order_type.value} tif={order.time_in_force}"
+                f"{' expire=' + order.expire_date if order.expire_date else ''}"
+            )
+
+    @staticmethod
+    def _is_expired(order: Order, current_date_8: str, is_last_bar_of_day: bool) -> bool:
+        """判断挂单是否过期。"""
+        if order.time_in_force == "DAY":
+            return is_last_bar_of_day
+        # GTC
+        if order.expire_date is None:
+            return False
+        return current_date_8 > order.expire_date
+
+    @staticmethod
+    def _estimate_pending_buy_price(order: Order, bar: pd.Series) -> float:
+        """预估挂单买入价（用于 reserve_cash 预留金额）。
+
+        取相对保守的上限：
+          - LIMIT：order.price（限价是买入上限）
+          - STOP：max(bar.open, stop_price)（突破后取更不利价 = 更高价）
+          - 兜底：bar.open
+        """
+        bar_open = float(bar.get("open", 0.0))
+        if order.order_type == OrderType.LIMIT and order.price:
+            return order.price
+        if order.order_type == OrderType.STOP and order.stop_price:
+            return max(bar_open, order.stop_price)
+        return bar_open
 
     def _resolve_trigger_and_price(
         self,

@@ -80,8 +80,8 @@
 
 | 文件 | 职责 |
 |------|------|
-| `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
-| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。 |
+| `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓；⑤ 维护**挂单池**（`pending_orders`）——LIMIT/STOP 当根 Bar 未触发时入池，由 `sweep_pending` 在后续每根 Bar 继续检查直至成交或过期（PRD_20260520_10）。 |
+| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。每根 Bar 开始时调用 `trade_engine.sweep_pending()` 扫描并尝试撮合前期挂单。 |
 | `paper_trader.py` | **虚拟盘**（PRD_20260520_09）。状态持久化到 `data/paper_state.json`（含 portfolio / 策略类与构造参数 / user_data / 待执行订单 / 待止损队列），支持断点续跑。`run_once(date=T)` 完整复用回测策略循环：预加载 `[T - lookback_days, T]` 历史行情 → 用 T 日开盘价撮合上次留存订单（**next_open 语义**，与回测一致）→ 调 `before_trading_start` / `handle_data` / `after_trading_end` → 收盘后止损检查 → 持久化新订单与止损队列。重复运行同一天会被拦截。该类已在 `engine/__init__.py` 中导出。 |
 
 **设计要点**：
@@ -94,6 +94,7 @@
   - `MARKET`：按 `price_type` 选 open/close，叠加滑点
   - `LIMIT`：买入 `bar.low ≤ price` 时按 price 成交；卖出 `bar.high ≥ price` 时按 price 成交；不叠加滑点
   - `STOP`：卖出 `bar.low ≤ stop_price` 触发，按 `min(open, stop_price)`（更不利价）；买入 `bar.high ≥ stop_price` 触发，按 `max(open, stop_price)`
+- **挂单池与过期机制**（PRD_20260520_10，详见 §4.14）：LIMIT/STOP 未成交时进入 `TradeEngine.pending_orders`，每根 Bar 由 `sweep_pending` 扫描。支持 `time_in_force="DAY"`（当日有效）/ `"GTC"`（可指定 `expire_date` 或永不过期）。`Context.cancel_order(order_id)` 可从池中撤单。
 
 ---
 
@@ -105,7 +106,7 @@
 
 | 文件 | 职责 |
 |------|------|
-| `base_strategy.py` | 策略抽象基类。定义生命周期钩子（`initialize` / `before_trading_start` / `handle_data` / `after_trading_end`）。`Context` 对象封装下单接口（`order` / `limit_order` / `stop_order`）与数据查询（`get_price`）。 |
+| `base_strategy.py` | 策略抽象基类。定义生命周期钩子（`initialize` / `before_trading_start` / `handle_data` / `after_trading_end`）。`Context` 对象封装下单接口（`order` / `limit_order` / `stop_order`）、撤单（`cancel_order`）与数据查询（`get_price`）。`limit_order` / `stop_order` 支持 `time_in_force="DAY"/"GTC"` 与 `expire_date` 参数，并返回 `order_id` 供后续撤单。 |
 | `momentum.py` | 月度动量策略示例：每月初买入上月涨幅前 N 名，等权持有。 |
 | `multi_factor.py` | 多因子策略示例：基于 PE/PB/ROE 综合评分选股（演示框架，实际需接入财务数据库）。 |
 | `intraday_ma.py` | 日内双均线策略示例：分钟级 MA5/MA15 金叉买入、死叉卖出 + 收盘前强制平仓。 |
@@ -310,8 +311,14 @@ context.order(code, target_qty - current_qty)
 
 ```python
 context.order(code, qty)                            # MARKET
-context.limit_order(code, qty, price=10.0)          # LIMIT
-context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
+oid = context.limit_order(code, qty, price=10.0)    # LIMIT，返回 order_id
+oid = context.stop_order(code, -qty, stop_price=9.5)  # STOP（卖出止损），返回 order_id
+
+# GTC 限价单（持续有效至 20240131 到期）
+oid = context.limit_order(code, qty, price=9.8,
+                           time_in_force="GTC", expire_date="20240131")
+# 主动撤单
+context.cancel_order(oid)
 ```
 
 ### 4.11 基准加载策略（PRD_20260520_03）
@@ -333,7 +340,7 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 |---|---|---|
 | `test_position.py` | `Position` | T+1 解冻、FIFO 同步消减 _buy_records（防 sellable_qty 虚高）、清仓归零 |
 | `test_portfolio.py` | `Portfolio` | 冻结/释放、买入扣 frozen、卖出回笼 cash |
-| `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截（含板块细分）、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告 |
+| `test_trade_engine.py` | `TradeEngine` | 佣金最低限、涨跌停拦截（含板块细分）、成交量截断、T+1、LIMIT/STOP 撮合、Order qty 警告；**挂单池**（AC-9.1~9.7：入池、跨 Bar 触发、DAY 过期、GTC 跨日保留/expire_date 过期、cancel）|
 | `test_code.py` | `utils.code` | 代码归一化、前缀推断、未知交易所抛错 |
 | `test_metrics.py` | `analytics.metrics._pair_fifo` + `calculate_metrics` | 全盈/全亏/混合配对、未平仓忽略、FIFO 顺序、inf 盈亏比 |
 | `test_price_limit.py` | `utils.code.price_limit_pct` | 主板 / 科创板 / 创业板（含 2020-08-24 切换）/ 北交所 / 新股首日（前 5 交易日 ±100%）/ ETF / 异常输入 fallback |
@@ -391,7 +398,65 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 | 首次启动（无 state.json） | 必需（否则 ValueError） |
 | 续跑（state.json 存在） | 可选；不传则从 state 反射；传入则覆盖 |
 
-运行：`pytest tests/ -v`（共 95 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
+运行：`pytest tests/ -v`（共 116 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
+
+### 4.15 挂单池、过期与取消机制（PRD_20260520_10）
+
+**背景**：原始实现中 LIMIT/STOP 订单在当根 Bar 未触发时直接丢弃，导致策略无法使用"挂单等待触发"语义。PRD_20260520_10 引入完整的订单生命周期管理。
+
+**核心数据结构**：
+
+```
+TradeEngine.pending_orders: Dict[str, Order]   # order_id → Order
+Order.order_id: str   # uuid4 hex[:12]，构造时自动生成
+Order.time_in_force: str   # "DAY"（当日有效）/ "GTC"（持续有效）
+Order.expire_date: Optional[str]   # YYYYMMDD；仅 GTC 单可设置；None = 永不过期
+```
+
+**订单流转路径**：
+
+```
+handle_data → Context.limit_order / stop_order
+    → Context._orders（本 Bar 新单队列）
+        → TradeEngine.execute_orders（当根 Bar 尝试一次）
+            → 触发 → Fill → Portfolio 更新
+            → 未触发 → add_pending → pending_orders 池
+                → 每根 Bar: sweep_pending
+                    → 触发 → Fill → 从池中移除
+                    → 未触发 → _is_expired?
+                        → DAY + is_last_bar_of_day → 过期移除
+                        → GTC + current_date > expire_date → 过期移除
+                        → 否则保留
+```
+
+**过期判定规则**（`TradeEngine._is_expired`）：
+
+| time_in_force | 过期条件 |
+|---|---|
+| `DAY` | `is_last_bar_of_day == True`（日线回测恒为 True） |
+| `GTC`（无 expire_date） | 永不因时间过期 |
+| `GTC`（有 expire_date） | `current_date[:8] > expire_date` |
+
+**资金预留（sweep_pending 买单）**：
+
+1. 调用 `portfolio.reserve_cash(est_amount)` 预留（LIMIT→limit price；STOP→max(open, stop_price)；其他→open）
+2. 若 reserve 失败（资金不足）：本 Bar 跳过撮合，但保留挂单（若同时到期则移除）
+3. 若 `_try_fill` 失败（未触发）：`release_cash(est_amount)` 退回；随后检查过期
+4. 若成交：`_apply_fill` 消耗 frozen cash；挂单从池中移除
+
+**撤单 API**（`Context.cancel_order(order_id)`）：
+
+- 先在本 Bar 的 `_orders` 队列中查找（当 Bar 新下的、未送往引擎的单子）
+- 再通过 `_cancel_callback`（注入的 `TradeEngine.cancel`）查找挂单池
+- 找到 → True；未找到/已成交/已过期 → False
+
+**BacktestEngine 集成**：
+
+- `_run_daily`：每个交易日在 `before_trading_start` 后、`execute_orders` 前调用 `sweep_pending(..., is_last_bar_of_day=True)`（日线每天只有一根 Bar）
+- `_run_intraday`：每根分钟 Bar 调用 `sweep_pending(..., is_last_bar_of_day=is_last_bar_of_day)`，复用已有的 `is_last_bar_of_day` 变量
+- sweep 返回的 `Fill` 列表与 `execute_orders` 返回的合并后一起写入 `DailyRecord.fills`
+
+---
 
 ### 4.9 ETF 15min 表 (`cn_etf_kline_15min`) 接入细节
 
