@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 08）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 10）
 
 | 编号 | 问题 | 解决方案 |
 |------|------|---------|
@@ -25,6 +25,7 @@
 | —    | README/ARCHITECTURE 与现状不一致 | PRD_20260520_01：全文同步 |
 | —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
 | P2-3 | 涨跌停固定 ±10%（未区分科创板/创业板/ETF） | PRD_20260520_08：抽 `utils.code.price_limit_pct(code, date)`；主板 10% / 科创板创业板 20% / ETF 10%；创业板按 2020-08-24 切换 |
+| TBD-2 | 限价单/止损单无过期与取消机制（挂单当根 bar 不成交即消失） | PRD_20260520_10：`TradeEngine.pending_orders` 挂单池；`sweep_pending` 每根 bar 扫描；`time_in_force` DAY/GTC + `expire_date`；`Context.cancel_order`；`BacktestEngine` 两条循环路径均已集成；新增 21 个单元测试（AC-9.1~9.7）|
 
 ---
 
@@ -41,17 +42,6 @@
 **修复方向**  
 - 在 `run_once` 中加载策略类、构造 `Context`，调用 `handle_data` 并把订单交给 `TradeEngine` 撮合
 - 状态文件中持久化策略 `user_data`（多日间状态续接）
-
----
-
-### TBD-2: 限价单 / 止损单缺少过期与取消机制
-
-**现象**  
-PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未成交的挂单会一直在 `Context._orders` 中（实际上每次 `pop_orders()` 都清空了，所以现在的实现等于"挂单当根 bar 不成交就消失"）。
-
-**修复方向**  
-- `Order` 新增 `expire_date` / `time_in_force`（GTC / DAY）
-- 引擎层维护一个"未成交挂单池"，每根 bar 检查触发条件直到过期
 
 ---
 
@@ -116,4 +106,4 @@ A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无�
 
 ---
 
-*本文档最后更新：2026-05-20*
+*本文档最后更新：2026-05-20（PRD_20260520_10 TBD-2 已关闭）*
