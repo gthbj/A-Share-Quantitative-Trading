@@ -47,6 +47,29 @@ class Order:
                 f"qty=0 时该订单将不会被撮合。code={self.code} side={self.side.value}"
             )
 
+    def to_dict(self) -> dict:
+        """序列化为 JSON 兼容字典（用于 PaperTrader state 持久化）。"""
+        return {
+            "code": self.code,
+            "side": self.side.value,
+            "qty": self.qty,
+            "order_type": self.order_type.value,
+            "price": self.price,
+            "stop_price": self.stop_price,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Order":
+        """从字典反序列化（用于 PaperTrader state 恢复）。"""
+        return cls(
+            code=data["code"],
+            side=OrderSide(data["side"]),
+            qty=data["qty"],
+            order_type=OrderType(data.get("order_type", "market")),
+            price=data.get("price"),
+            stop_price=data.get("stop_price"),
+        )
+
 
 @dataclass
 class Fill:

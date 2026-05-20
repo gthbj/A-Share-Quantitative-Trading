@@ -186,6 +186,11 @@ class BaseStrategy(ABC):
       - handle_data(context, data)
     """
 
+    # 策略需要多少天历史 bar 来 warm up 指标。子类可覆盖。
+    # PaperTrader 用此值预加载 [date - lookback_days, date] 历史行情。
+    # 默认 60 天对 MA20、RSI14 等常见指标足够。
+    lookback_days: int = 60
+
     def __init__(self) -> None:
         self.context: Optional[Context] = None
         self._universe: List[str] = []

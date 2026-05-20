@@ -82,7 +82,7 @@
 |------|------|
 | `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓。 |
 | `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。 |
-| `paper_trader.py` | **虚拟盘**。状态持久化到 `data/paper_state.json`，支持断点续跑。每日收盘后读取最新行情，更新持仓市值，可扩展为定时自动运行。该类已在 `engine/__init__.py` 中导出，可通过 `from engine import PaperTrader` 使用。 |
+| `paper_trader.py` | **虚拟盘**（PRD_20260520_09）。状态持久化到 `data/paper_state.json`（含 portfolio / 策略类与构造参数 / user_data / 待执行订单 / 待止损队列），支持断点续跑。`run_once(date=T)` 完整复用回测策略循环：预加载 `[T - lookback_days, T]` 历史行情 → 用 T 日开盘价撮合上次留存订单（**next_open 语义**，与回测一致）→ 调 `before_trading_start` / `handle_data` / `after_trading_end` → 收盘后止损检查 → 持久化新订单与止损队列。重复运行同一天会被拦截。该类已在 `engine/__init__.py` 中导出。 |
 
 **设计要点**：
 - `TradeEngine` 与 `BacktestEngine` 分离：前者只负责"一笔订单能否成交"，后者负责"何时调用策略、如何组织交易日历"。
@@ -337,6 +337,7 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 | `test_code.py` | `utils.code` | 代码归一化、前缀推断、未知交易所抛错 |
 | `test_metrics.py` | `analytics.metrics._pair_fifo` + `calculate_metrics` | 全盈/全亏/混合配对、未平仓忽略、FIFO 顺序、inf 盈亏比 |
 | `test_price_limit.py` | `utils.code.price_limit_pct` | 主板 / 科创板 / 创业板（含 2020-08-24 切换）/ ETF / 异常输入 fallback |
+| `test_paper_trader.py` | `PaperTrader`（PRD_20260520_09）| 首次启动校验、state 往返序列化、老 state 向后兼容、next_open 延迟成交、user_data 跨日续接、重复运行拦截、止损队列持久化、user_data 不可序列化报错 |
 
 ### 4.13 板块涨跌停规则（PRD_20260520_08）
 
@@ -355,7 +356,38 @@ context.stop_order(code, -qty, stop_price=9.5)      # STOP（卖出止损）
 
 **未来扩展**（TODO 已记录）：ST/*ST ±5%（缺数据源）、北交所 ±30%（`normalize_code` 暂不接受 4/8 前缀）、新股首日特殊涨跌幅（缺 `list_date`）。
 
-运行：`pytest tests/ -v`（共 64 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
+### 4.14 虚拟盘策略循环（PRD_20260520_09）
+
+`PaperTrader.run_once(date=T)` 与回测引擎共享同一套策略生命周期、撮合时序与止损模块。完整流程：
+
+```
+1. load_state()                       ← state.json 含 portfolio / 策略类与 kwargs /
+                                       user_data / pending_orders / pending_stop_loss
+2. 实例化策略 strategy_cls(**strategy_kwargs)
+3. 预加载 [T - lookback_days, T] 历史行情 → context.all_bars
+4. portfolio.before_trading(T)        ← 解冻 T-1 买入的股票
+5. 用 T 日开盘价撮合 pending_orders + pending_stop_loss（next_open 语义）
+6. strategy.before_trading_start(T) / handle_data(T) / after_trading_end(T)
+7. 收盘后止损检查 → 新的 pending_stop_loss
+8. save_state()                       ← 新 pending_orders / pending_stop_loss / user_data
+```
+
+**关键设计**：
+
+- **next_open 语义对齐回测**：T 日 `handle_data` 产生的订单不在 T 日成交，而是写进 `pending_orders` 持久化，等下次 `run_once(T+1)` 用 T+1 开盘价成交。这与回测引擎 `_run_daily` 完全一致，便于"虚拟盘 vs 回测"对比验证。
+- **策略元信息持久化**：`strategy_class`（模块路径字符串）+ `strategy_kwargs` 写入 state.json，下次启动只需传 `state_file` 即可恢复。外部传入的 `strategy_cls` / `strategy_kwargs` 优先级最高，便于切换策略或修改参数。
+- **lookback_days 协议**：`BaseStrategy.lookback_days`（默认 60）声明策略需要多少天历史 bar 来 warm up 指标。`DoubleMAStrategy` 覆盖为 `long_window + 10`。PaperTrader 按 `lookback_days × 1.6` 估算自然日跨度预加载行情。
+- **重复运行拦截**：`last_run_date >= date` 时本次 `run_once` 直接跳过并 WARNING，防止误重跑覆盖状态。
+- **user_data 序列化约定**：必须是 JSON 兼容类型；保存时遇到不可序列化对象直接 TypeError，**不静默丢失**。
+
+**首次启动 vs 续跑**：
+
+| 场景 | strategy_cls 是否必需 |
+|---|---|
+| 首次启动（无 state.json） | 必需（否则 ValueError） |
+| 续跑（state.json 存在） | 可选；不传则从 state 反射；传入则覆盖 |
+
+运行：`pytest tests/ -v`（共 95 个用例，期望全部 PASS）。开发依赖见 `requirements-dev.txt`。
 
 ### 4.9 ETF 15min 表 (`cn_etf_kline_15min`) 接入细节
 

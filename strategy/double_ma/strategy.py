@@ -31,6 +31,8 @@ class DoubleMAStrategy(BaseStrategy):
         super().__init__()
         self.short_window = short_window
         self.long_window = long_window
+        # 覆盖基类默认 lookback：MA{long_window} 需要 long_window 天样本，+10 缓冲
+        self.lookback_days = long_window + 10
         # 通过构造函数注入 universe；为空时回退到默认
         self._init_universe = list(universe) if universe else list(self.DEFAULT_UNIVERSE)
 

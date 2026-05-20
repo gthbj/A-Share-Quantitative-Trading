@@ -4,7 +4,7 @@
 
 ---
 
-## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 08）
+## ✅ 已修复（2026-05-20，PRD_20260520_01 ~ 09）
 
 | 编号 | 问题 | 解决方案 |
 |------|------|---------|
@@ -25,26 +25,13 @@
 | —    | README/ARCHITECTURE 与现状不一致 | PRD_20260520_01：全文同步 |
 | —    | TradeEngine 仅支持 MARKET 单 | PRD_20260520_06：实现 LIMIT/STOP 撮合 + Context.limit_order / stop_order |
 | P2-3 | 涨跌停固定 ±10%（未区分科创板/创业板/ETF） | PRD_20260520_08：抽 `utils.code.price_limit_pct(code, date)`；主板 10% / 科创板创业板 20% / ETF 10%；创业板按 2020-08-24 切换 |
+| P2-4 | paper_trader 缺少策略信号驱动 | PRD_20260520_09：`run_once` 完整接入策略循环（预加载历史 → next_open 撮合 → handle_data → 止损检查 → 状态持久化）；state.json 扩展存储策略类与 kwargs、user_data、待执行订单、待止损队列 |
 
 ---
 
 ## 🟢 待优化（建议优先级）
 
-### TBD-1: paper_trader 缺少策略信号驱动
-
-**现象**  
-`PaperTrader.run_once` 仅做"持仓估值与状态更新"，没有真正调用策略 `handle_data` 生成订单。
-
-**根因分析**  
-当前实现是占位骨架，未把策略循环挂接到虚拟盘日常调度上。
-
-**修复方向**  
-- 在 `run_once` 中加载策略类、构造 `Context`，调用 `handle_data` 并把订单交给 `TradeEngine` 撮合
-- 状态文件中持久化策略 `user_data`（多日间状态续接）
-
----
-
-### TBD-2: 限价单 / 止损单缺少过期与取消机制
+### TBD-1: 限价单 / 止损单缺少过期与取消机制
 
 **现象**  
 PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未成交的挂单会一直在 `Context._orders` 中（实际上每次 `pop_orders()` 都清空了，所以现在的实现等于"挂单当根 bar 不成交就消失"）。
@@ -55,7 +42,7 @@ PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未�
 
 ---
 
-### TBD-3: chinese_calendar 覆盖范围有限
+### TBD-2: chinese_calendar 覆盖范围有限
 
 **现象**  
 `chinese_calendar` 当前版本（1.11.0）覆盖到 2026 年。2027+ 会降级到"非周末"启发式，导致 2027 假期判定错误。
@@ -66,7 +53,7 @@ PRD_20260520_06 实现了 LIMIT / STOP 撮合，但订单**永不过期**：未�
 
 ---
 
-### TBD-4: ST/*ST 股票涨跌停 ±5% 未支持
+### TBD-3: ST/*ST 股票涨跌停 ±5% 未支持
 
 **现象**  
 PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、ETF 10%），但 ST/*ST 股票应为 ±5%，目前一律按板块默认值放行。
@@ -81,7 +68,7 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 
 ---
 
-### TBD-5: 北交所代码 / 涨跌停 ±30% 未支持
+### TBD-4: 北交所代码 / 涨跌停 ±30% 未支持
 
 **现象**  
 `utils.code.normalize_code` 当前不接受北交所前缀（4/8 开头），所以 `price_limit_pct` 即使加了北交所分支也不会被触发。
@@ -93,7 +80,7 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 
 ---
 
-### TBD-6: 新股上市首日涨跌幅未支持
+### TBD-5: 新股上市首日涨跌幅未支持
 
 **现象**  
 A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无限制），目前一律按板块常规规则。
@@ -105,7 +92,7 @@ A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无�
 
 ---
 
-### TBD-7: 缺少行业 / 财务因子数据
+### TBD-6: 缺少行业 / 财务因子数据
 
 **现象**  
 `MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
@@ -113,6 +100,29 @@ A 股新股上市首日特殊涨跌幅（主板 ±44%、创业板/科创板无�
 **修复方向**  
 - 等待 MaxCompute 中财务表、行业表、指数成分股表上线
 - `MultiFactorStrategy` 接入真实因子数据
+
+---
+
+### TBD-7: MaxCompute 数据源 get_bars 缓存裁剪丢数据
+
+**现象**  
+PRD_20260520_09 端到端验证时发现：当 `get_multi_bars(start, end)` 请求的 `end` 接近缓存数据范围末尾时，返回结果可能少最后 1~2 个交易日。例如本地缓存覆盖到 20240130，请求 `end=20240115` 实际只拉到 20240112。
+
+**根因（待确认）**  
+`MaxComputeDataSource.get_bars` 第 386–394 行的缓存命中逻辑：
+```python
+if cmin <= str(start_date) and cmax >= str(end_date):
+    df = self.storage.load_bars(norm_code, start_date, end_date, period=period)
+```
+怀疑 `storage.load_bars` 对分钟级数据按 `YYYYMMDD` 字符串严格 ≤ end_date 过滤，没像 `get_bars` 主路径那样用 `end_date + "9999"` 兜底。
+
+**修复方向**  
+- 排查 `storage.load_bars` 的 end_date 过滤逻辑
+- 对分钟级数据，过滤时统一使用 `date <= end_date + "9999"`
+
+**影响**  
+- 回测无感（回测一次性预加载整段区间，缓存命中后 end 在范围内不会触发该问题）
+- PaperTrader 每次 `run_once` 都拉一段窄区间，更容易撞上这个边界，导致"无任何当日行情，跳过"
 
 ---
 
