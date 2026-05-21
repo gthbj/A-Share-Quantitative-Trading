@@ -73,5 +73,178 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 ---
 
 ---
+### TBD-6: 分钟级缓存覆盖范围检查失效（P0）
 
-*本文档最后更新：2026-05-20（PRD_20260520_11 TBD-5 缓存 bug 已关闭）*
+**现象**  
+`MaxComputeDataSource.get_bars()` 中缓存命中判断使用字符串比较：`cmin <= start_date`。分钟级 `date` 为 12 位（`YYYYMMDDHHMM`），而 `start_date` 为 8 位（`YYYYMMDD`），字典序下 `"200006090000" <= "20000609"` 为 `False`，导致**分钟级缓存永远不会被命中**，重复查询 MaxCompute 产生额外费用。
+
+**根因分析**  
+`get_bars()` 中未对分钟级与日线级的日期长度做统一处理，直接进行字符串比较。
+
+**修复方向**  
+- 统一比较长度：将 `start_date` / `end_date` 扩展为与缓存数据相同的位数后再比较；或统一截取日期前缀。
+- 位置：`data_layer/maxcompute_source.py` `get_bars()` 方法。
+
+---
+
+### TBD-7: 回测引擎中 LIMIT/STOP 买单资金重复冻结（P0）
+
+**现象**  
+`BacktestEngine` 在调用 `execute_orders` 前对 LIMIT/STOP 买单预执行 `reserve_cash`；若当根 bar 未成交，订单被加入 `pending_orders`。下一根 bar `sweep_pending` 会**再次** `reserve_cash`，导致同一笔订单资金被双重冻结。多扣的 `frozen_cash` 要等到次日 `before_trading` 才释放，分钟级回测中尤为严重。
+
+**根因分析**  
+`execute_orders` 未成交入池前未释放预留资金，而 `sweep_pending` 自行管理资金预留，两者职责重叠。
+
+**修复方向**  
+- 方案 A：`execute_orders` 未成交的 LIMIT/STOP 买单在 `add_pending` 前调用 `release_cash`，完全交由 `sweep_pending` 管理。
+- 方案 B：取消 `BacktestEngine` 对 LIMIT/STOP 订单的预冻结，仅对 MARKET 单预冻结。
+
+---
+
+### TBD-8: MARKET 单未成交时资金当日不释放（P1）
+
+**现象**  
+MARKET 单因涨停/跌停等原因未成交后会被直接丢弃（不入 `pending_orders`），但 `BacktestEngine` 中已 `reserve_cash` 的资金未被释放。日线回测中次日 `before_trading` 会释放，影响较小；**分钟级回测中该笔资金在当日剩余时间一直处于冻结状态**。
+
+**根因分析**  
+`BacktestEngine` 对 MARKET 单预冻结后，未在 `execute_orders` 返回后检查未成交订单并释放资金。
+
+**修复方向**  
+- `execute_orders` 返回后，对未成交且未入池的 MARKET 买单统一 `release_cash`。
+- 或重构资金管理：所有未成交买单统一在 bar 结束后释放冻结资金，成交单在 `apply_buy_fill` 中处理差额。
+
+---
+
+### TBD-9: Alpha 计算使用非年化基准收益（P1）
+
+**现象**  
+`analytics/metrics.py` 中 Jensen Alpha 公式使用了 `result.benchmark_return`，但 `benchmark_return` 是区间**总收益**（`bench.iloc[-1] / bench.iloc[0] - 1`），而非年化收益。长周期回测下总收益与年化收益差距显著，Alpha 严重失真。
+
+**根因分析**  
+公式代入时未对基准收益做年化转换。
+
+**修复方向**  
+- 将 `benchmark_return` 按回测时长转换为年化收益后代入 Alpha 公式；或在 `MetricsResult` 中新增 `benchmark_annual_return` 字段。
+
+---
+
+### TBD-10: turnover 换手率指标未计算（P1）
+
+**现象**  
+`MetricsResult` 中声明了 `turnover: float = 0.0`，但 `calculate_metrics()` 中**完全没有计算逻辑**，该字段恒为 0。
+
+**修复方向**  
+- 按标准定义计算：`(期间买入金额 + 期间卖出金额) / 2 / 平均资产` 或 `期间成交金额 / 平均资产`。
+- 需要 `fills` 数据与 `nav` 序列配合计算。
+
+---
+
+### TBD-11: 回测主循环存在 O(n) 性能瓶颈（P1）
+
+**现象**  
+`_run_daily` 与 `_run_intraday` 中，每根 bar 都用 `df[df["date"] == date_str]` 进行全表扫描匹配。当 universe 较大（如全 A 股）或历史数据较长时，回测速度显著下降。
+
+**根因分析**  
+DataFrame 布尔索引为 O(n) 操作，且在每个交易日/每根 bar、每只股票上重复执行。
+
+**修复方向**  
+- 预先将 `all_bars[code]` 的 `date` 列设为索引（`set_index`），或使用 `dict` 将 date 映射到 row 实现 O(1) 查找。
+- 分钟级并集排序也可优化为基于优先队列的合并遍历。
+
+---
+
+### TBD-12: MaxCompute 数据源 SQL 注入风险与性能问题（P1）
+
+**现象**  
+1. `_fetch_5min_bars` / `_fetch_etf_15min_bars` 中直接将 `code` 拼接到 SQL 字符串（`WHERE code = '{exchange_code}'`），存在 SQL 注入风险。
+2. `get_stock_list` 执行无分区条件的 `SELECT DISTINCT code, name FROM {table}`，对大表会触发全表扫描，计费成本极高。
+3. `_execute_sql` 对所有异常（包括 SQL 语法错误、表不存在等）都执行指数退避重试，浪费资源。
+
+**修复方向**  
+- `code` 使用参数化查询或预校验格式（仅允许 `sh\d{6}` / `sz\d{6}` / `\d{6}\.(SH|SZ|BJ)` 等）。
+- `get_stock_list` 限制 `year_month` 分区条件，或优先使用独立的 `stock_info` 表。
+- 重试逻辑区分可重试异常（网络超时、连接断开）与不可重试异常（语法错误、权限不足）。
+
+---
+
+### TBD-13: Sortino Ratio 分子未扣除无风险利率（P2）
+
+**现象**  
+`metrics.py` 中 `sortino_ratio = (returns.mean() * ann_factor) / (downside.std() * np.sqrt(ann_factor))`，分子直接使用了年化收益，未减去 `risk_free_rate`。
+
+**修复方向**  
+- 分子改为 `(returns.mean() * ann_factor - risk_free_rate)`，与 Sharpe Ratio 的分子处理保持一致。
+
+---
+
+### TBD-14: 涨跌停 prev_close fallback 导致限制失效（P2）
+
+**现象**  
+`TradeEngine._try_fill` 中：`prev_close = bar.get("prev_close", price)`。当 bar 缺少 `prev_close`（如上市首日或数据缺失）时，fallback 到 `price` 自身，导致 `price >= up_limit` 几乎恒为 `False`，**涨跌停限制在此场景下失效**。
+
+**修复方向**  
+- 缺失 `prev_close` 时采取更保守策略：如拒绝成交并打 WARNING，或至少将 `prev_close` fallback 到 `bar.get("prev_close", bar.get("close", price))` 以增加数据来源。
+
+---
+
+### TBD-15: `_try_fill` 买入资金检查逻辑不精确（P2）
+
+**现象**  
+`_try_fill` 中对买单的资金检查为：`portfolio.available_cash + portfolio.frozen_cash < required`。`available + frozen` 在 `reserve_cash` 后等于原始总资产，无法反映其他订单已占用的冻结资金，防御性检查形同虚设。
+
+**修复方向**  
+- 检查逻辑改为 `portfolio.available_cash < required`，或明确扣除当前订单已预留的冻结资金。
+
+---
+
+### TBD-16: 异常处理与日志规范（P2）
+
+**现象**  
+1. `BacktestEngine._load_benchmark()` 等位置使用宽泛的 `except Exception as e`，会吞掉真正的 Bug（如数据格式错误、类型错误）。
+2. `run_backtest.py` CLI 入口大量使用 `print()` 输出信息，与框架内部统一使用的 `get_logger` 不一致，不利于日志级别控制和日志文件收集。
+
+**修复方向**  
+- 精细化异常捕获：区分 `NotImplementedError`（降级）、`ValueError`/`KeyError`（报错）、网络异常（重试）。
+- CLI 统一替换为 `logger.info()` / `logger.error()`。
+
+---
+
+### TBD-17: 缺少事件/钩子系统（P2）
+
+**现象**  
+当前策略生命周期仅提供 `before_trading_start` / `handle_data` / `after_trading_end`。若需接入风控告警、外部信号推送、成交后回调等，必须直接修改引擎源码，耦合度高。
+
+**修复方向**  
+- 引入轻量级事件总线或钩子机制：如 `on_order_filled(fill)`、`on_stop_loss_triggered(code, qty)`、`on_day_end(record)` 等，由策略或外部模块订阅。
+
+---
+
+### TBD-18: 配置缺少统一校验层（P2）
+
+**现象**  
+参数来源分散（CLI args → preset config → `config/backtest.yaml` → 硬编码），没有统一的配置校验层。非法配置（如负滑点、非法 `frequency`、越界止损阈值）可能在运行中途才暴露。
+
+**修复方向**  
+- 引入 Pydantic model 或 dataclass + `__post_init__` 做统一校验与类型转换，在回测启动前一次性校验所有参数。
+
+---
+
+### TBD-19: 测试覆盖存在盲区（P2）
+
+**现象**  
+现有单元测试主要覆盖 `TradeEngine`、`Position`、`Portfolio`、`metrics`、`code`、`paper_trader`。但缺少对以下模块的测试：
+- `analytics/plotter.py`（图表渲染、中文字体 fallback）
+- `analytics/report.py`、`summary.py`（HTML/Markdown 结构断言）
+- `run_backtest.py`（CLI 参数解析、preset 加载流程）
+- `data_layer/maxcompute_source.py`（SQL 拼接、分区裁剪、缓存命中/未命中路径）
+- `data_layer/local_storage.py`（Parquet 读写、日期边界过滤）
+
+此外，**缺少端到端集成测试**：无法验证"完整回测一次并产出正确 NAV 曲线与报告"这一核心链路。
+
+**修复方向**  
+- 补充上述模块的单元测试；
+- 增加至少一条完整回测链路的集成测试（如 DoubleMAStrategy + 510300.SH + 日线/15min，断言 NAV 不为空、报告文件生成、关键指标合理）。
+
+---
+
+*本文档最后更新：2026-05-21（补充 TBD-6 ~ TBD-19，来源于代码审阅梳理）*
