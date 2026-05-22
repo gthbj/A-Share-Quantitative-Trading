@@ -1,0 +1,21 @@
+# HMM 市场状态切换策略配置
+#
+# 用法：python run_backtest.py --preset regime_switching
+
+name: "regime_switching"
+class: "strategy.regime_switching.HMMRegimeStrategy"
+description: "HMM 识别市场状态（Bull/Bear/Sideways），调整目标仓位"
+
+params:
+  index_code: "000300.SH"
+  n_states: 3
+  lookback: 252
+  observation_window: 20
+  position_pcts: [1.0, 0.5, 0.0]
+
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"

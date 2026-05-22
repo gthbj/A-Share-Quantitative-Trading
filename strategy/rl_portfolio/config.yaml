@@ -1,0 +1,20 @@
+# RL 组合权重管理策略配置
+#
+# 用法：python run_backtest.py --preset rl_portfolio
+
+name: "rl_portfolio"
+class: "strategy.rl_portfolio.RLPortfolioStrategy"
+description: "PPO 强化学习做组合权重管理"
+
+params:
+  model_path: "strategy/rl_portfolio/models/ppo_v1.zip"
+  index_code: "000300.SH"
+  observation_window: 5
+  rebalance_freq: 1
+
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"

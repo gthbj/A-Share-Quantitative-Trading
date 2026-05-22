@@ -1,0 +1,34 @@
+# 组合优化策略实验包配置
+#
+# 用法：python run_backtest.py --preset portfolio_optimization
+
+name: "portfolio_optimization"
+class: "strategy.portfolio_optimization.PortfolioOptStrategy"
+description: "组合优化权重分配：风险平价/最小方差/最大分散化"
+
+params:
+  universe:
+    - "000001.SZ"
+    - "000002.SZ"
+    - "000333.SZ"
+    - "000568.SZ"
+    - "000651.SZ"
+    - "000725.SZ"
+    - "000858.SZ"
+    - "600000.SH"
+    - "600036.SH"
+    - "600519.SH"
+    - "601318.SH"
+    - "601398.SH"
+  method: "risk_parity"
+  lookback: 60
+  rebalance_freq: 5
+  max_weight: 0.20
+  min_weight: 0.0
+
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"

@@ -8,3 +8,11 @@ pyyaml>=6.0
 fastparquet>=2023.0.0
 pyarrow>=12.0.0
 chinese-calendar>=1.10.0
+
+# 策略扩展依赖
+cvxpy>=1.5.0            # 组合优化
+statsmodels>=0.14.0     # 配对交易协整检验
+hmmlearn>=0.3.0         # HMM 市场状态识别
+arch>=7.0.0             # GARCH 波动率建模
+stable-baselines3>=2.0.0  # RL 组合优化
+torch>=2.0.0            # stable-baselines3 依赖

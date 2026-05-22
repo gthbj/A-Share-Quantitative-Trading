@@ -1,0 +1,23 @@
+# GARCH 波动率择时策略配置
+#
+# 用法：python run_backtest.py --preset volatility_timing
+
+name: "volatility_timing"
+class: "strategy.volatility_timing.GARCHVolTimingStrategy"
+description: "GARCH(1,1) 预测波动率，高波时降仓"
+
+params:
+  index_code: "000300.SH"
+  lookback: 252
+  vol_window: 60
+  high_volile: 0.80
+  low_volile: 0.20
+  high_vol_position: 0.5
+  low_vol_position: 1.0
+
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"

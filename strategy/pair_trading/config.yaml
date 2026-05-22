@@ -1,0 +1,37 @@
+# 配对交易策略实验包配置
+#
+# 用法：python run_backtest.py --preset pair_trading
+
+name: "pair_trading"
+class: "strategy.pair_trading.PairTradingStrategy"
+description: "同行业配对交易，Kalman Filter 动态对冲，z-score 均值回归"
+
+params:
+  board_code: "BK0421.DC"
+  lookback: 60
+  entry_zscore: 2.0
+  exit_zscore: 0.5
+  stop_zscore: 3.5
+  max_holding_days: 15
+  use_kalman: true
+  capital_per_pair: 0.1
+  universe:
+    - "000001.SZ"
+    - "000002.SZ"
+    - "000333.SZ"
+    - "000568.SZ"
+    - "000651.SZ"
+    - "000725.SZ"
+    - "000858.SZ"
+    - "600000.SH"
+    - "600036.SH"
+    - "600519.SH"
+    - "601318.SH"
+    - "601398.SH"
+
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"
