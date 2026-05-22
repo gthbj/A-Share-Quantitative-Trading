@@ -1,0 +1,31 @@
+source_root: "D:/A Share"
+work_dir: "D:/A_Share_Transfer_Work"
+manifest_path: "D:/A_Share_Transfer_Work/raw_manifest.jsonl"
+
+ignore_dirs:
+  - "D:/A Share/基金_分钟数据"
+  - "D:/A Share/A股分钟数据"
+
+gcs:
+  project_id: "data-aquarium"
+  bucket: "data-aquarium"
+  prefix: "a-share/raw"
+  location: "asia-east2"
+
+credentials:
+  # Service account key creation is disabled by org policy in this project.
+  # Use local Application Default Credentials for local uploads.
+  mode: "application_default_credentials"
+  service_account_json: "D:/A_Share_Transfer_Work/gcp-service-account.json"
+  secrets_yaml: "D:/git/A-Share-Quantitative-Trading/config/secrets.yaml"
+
+upload:
+  include_extensions:
+    - ".csv"
+    - ".zip"
+    - ".xlsx"
+    - ".txt"
+  exclude_extensions:
+    - ".downloading"
+  skip_if_remote_size_matches: true
+  verify_after_upload: true

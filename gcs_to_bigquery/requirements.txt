@@ -1,0 +1,4 @@
+google-cloud-bigquery>=3.31.0
+google-cloud-storage>=3.10.0
+google-auth>=2.53.0
+PyYAML>=6.0.3

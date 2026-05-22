@@ -142,7 +142,7 @@ def generate_markdown_summary(
     nav_records_count: int,
     fills_buy_count: int,
     fills_sell_count: int,
-    data_source_name: str = "MaxCompute",
+    data_source_name: str = "BigQuery",
     trade_rows: Optional[List[Dict[str, Any]]] = None,
     benchmark_loaded: bool = True,
 ) -> Path:
@@ -155,8 +155,8 @@ def generate_markdown_summary(
     exec_cfg = config.get("execution", {})
     stop_cfg = config.get("stop_loss", {})
     data_cfg = config.get("data", {})
-    mc_cfg = data_cfg.get("maxcompute", {})
-    tables_cfg = mc_cfg.get("tables", {})
+    bq_cfg = data_cfg.get("bigquery", {})
+    tables_cfg = bq_cfg.get("tables", {})
 
     # 推断本次回测真正用到的表（按 frequency）
     table_hints = {
@@ -189,9 +189,9 @@ def generate_markdown_summary(
 | 字段 | 值 |
 |---|---|
 | 数据源 | {data_source_name} |
-| 项目 (project) | `{mc_cfg.get('project', '')}` |
+| 项目 (project) | `{bq_cfg.get('project_id', '')}` |
 | 主表 (period={frequency}) | `{used_table or '(未配置)'}` |
-| 复权方式 | 前复权（qfq），从 `cn_etf_adj_factor` 即时计算 |
+| 复权方式 | 前复权（qfq），BigQuery 日K表内置 adjust_type 直接查询 |
 
 ## 三、回测参数
 

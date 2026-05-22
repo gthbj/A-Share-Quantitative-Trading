@@ -25,7 +25,7 @@
 │  Portfolio (资金) + Position (持仓/T+1)    │
 ├────────────────────────────────────────────┤
 │  Data Layer (数据层)                       │
-│  BaseDataSource → MaxComputeDataSource     │
+│  BaseDataSource → BigQueryDataSource       │
 │  LocalStorage (Parquet/CSV 缓存)           │
 ├────────────────────────────────────────────┤
 │  Analytics & Utils (绩效与工具)            │
@@ -50,16 +50,17 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `maxcompute_source.py` | **当前默认数据源**。通过 pyodps 连接阿里云 MaxCompute（项目 `a_share_historical_data`，北京区 endpoint）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。接入进度：✅ 5min K 线（`cn_stock_kline_5min` 表）；✅ 15min ETF K 线（`cn_etf_kline_15min` 表，含 510300.SH）；✅ 股票列表（从 5min 表 DISTINCT 派生）；⚠️ 复权接口预留（待因子表接入）；⚠️ 指数成分股暂返回空列表；❌ daily / 1/30/60min 周期及普通股票 15min 表尚未建立。详见 §4.7 / §4.8 / §4.9。 |
+| `bigquery_source.py` | **当前默认数据源**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。接入进度：✅ 日K线（`fact_equity_kline_1d` / `fact_fund_kline_1d` / `fact_index_kline_1d` 表，内置 adjust_type 字段同时支持 none/qfq/hfq）；✅ 股票列表（`dim_security` 表）；✅ 指数成分股（`fact_board_component_1d` 表）；⚠️ 分钟K线表尚未建立。详见 §4.7 / §4.8 / §4.9。 |
+| `maxcompute_source.py` | 阿里云 MaxCompute 数据源实现（保留为备选）。通过 pyodps 连接。历史支持：5min K 线、15min ETF K 线。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
 
 **设计要点**：
 - 抽象接口隔离具体数据源，便于后续接入 Wind、Tushare Pro 等付费源。
 - 缓存策略为 **写时缓存**：首次从远程拉取后自动落盘，不预加载全量数据。
-- **缓存清理（MaxCompute 数据源专有）**：实例化时根据 `data.cache.retention_days` 与 `data.cache.max_size_gb` 自动清理过期或溢出的本地缓存文件，避免长期累积。
+- **缓存清理（BigQuery / MaxCompute 数据源共用）**：实例化时根据 `data.cache.retention_days` 与 `data.cache.max_size_gb` 自动清理过期或溢出的本地缓存文件，避免长期累积。
 - 分钟级数据时间列统一格式化为 `YYYYMMDDHHMM`（12位），便于按交易日前缀快速筛选。
-- **凭据隔离**：MaxCompute AccessKey 通过 `config/secrets.yaml`（已加入 `.gitignore`）或环境变量 `MAXCOMPUTE_ACCESS_ID` / `MAXCOMPUTE_ACCESS_KEY` 注入，不入仓库。
+- **凭据隔离**：BigQuery 服务账号通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml` 中 `bigquery.credentials_path` 注入；MaxCompute AccessKey 仍保留为备选凭据。均不入仓库。
 
 ---
 
@@ -243,57 +244,61 @@ context.order(code, target_qty - current_qty)
 
 **绩效分析**：`metrics.py` 根据 `frequency` 自动选择年化系数（日线 252，1min 252×240），避免分钟级收益率使用日线年化系数导致指标失真。
 
-### 4.6 为什么默认数据源切换为 MaxCompute？
+### 4.6 为什么默认数据源切换为 BigQuery？
 
-历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选）。但 AKShare 接口稳定性差、有 IP 限流且分钟级数据被部分屏蔽；Tushare 的高频接口需要积分门槛。项目所有者已在阿里云 MaxCompute 中维护了 `a_share_historical_data` 项目作为权威历史行情源，因此将默认数据源切换为 MaxCompute。
+历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`）。BigQuery 提供标准 SQL、列式存储与自动分区，且日K线表内置 `adjust_type` 字段（none/qfq/hfq），无需 Python 侧即时复权计算。
 
 **实现要点**：
-- `MaxComputeDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
-- 连接懒加载，凭据通过 `config/secrets.yaml`（gitignored）或环境变量注入。
-- 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免 SQL 重复计费。
-- `akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 装载，以便后续按需切换。
+- `BigQueryDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
+- 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入。
+- 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
+- `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
 
-### 4.7 MaxCompute 表结构与接入进度
+### 4.7 BigQuery 表结构与接入进度
 
-> **当前状态**（截至 PRD_20260519_03 完成）：
+> **当前状态**（截至 PRD_20260522_02 完成）：
 
 | 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
 |------|----------------------------------|------|------|
-| 5min K 线 | `data.maxcompute.tables.kline_5min` | ✅ **已接入** | 表 `cn_stock_kline_5min`，详见 §4.8 |
-| ETF 15min K 线 | `data.maxcompute.tables.kline_etf_15min` | ✅ **已接入** | 表 `cn_etf_kline_15min`，详见 §4.9 |
-| 复权因子 | `data.maxcompute.tables.adjust_factor` | 🟡 接口预留 | `_apply_adjust()` 占位，待复权 PRD 接入 |
-| 股票列表 | （无需配置） | ✅ 已接入（派生） | 由 5min 表 `SELECT DISTINCT code, name` 派生；`list_date / industry` 为空 |
-| 指数成分股 | `data.maxcompute.tables.index_constituent` | 🟡 暂返回空 | 调用 `get_index_constituents()` 返回 `[]` + WARNING，不阻塞策略 |
-| 日K | `data.maxcompute.tables.daily` | ❌ 待建表 | 调用 `get_bars(period="daily")` 抛 `NotImplementedError` |
-| 1min K | `data.maxcompute.tables.kline_1min` | ❌ 待建表 | 同上 |
-| 普通股票 15min K | `data.maxcompute.tables.kline_15min` | ❌ 待建表 | ETF 15min 已有专表；普通股票 15min 待建 |
-| 30/60min K | `data.maxcompute.tables.kline_30/60min` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
-| 专用 stock_info | `data.maxcompute.tables.stock_info` | ❌ 待建表 | 若建立则替代 5min 派生路径；当前未启用 |
+| 股票日K线 | `data.bigquery.tables.kline_1d_equity` | ✅ **已接入** | 表 `fact_equity_kline_1d`，内置 `adjust_type`（none/qfq/hfq） |
+| 基金日K线 | `data.bigquery.tables.kline_1d_fund` | ✅ **已接入** | 表 `fact_fund_kline_1d`，ETF/LOF |
+| 指数日K线 | `data.bigquery.tables.kline_1d_index` | ✅ **已接入** | 表 `fact_index_kline_1d`，用于基准对比 |
+| 股票列表 | `data.bigquery.tables.dim_security` | ✅ **已接入** | 表 `dim_security`，含 `security_type / exchange / list_date` |
+| 指数成分股 | `data.bigquery.tables.board_component` | ✅ **已接入** | 表 `fact_board_component_1d` |
+| 复权因子 | `data.bigquery.tables.adjust_factor` | 🟡 接口预留 | 日K表已内置复权，单独复权因子表待按需启用 |
+| 1min K | `data.bigquery.tables.kline_1min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
+| 5min K | `data.bigquery.tables.kline_5min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
+| 15min K | `data.bigquery.tables.kline_15min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
+| 30/60min K | `data.bigquery.tables.kline_30/60min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
 
-后续每一项接入时，对应方法 `_fetch_daily_bars` / `_fetch_minute_bars` 内分支需按实际字段名拼接 SQL，列名映射到框架标准列 `[code, date, open, high, low, close, volume, amount]`。
+后续每一项分钟级表接入时，对应方法 `_fetch_minute_bars` 内分支需按实际字段名拼接 SQL，列名映射到框架标准列 `[code, date, open, high, low, close, volume, amount]`。
 
-### 4.8 5min 表 (`cn_stock_kline_5min`) 接入细节
+### 4.8 BigQuery 日K线表接入细节
 
-**表结构**（PRD_20260519_02 调研结果）：
+**表结构**（PRD_20260522_01 规范）：
 
 | 列 | 类型 | 含义 |
 |---|---|---|
-| `trade_time` | DATETIME | K 线时间，精确到分钟 |
-| `code` | STRING | 股票代码，**表内格式为 `shXXXXXX` / `szXXXXXX`**（小写前缀） |
-| `name` | STRING | 股票中文名 |
-| `open / close / high / low` | DOUBLE | OHLC |
-| `volume` | BIGINT | 成交量（股） |
-| `amount` | DOUBLE | 成交额（元） |
-| `change_pct / amplitude` | DOUBLE | 涨跌幅 / 振幅（框架不返回） |
-| `year_month` | STRING | **分区字段**，格式 `YYYYMM` |
+| `date` | DATE | K 线日期 |
+| `partition_month` | INT64 | **分区字段**，格式 `YYYYMM` |
+| `security_code` | STRING | 股票代码，**标准格式 `XXXXXX.SH` / `XXXXXX.SZ`** |
+| `source_code` | STRING | 原始代码（备用） |
+| `adjust_type` | STRING | 复权类型：`none` / `qfq` / `hfq` |
+| `open / high / low / close` | NUMERIC | OHLC |
+| `volume` | NUMERIC | 成交量（股） |
+| `amount` | NUMERIC | 成交额（元） |
+| `amplitude / pct_change / change / turnover_rate` | NUMERIC | 涨跌幅等（框架不全部返回） |
 
 **关键约定**：
 
-1. **代码格式双向映射**：上层调用始终用框架格式 `XXXXXX.SH` / `XXXXXX.SZ`；`_to_exchange_code()` 在拼 SQL 前转为表格式 `shXXXXXX` / `szXXXXXX`；`_to_framework_code()` 在 DataFrame 返回前转回框架格式。**对策略层完全透明。**
-2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `year_month` 列表（`_year_months_in_range()`），SQL 中以 `year_month IN ('200006', '200007', ...)` 触发分区裁剪。**不裁剪则全表扫描，计费成本约 1000 倍。**
-3. **时间格式化**：SQL 直接 `SELECT trade_time`（DATETIME），由 Python 侧 `pd.to_datetime(...).strftime("%Y%m%d%H%M")` 转为 12 位 `YYYYMMDDHHMM` 字符串，与框架分钟级 `date` 列约定一致。避免对 MaxCompute SQL 函数版本差异的依赖。
-4. **复权当前不支持**：5min 表为不复权原始价。`adjust ∈ {qfq, hfq}` 时 `_apply_adjust()` 仅打 WARNING 日志，**返回原始价**。待复权因子表接入后扩展该方法。
-5. **数据时间覆盖**：当前 5min 表仅含 `200006 ~ 200212` 共 31 个分区（约 2.5 年）。超出范围的请求返回空 DataFrame，不报错。数据扩充由独立 PRD 负责。
+1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ`，**无需像 MaxCompute 那样做 shXXXXXX 双向映射**。
+2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `partition_month` 列表（`_partition_months_in_range()`），SQL 中以 `partition_month IN (202001, 202002, ...)` 触发分区裁剪。**不裁剪则全表扫描，查询成本显著增加。**
+3. **内置复权**：日K表通过 `adjust_type` 字段同时保存 none/qfq/hfq 三种数据。`get_bars(adjust="qfq")` 直接在 SQL 中 `WHERE adjust_type = 'qfq'`，**无需 Python 侧即时复权计算**，结果更准确且避免跨表 JOIN。
+4. **资产类型自动路由**：`BigQueryDataSource._resolve_kline_table()` 根据代码前缀自动判断：
+   - ETF/LOF（51/56/58/11.SH, 15/16.SZ）→ `fact_fund_kline_1d`
+   - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
+   - 其他 → `fact_equity_kline_1d`
+5. **数据时间覆盖**：日K线数据覆盖范围由数据迁移 PRD 决定，超出范围的请求返回空 DataFrame，不报错。
 
 ### 4.10 订单类型撮合规则（PRD_20260520_06）
 
@@ -495,7 +500,8 @@ handle_data → Context.limit_order / stop_order
 ### 5.1 接入新数据源
 
 1. 继承 `BaseDataSource`，实现 `get_bars`、`get_stock_list`、`get_index_constituents`。
-2. 在 `run_backtest.py` 中替换 `build_maxcompute_data_source()` 的调用为你的实现，或在 `data.source` 配置项基础上扩展分支。
+2. 在 `run_backtest.py` 中替换 `build_bigquery_data_source()` 的调用为你的实现，或在 `data.source` 配置项基础上扩展分支。
+3. 参考 `bigquery_source.py` 的缓存策略、分区裁剪与资产类型路由设计。
 
 ### 5.2 添加新策略
 
@@ -522,10 +528,11 @@ handle_data → Context.limit_order / stop_order
 |------|------|------|
 | `run_backtest.py` | 入口 | CLI 命令行入口（含 `--preset` 模式） |
 | `config/backtest.yaml` | 配置 | 回测参数与费率 |
-| `config/secrets.yaml` | 配置 | MaxCompute 凭据，**不入 git** |
+| `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
-| `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（默认） |
+| `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
+| `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（保留备选） |
 | `data_layer/akshare_source.py` | 实现 | AKShare 数据源（保留备选） |
 | `data_layer/tushare_source.py` | 实现 | Tushare 数据源（保留备选） |
 | `data_layer/local_storage.py` | 工具 | 本地缓存读写 |

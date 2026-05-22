@@ -19,7 +19,7 @@ from analytics.metrics import calculate_metrics
 from analytics.plotter import Plotter
 from analytics.report import generate_html_report
 from analytics.summary import generate_markdown_summary
-from data_layer.maxcompute_source import MaxComputeDataSource
+from data_layer.bigquery_source import BigQueryDataSource
 from engine.backtest import BacktestEngine
 from engine.backtest import DailyRecord
 from engine.trade_engine import OrderSide, TradeEngine
@@ -43,34 +43,27 @@ def load_secrets(secrets_path: str = "config/secrets.yaml") -> dict:
         return yaml.safe_load(f) or {}
 
 
-def build_maxcompute_data_source(cfg: dict) -> MaxComputeDataSource:
-    """根据 config + secrets + 环境变量构造 MaxCompute 数据源。
+def build_bigquery_data_source(cfg: dict) -> BigQueryDataSource:
+    """根据 config + secrets + 环境变量构造 BigQuery 数据源。
 
-    凭据优先级：环境变量 > secrets.yaml。
+    凭据优先级：环境变量 GOOGLE_APPLICATION_CREDENTIALS > secrets.yaml。
     """
     secrets = load_secrets()
     data_cfg = cfg.get("data", {})
-    mc_cfg = data_cfg.get("maxcompute", {})
-    mc_secrets = secrets.get("maxcompute", {})
+    bq_cfg = data_cfg.get("bigquery", {})
+    bq_secrets = secrets.get("bigquery", {})
 
-    access_id = os.environ.get("MAXCOMPUTE_ACCESS_ID") or mc_secrets.get("access_id", "")
-    access_key = os.environ.get("MAXCOMPUTE_ACCESS_KEY") or mc_secrets.get("access_key", "")
-
-    if not access_id or not access_key:
-        raise RuntimeError(
-            "缺少 MaxCompute 凭据：请在 config/secrets.yaml 中配置 access_id / access_key，"
-            "或设置环境变量 MAXCOMPUTE_ACCESS_ID / MAXCOMPUTE_ACCESS_KEY。"
-        )
+    credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or bq_secrets.get("credentials_path", "")
 
     cache_cfg = data_cfg.get("cache", {})
-    return MaxComputeDataSource(
-        access_id=access_id,
-        access_key=access_key,
-        project=mc_cfg.get("project", ""),
-        endpoint=mc_cfg.get("endpoint", ""),
+    return BigQueryDataSource(
+        project_id=bq_cfg.get("project_id", ""),
+        dataset=bq_cfg.get("dataset", "ashare_core"),
+        location=bq_cfg.get("location", "asia-east2"),
+        credentials_path=credentials_path,
         cache_retention_days=cache_cfg.get("retention_days", 7),
         cache_max_size_gb=cache_cfg.get("max_size_gb", 1.0),
-        tables=mc_cfg.get("tables", {}),
+        tables=bq_cfg.get("tables", {}),
     )
 
 
@@ -190,9 +183,9 @@ def main() -> int:
         print("错误：必须指定 --strategy 或 --preset 之一")
         return 1
 
-    # 初始化数据源（当前固定使用 MaxCompute）
+    # 初始化数据源（当前默认使用 BigQuery）
     try:
-        data_source = build_maxcompute_data_source(cfg)
+        data_source = build_bigquery_data_source(cfg)
     except RuntimeError as e:
         print(str(e))
         return 1
@@ -365,7 +358,7 @@ def main() -> int:
         nav_records_count=len(nav_df),
         fills_buy_count=buy_count,
         fills_sell_count=sell_count,
-        data_source_name="阿里云 MaxCompute",
+        data_source_name="Google Cloud BigQuery",
         trade_rows=trade_rows,
     )
 
@@ -395,7 +388,7 @@ def main() -> int:
         nav_records_count=len(nav_df),
         fills_buy_count=buy_count,
         fills_sell_count=sell_count,
-        data_source_name="阿里云 MaxCompute",
+        data_source_name="Google Cloud BigQuery",
         trade_rows=trade_rows,
         benchmark_loaded=benchmark_loaded,
     )

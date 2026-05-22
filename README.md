@@ -16,23 +16,23 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
-### 2. 配置 MaxCompute 凭据（首次运行必做）
+### 2. 配置 BigQuery 凭据（首次运行必做）
 
-数据源默认使用阿里云 MaxCompute（项目 `a_share_historical_data`，北京区 endpoint）。
+数据源默认使用 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`）。
 将凭据放入 `config/secrets.yaml`（已在 .gitignore 中，不会入库）：
 
 ```yaml
-maxcompute:
-  access_id: "你的 AccessKey ID"
-  access_key: "你的 AccessKey Secret"
+bigquery:
+  credentials_path: "config/bigquery-service-account.json"
 ```
 
-或通过环境变量：
+或通过环境变量（推荐）：
 
 ```bash
-export MAXCOMPUTE_ACCESS_ID=...
-export MAXCOMPUTE_ACCESS_KEY=...
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bigquery-service-account.json
 ```
+
+> 如需回退到 MaxCompute，修改 `config/backtest.yaml` 中 `data.source: "maxcompute"` 并配置对应凭据。
 
 ### 3. 运行回测（推荐用 preset）
 
@@ -80,13 +80,14 @@ python run_backtest.py \
 ├── ARCHITECTURE.md               # 架构设计文档
 ├── config/
 │   ├── backtest.yaml             # 全局配置：费率、滑点、撮合规则、表名
-│   ├── secrets.yaml              # MaxCompute 凭据（不入库）
+│   ├── secrets.yaml              # BigQuery / MaxCompute 凭据（不入库）
 │   └── secrets.yaml.example      # 凭据模板
 ├── data/                         # 本地缓存
-│   └── raw/                      # MaxCompute 拉取的行情 Parquet（不入库）
+│   └── raw/                      # BigQuery 拉取的行情 Parquet（不入库）
 ├── data_layer/
 │   ├── base_data_source.py       # 数据源抽象基类
-│   ├── maxcompute_source.py      # MaxCompute 实现（默认）
+│   ├── bigquery_source.py        # BigQuery 实现（默认）
+│   ├── maxcompute_source.py      # MaxCompute 实现（备选）
 │   ├── akshare_source.py         # AKShare 实现（备选，未启用）
 │   ├── tushare_source.py         # Tushare 实现（备选，未启用）
 │   └── local_storage.py          # Parquet 缓存
@@ -200,8 +201,8 @@ python run_backtest.py --strategy strategy.my_module.MyStrategy --universe 51030
 - **三种订单类型**：MARKET / LIMIT / STOP
 - **撮合规则**：默认 next_open（信号 T → 成交 T+1 开盘），避免 Lookahead Bias
 - **全局止损**：可在 `backtest.yaml` 配置，与策略订单并轨执行
-- **MaxCompute 数据源**：默认接入阿里云 `a_share_historical_data` 项目，本地 Parquet 缓存
-- **复权**：从 `cn_etf_adj_factor` 表即时计算前复权（qfq）
+- **BigQuery 数据源**：默认接入 Google Cloud `data-aquarium` 项目 `ashare_core` dataset，本地 Parquet 缓存
+- **复权**：日K线表内置 `adjust_type`（none/qfq/hfq），直接查询对应复权数据
 - **绩效指标**：累计/年化收益、最大回撤、夏普/索提诺、Beta/Alpha/IR、胜率、盈亏比（FIFO 配对）
 - **可视化**：累计收益、回撤、月度热力图；自动探测系统中文字体
 - **单元测试**：tests/ 覆盖 TradeEngine / Position / Portfolio / metrics / code
@@ -223,7 +224,8 @@ pytest tests/ -v
 
 - Python 3.9+
 - pandas / numpy
-- pyodps（MaxCompute 数据源）
+- google-cloud-bigquery（BigQuery 数据源）
+- pyodps（MaxCompute 数据源，备选）
 - matplotlib
 - pyyaml
 - chinese-calendar

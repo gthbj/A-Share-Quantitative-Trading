@@ -70,7 +70,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <tr><td class="k">数据源</td><td>__DATA_SOURCE__</td></tr>
             <tr><td class="k">项目 (project)</td><td><code>__MC_PROJECT__</code></td></tr>
             <tr><td class="k">主表 (period=__FREQUENCY__)</td><td><code>__USED_TABLE__</code></td></tr>
-            <tr><td class="k">复权方式</td><td>前复权（qfq），从 <code>cn_etf_adj_factor</code> 即时计算</td></tr>
+            <tr><td class="k">复权方式</td><td>前复权（qfq），BigQuery 日K表内置 <code>adjust_type</code> 直接查询</td></tr>
         </table>
 
         <h2>三、核心绩效指标</h2>
@@ -243,7 +243,7 @@ def generate_html_report(
     nav_records_count: int = 0,
     fills_buy_count: int = 0,
     fills_sell_count: int = 0,
-    data_source_name: str = "MaxCompute",
+    data_source_name: str = "BigQuery",
     trade_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """生成 HTML 回测报告并保存到本地。
@@ -260,18 +260,18 @@ def generate_html_report(
     slip_cfg = config.get("slippage", {})
     exec_cfg = config.get("execution", {})
     stop_cfg = config.get("stop_loss", {})
-    mc_cfg = config.get("data", {}).get("maxcompute", {})
-    tables_cfg = mc_cfg.get("tables", {})
+    bq_cfg = config.get("data", {}).get("bigquery", {})
+    tables_cfg = bq_cfg.get("tables", {})
 
     # 推断本次回测真正用到的表
-    used_table = {
-        "daily": tables_cfg.get("daily", ""),
-        "1min": tables_cfg.get("kline_1min", ""),
-        "5min": tables_cfg.get("kline_5min", ""),
-        "15min": tables_cfg.get("kline_etf_15min") or tables_cfg.get("kline_15min", ""),
-        "30min": tables_cfg.get("kline_30min", ""),
-        "60min": tables_cfg.get("kline_60min", ""),
-    }.get(frequency, "")
+    if frequency == "daily":
+        used_table = (
+            f"equity: {tables_cfg.get('kline_1d_equity', '')}, "
+            f"fund: {tables_cfg.get('kline_1d_fund', '')}, "
+            f"index: {tables_cfg.get('kline_1d_index', '')}"
+        )
+    else:
+        used_table = tables_cfg.get(f"kline_{frequency}_equity", "")
 
     universe_chips = "".join(
         f"<span class='chip'>{code}</span>" for code in universe
@@ -309,7 +309,7 @@ def generate_html_report(
         "__BENCHMARK__": benchmark,
         "__NAV_COUNT__": f"{nav_records_count:,}",
         "__DATA_SOURCE__": data_source_name,
-        "__MC_PROJECT__": mc_cfg.get('project', ''),
+        "__MC_PROJECT__": bq_cfg.get('project_id', ''),
         "__USED_TABLE__": used_table or "(未配置)",
         "__TOTAL_RETURN__": _fmt_pct(metrics.total_return),
         "__CLS_TOTAL__": _cls(metrics.total_return),

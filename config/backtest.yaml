@@ -29,38 +29,56 @@ execution:
 
 # 数据配置
 data:
-  source: "maxcompute"      # 当前固定使用 MaxCompute；akshare/tushare 实现暂保留但不启用
+  source: "bigquery"         # 当前默认使用 BigQuery；maxcompute / akshare / tushare 保留为备选
   cache_dir: "data/raw"
   storage_format: "parquet"  # parquet | csv
 
-  # 本地缓存策略：MaxCompute SQL 查询计费，首次拉取后落盘，后续命中本地缓存
+  # 本地缓存策略：BigQuery 查询按量计费，首次拉取后落盘，后续命中本地缓存
   cache:
     retention_days: 7        # 缓存文件保留时长（天），超过此期限的文件会被清理
     max_size_gb: 1.0         # 缓存目录最大体积（GB），超过则按修改时间升序清理至阈值内
 
-  # 阿里云 MaxCompute（ODPS）数据源配置
+  # Google Cloud BigQuery 数据源配置
+  # 敏感凭据（GOOGLE_APPLICATION_CREDENTIALS）放在 config/secrets.yaml 或环境变量，不入 git
+  bigquery:
+    project_id: "data-aquarium"
+    dataset: "ashare_core"
+    location: "asia-east2"
+    # 表名映射
+    tables:
+      # —— 日K线（已接入）——
+      kline_1d_equity: "fact_equity_kline_1d"   # A股日K（含 adjust_type: none/qfq/hfq）
+      kline_1d_fund: "fact_fund_kline_1d"       # ETF/LOF 日K
+      kline_1d_index: "fact_index_kline_1d"     # 指数日K
+      # —— 复权因子表（接口预留，日K已内置复权，暂不需要单独查询）——
+      adjust_factor: "fact_adjust_factor"
+      # —— 股票基础信息（已接入）——
+      dim_security: "dim_security"               # 股票列表、基金列表、指数列表
+      # —— 指数/板块成分股（已接入）——
+      board_component: "fact_board_component_1d" # 指数成分股、板块成分股
+      # —— 以下分钟级表尚未建立，调用时会抛 NotImplementedError ——
+      kline_1min_equity: ""       # 1 分钟K表
+      kline_5min_equity: ""       # 5 分钟K表
+      kline_15min_equity: ""      # 15 分钟K表（普通股票）
+      kline_30min_equity: ""      # 30 分钟K表
+      kline_60min_equity: ""      # 60 分钟K表
+
+  # 阿里云 MaxCompute（ODPS）数据源配置（保留为备选）
   # 敏感凭据（access_id / access_key）放在 config/secrets.yaml，不入 git
   maxcompute:
     endpoint: "http://service.cn-beijing.maxcompute.aliyun.com/api"
     project: "a_share_historical_data"
-    # 表名映射
-    # 项目 a_share_historical_data 目前仅 cn_stock_kline_5min 一张表已建立，其余周期/
-    # 元信息/指数成分股表待后续 PRD 建立。未配置（空字符串）的项在被调用时会抛出
-    # NotImplementedError，错误信息会明确指出对应 key。
     tables:
-      # —— 已建表（已接入）——
       kline_5min: "cn_stock_kline_5min"
-      # —— 复权因子表（接口已预留，待复权 PRD 接入）——
       adjust_factor: "cn_etf_adj_factor"
-      # —— 以下表尚未建立，对应 period 调用会抛 NotImplementedError ——
-      daily: ""                # 日K表
-      kline_1min: ""           # 1 分钟K表
-      kline_etf_15min: "cn_etf_kline_15min"  # ETF 15min K 表（代码格式为框架格式 XXXXXX.SH）
-      kline_15min: ""          # 15 分钟K表（普通股票，待建）
-      kline_30min: ""          # 30 分钟K表
-      kline_60min: ""          # 60 分钟K表
-      stock_info: ""           # 股票基础信息表（若空，get_stock_list 会从 5min 表派生）
-      index_constituent: ""    # 指数成分股表（若空，get_index_constituents 返回空列表）
+      daily: ""
+      kline_1min: ""
+      kline_etf_15min: "cn_etf_kline_15min"
+      kline_15min: ""
+      kline_30min: ""
+      kline_60min: ""
+      stock_info: ""
+      index_constituent: ""
 
 # 止损配置
 stop_loss:

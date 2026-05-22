@@ -1,0 +1,68 @@
+project_id: "data-aquarium"
+location: "asia-east2"
+manifest_path: "D:/A_Share_Transfer_Work/bigquery_load_manifest.jsonl"
+
+gcs:
+  bucket: "data-aquarium"
+  prefix: "a-share/standardized"
+
+datasets:
+  raw: "ashare_raw"
+  core: "ashare_core"
+  mart: "ashare_mart"
+
+defaults:
+  load_mode: "staging_only"
+  skip_loaded: true
+  csv:
+    skip_leading_rows: 1
+    autodetect: true
+    allow_quoted_newlines: true
+    encoding: "UTF-8"
+
+tables:
+  fact_equity_kline_1d:
+    primary_key: ["security_code", "date", "adjust_type"]
+    partition_field: "date"
+    clustering_fields: ["security_code", "adjust_type"]
+    load_mode: "staging_only"
+  fact_fund_kline_1d:
+    primary_key: ["fund_code", "date", "adjust_type"]
+    partition_field: "date"
+    clustering_fields: ["fund_code", "fund_type", "adjust_type"]
+    load_mode: "staging_only"
+  fact_index_kline_1d:
+    primary_key: ["index_code", "date"]
+    partition_field: "date"
+    clustering_fields: ["index_code", "source"]
+    load_mode: "staging_only"
+  fact_board_kline_1d:
+    primary_key: ["board_code", "date", "source"]
+    partition_field: "date"
+    clustering_fields: ["board_code", "board_type", "source"]
+    load_mode: "staging_only"
+  fact_adjust_factor:
+    primary_key: ["security_code", "date", "adjust_type"]
+    partition_field: "date"
+    clustering_fields: ["security_code", "adjust_type"]
+    load_mode: "staging_only"
+  fact_limit_price_1d:
+    primary_key: ["security_code", "date"]
+    partition_field: "date"
+    clustering_fields: ["security_code"]
+    load_mode: "staging_only"
+  fact_suspend_1d:
+    primary_key: ["security_code", "date"]
+    partition_field: "date"
+    clustering_fields: ["security_code"]
+    load_mode: "staging_only"
+  fact_st_status_1d:
+    primary_key: ["security_code", "date"]
+    partition_field: "date"
+    clustering_fields: ["security_code", "st_type"]
+    load_mode: "staging_only"
+  fact_board_component_1d:
+    primary_key: ["date", "board_code", "security_code", "source"]
+    partition_field: "date"
+    clustering_fields: ["board_code", "security_code", "source"]
+    load_mode: "staging_only"

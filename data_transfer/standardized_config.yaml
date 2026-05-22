@@ -1,0 +1,22 @@
+source_root: "D:/A Share"
+work_dir: "D:/A_Share_Transfer_Work"
+standardized_root: "D:/A_Share_Transfer_Work/standardized"
+manifest_path: "D:/A_Share_Transfer_Work/standardized_manifest.jsonl"
+
+ignore_dirs:
+  - "D:/A Share/基金_分钟数据"
+  - "D:/A Share/A股分钟数据"
+
+gcs:
+  project_id: "data-aquarium"
+  bucket: "data-aquarium"
+  prefix: "a-share/standardized"
+  location: "asia-east2"
+
+credentials:
+  mode: "application_default_credentials"
+
+upload:
+  skip_if_remote_size_matches: true
+  verify_after_upload: true
+  keep_local_files: true

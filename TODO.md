@@ -10,7 +10,7 @@
 |------|------|---------|
 | P0-1 | 收益曲线/回撤图水平线段 | 此前已在 PRD_20260519_03 之前修复（按日期长度分别解析 YYYYMMDD / YYYYMMDDHHMM） |
 | P0-2 | 止损单未来函数 | 此前已在 PRD_20260510_02 中改为次日开盘成交 |
-| P1-1 | AKShare 分钟数据不可达 | 默认切换到 MaxCompute（PRD_20260519_01） |
+| P1-1 | AKShare 分钟数据不可达 | 默认切换到 MaxCompute（PRD_20260519_01），后迁移至 BigQuery（PRD_20260522_01/02） |
 | P1-2 | Matplotlib 中文字体 | PRD_20260520_05：`Plotter` 模块加载时自动探测系统中文字体 |
 | P2-1 | 交易日历硬编码 | PRD_20260520_05：接入 `chinese_calendar`，硬编码保留为 fallback |
 | P2-2 | 缺少单元测试 | PRD_20260520_07：tests/ 共 64 个用例，覆盖 TradeEngine / Position / Portfolio / metrics / code |
@@ -52,7 +52,7 @@
 PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、ETF 10%），但 ST/*ST 股票应为 ±5%，目前一律按板块默认值放行。
 
 **根因分析**  
-当前数据源（MaxCompute 5min K 线表）不包含 ST 标签字段；`Order` 也没有 `is_st` 字段。
+当前数据源（BigQuery `fact_equity_kline_1d`）已包含 ST 状态表 `fact_st_status_1d`，但引擎尚未接入。
 
 **修复方向**  
 - 等股票列表 / 基本面表上线后接入 ST 状态（按日期生效）
@@ -67,7 +67,7 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 `MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
 
 **修复方向**  
-- 等待 MaxCompute 中财务表、行业表、指数成分股表上线
+- BigQuery 已上线财务表、行业表、指数成分股表（`ashare_core` dataset），待引擎接入
 - `MultiFactorStrategy` 接入真实因子数据
 
 ---
@@ -76,14 +76,14 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 ### TBD-6: 分钟级缓存覆盖范围检查失效（P0）
 
 **现象**  
-`MaxComputeDataSource.get_bars()` 中缓存命中判断使用字符串比较：`cmin <= start_date`。分钟级 `date` 为 12 位（`YYYYMMDDHHMM`），而 `start_date` 为 8 位（`YYYYMMDD`），字典序下 `"200006090000" <= "20000609"` 为 `False`，导致**分钟级缓存永远不会被命中**，重复查询 MaxCompute 产生额外费用。
+`BigQueryDataSource.get_bars()` 继承了与 MaxCompute 相同的缓存命中判断逻辑：字符串比较 `cmin <= start_date`。分钟级 `date` 为 12 位（`YYYYMMDDHHMM`），而 `start_date` 为 8 位（`YYYYMMDD`），字典序下 `"200006090000" <= "20000609"` 为 `False`，导致**分钟级缓存永远不会被命中**，重复查询 BigQuery 产生额外费用。
 
 **根因分析**  
 `get_bars()` 中未对分钟级与日线级的日期长度做统一处理，直接进行字符串比较。
 
 **修复方向**  
 - 统一比较长度：将 `start_date` / `end_date` 扩展为与缓存数据相同的位数后再比较；或统一截取日期前缀。
-- 位置：`data_layer/maxcompute_source.py` `get_bars()` 方法。
+- 位置：`data_layer/bigquery_source.py` `get_bars()` 方法（与 `maxcompute_source.py` 同源逻辑）。
 
 ---
 
@@ -153,16 +153,16 @@ DataFrame 布尔索引为 O(n) 操作，且在每个交易日/每根 bar、每�
 
 ---
 
-### TBD-12: MaxCompute 数据源 SQL 注入风险与性能问题（P1）
+### TBD-12: 数据源 SQL 注入风险与性能问题（P1）
 
 **现象**  
-1. `_fetch_5min_bars` / `_fetch_etf_15min_bars` 中直接将 `code` 拼接到 SQL 字符串（`WHERE code = '{exchange_code}'`），存在 SQL 注入风险。
-2. `get_stock_list` 执行无分区条件的 `SELECT DISTINCT code, name FROM {table}`，对大表会触发全表扫描，计费成本极高。
+1. `maxcompute_source.py` 中 `_fetch_5min_bars` / `_fetch_etf_15min_bars` 直接将 `code` 拼接到 SQL 字符串（`WHERE code = '{exchange_code}'`），存在 SQL 注入风险。`bigquery_source.py` 的 `_fetch_daily_bars` 也存在相同问题。
+2. `maxcompute_source.py` 的 `get_stock_list` 执行无分区条件的 `SELECT DISTINCT code, name FROM {table}`，对大表会触发全表扫描，计费成本极高。`bigquery_source.py` 已改用 `dim_security` 小表，该问题已缓解。
 3. `_execute_sql` 对所有异常（包括 SQL 语法错误、表不存在等）都执行指数退避重试，浪费资源。
 
 **修复方向**  
-- `code` 使用参数化查询或预校验格式（仅允许 `sh\d{6}` / `sz\d{6}` / `\d{6}\.(SH|SZ|BJ)` 等）。
-- `get_stock_list` 限制 `year_month` 分区条件，或优先使用独立的 `stock_info` 表。
+- `code` 使用参数化查询或预校验格式（仅允许 `\d{6}\.(SH|SZ|BJ)` 等）。
+- `get_stock_list` 优先使用独立的 `dim_security` 表（BigQuery 已接入）。
 - 重试逻辑区分可重试异常（网络超时、连接断开）与不可重试异常（语法错误、权限不足）。
 
 ---
@@ -236,7 +236,8 @@ DataFrame 布尔索引为 O(n) 操作，且在每个交易日/每根 bar、每�
 - `analytics/plotter.py`（图表渲染、中文字体 fallback）
 - `analytics/report.py`、`summary.py`（HTML/Markdown 结构断言）
 - `run_backtest.py`（CLI 参数解析、preset 加载流程）
-- `data_layer/maxcompute_source.py`（SQL 拼接、分区裁剪、缓存命中/未命中路径）
+- `data_layer/bigquery_source.py`（SQL 拼接、分区裁剪、缓存命中/未命中路径）
+- `data_layer/maxcompute_source.py`（保留备选）
 - `data_layer/local_storage.py`（Parquet 读写、日期边界过滤）
 
 此外，**缺少端到端集成测试**：无法验证"完整回测一次并产出正确 NAV 曲线与报告"这一核心链路。
