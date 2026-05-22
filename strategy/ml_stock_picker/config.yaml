@@ -1,0 +1,73 @@
+# ML 选股策略实验包配置
+#
+# 用法：python run_backtest.py --preset ml_stock_picker
+# CLI 参数可覆盖本文件的对应字段。
+
+# ── 元信息 ──
+name: "ml_stock_picker"
+class: "strategy.ml_stock_picker.MLStockPickerStrategy"
+description: "基于 LightGBM/XGBoost 的日线中频选股策略。预训练模型预测股票上涨概率，取 Top-K 等权持仓，每 5 个交易日调仓。"
+
+# ── 策略构造参数 ──
+params:
+  model_path: "strategy/ml_stock_picker/models/lgbm_model.pkl"
+  model_type: "lightgbm"
+  universe:
+    - "000001.SZ"
+    - "000002.SZ"
+    - "000063.SZ"
+    - "000100.SZ"
+    - "000333.SZ"
+    - "000568.SZ"
+    - "000651.SZ"
+    - "000725.SZ"
+    - "000768.SZ"
+    - "000858.SZ"
+    - "600000.SH"
+    - "600009.SH"
+    - "600016.SH"
+    - "600028.SH"
+    - "600030.SH"
+    - "600031.SH"
+    - "600036.SH"
+    - "600048.SH"
+    - "600276.SH"
+    - "600309.SH"
+    - "600406.SH"
+    - "600436.SH"
+    - "600519.SH"
+    - "600585.SH"
+    - "600690.SH"
+    - "600745.SH"
+    - "600809.SH"
+    - "600887.SH"
+    - "601012.SH"
+    - "601066.SH"
+    - "601088.SH"
+    - "601138.SH"
+    - "601166.SH"
+    - "601318.SH"
+    - "601398.SH"
+    - "601888.SH"
+    - "603288.SH"
+    - "603501.SH"
+    - "603986.SH"
+    - "688981.SH"
+  feature_window: 20
+  label_horizon: 5
+  top_k: 8
+  rebalance_freq: 5
+  position_pct: 0.95
+
+# ── 推荐回测区间与频率 ──
+backtest:
+  start_date: "20200101"
+  end_date: "20231231"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"
+
+# ── 备注 ──
+# 1. 模型文件需先通过 train.py 训练生成，否则策略会降级为随机选股。
+# 2. 止损/滑点等市场级参数继承自全局 config/backtest.yaml。
+# 3. 如需使用 GCS 模型路径，修改 model_path 为 gs://bucket/models/xxx.pkl。

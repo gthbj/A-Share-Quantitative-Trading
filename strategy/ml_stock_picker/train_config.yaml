@@ -1,0 +1,98 @@
+# ML 选股模型训练配置
+#
+# 用法：
+#   python strategy/ml_stock_picker/train.py --config strategy/ml_stock_picker/train_config.yaml
+#
+# 推荐在 GCP Spot VM 上运行：
+#   gcloud compute instances create trainer --zone=asia-east2-a \
+#     --machine-type=n2-standard-8 --preemptible \
+#     --metadata-from-file startup-script=train_startup.sh
+
+logging:
+  level: "INFO"
+
+# ── 数据源 ──
+data_source: "bigquery"  # bigquery | local
+
+bigquery:
+  project_id: "data-aquarium"
+  dataset: "ashare_core"
+  location: "asia-east2"
+  # 凭据优先级：GOOGLE_APPLICATION_CREDENTIALS 环境变量 > 此处配置
+  credentials_path: ""
+
+local:
+  local_dir: "data/raw"
+
+# ── 训练参数 ──
+train:
+  # 股票池（与回测 universe 保持一致）
+  universe:
+    - "000001.SZ"
+    - "000002.SZ"
+    - "000063.SZ"
+    - "000100.SZ"
+    - "000333.SZ"
+    - "000568.SZ"
+    - "000651.SZ"
+    - "000725.SZ"
+    - "000768.SZ"
+    - "000858.SZ"
+    - "600000.SH"
+    - "600009.SH"
+    - "600016.SH"
+    - "600028.SH"
+    - "600030.SH"
+    - "600031.SH"
+    - "600036.SH"
+    - "600048.SH"
+    - "600276.SH"
+    - "600309.SH"
+    - "600406.SH"
+    - "600436.SH"
+    - "600519.SH"
+    - "600585.SH"
+    - "600690.SH"
+    - "600745.SH"
+    - "600809.SH"
+    - "600887.SH"
+    - "601012.SH"
+    - "601066.SH"
+    - "601088.SH"
+    - "601138.SH"
+    - "601166.SH"
+    - "601318.SH"
+    - "601398.SH"
+    - "601888.SH"
+    - "603288.SH"
+    - "603501.SH"
+    - "603986.SH"
+    - "688981.SH"
+
+  # 训练区间
+  start_date: "20180101"
+  end_date: "20231231"
+
+  # 模型类型
+  model_type: "lightgbm"  # lightgbm | xgboost
+
+  # 模型超参数（覆盖默认值）
+  model_params:
+    objective: "binary"
+    metric: "auc"
+    boosting_type: "gbdt"
+    num_leaves: 31
+    learning_rate: 0.05
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    verbose: -1
+
+  # 特征与标签
+  feature_window: 20
+  label_horizon: 5
+  top_pct: 0.30       # top 30% 标记为正样本
+  bottom_pct: 0.30    # bottom 30% 标记为负样本
+
+  # 模型输出路径（本地或 gs://）
+  model_output_path: "strategy/ml_stock_picker/models/lgbm_model.pkl"

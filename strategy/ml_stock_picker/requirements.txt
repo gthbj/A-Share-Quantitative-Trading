@@ -1,0 +1,6 @@
+# ML 选股策略额外依赖
+# 安装：pip install -r strategy/ml_stock_picker/requirements.txt
+
+lightgbm>=4.0.0
+xgboost>=2.0.0
+scikit-learn>=1.3.0
