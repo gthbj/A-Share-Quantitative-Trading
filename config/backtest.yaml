@@ -42,20 +42,20 @@ data:
   # 敏感凭据（GOOGLE_APPLICATION_CREDENTIALS）放在 config/secrets.yaml 或环境变量，不入 git
   bigquery:
     project_id: "data-aquarium"
-    dataset: "ashare_core"
+    dataset: "ashare"
     location: "asia-east2"
     # 表名映射
     tables:
       # —— 日K线（已接入）——
-      kline_1d_equity: "fact_equity_kline_1d"   # A股日K（含 adjust_type: none/qfq/hfq）
-      kline_1d_fund: "fact_fund_kline_1d"       # ETF/LOF 日K
-      kline_1d_index: "fact_index_kline_1d"     # 指数日K
+      kline_1d_equity: "dwd_fact_equity_kline_1d"   # A股日K（含 adjust_type: none/qfq/hfq）
+      kline_1d_fund: "dwd_fact_fund_kline_1d"       # ETF/LOF 日K
+      kline_1d_index: "dwd_fact_index_kline_1d"     # 指数日K
       # —— 复权因子表（接口预留，日K已内置复权，暂不需要单独查询）——
-      adjust_factor: "fact_adjust_factor"
+      adjust_factor: "dwd_fact_adjust_factor"
       # —— 股票基础信息（已接入）——
-      dim_security: "dim_security"               # 股票列表、基金列表、指数列表
+      dim_security: "dwd_dim_security"               # 股票列表、基金列表、指数列表
       # —— 指数/板块成分股（已接入）——
-      board_component: "fact_board_component_1d" # 指数成分股、板块成分股
+      board_component: "dwd_fact_board_component_1d" # 指数成分股、板块成分股
       # —— 以下分钟级表尚未建立，调用时会抛 NotImplementedError ——
       kline_1min_equity: ""       # 1 分钟K表
       kline_5min_equity: ""       # 5 分钟K表

@@ -6,13 +6,14 @@ Loads table-organized GCS objects from:
 gs://data-aquarium/a-share/standardized_parquet/
 ```
 
-into BigQuery datasets:
+into BigQuery dataset `ashare` with layer prefixes:
 
-- `ashare_raw`
-- `ashare_core`
-- `ashare_mart`
+- `ods_*` — 原始层（staging / 外部表）
+- `dwd_*` — 明细层（core 事实表与维表）
+- `dws_*` — 汇总层（待后续 PRD 启用）
+- `ads_*` — 应用层（待后续 PRD 启用）
 
-The pipeline defaults to `staging_only` so GCS objects land in `ashare_raw.stg_*` tables before any merge into core tables is enabled. Parquet files are loaded in table batches, and BigQuery Hive partitioning reads `partition_month=YYYYMM` from the GCS path into a `partition_month` column.
+The pipeline defaults to `staging_only` so GCS objects land in `ashare.ods_*` tables before any merge into dwd tables is enabled. Parquet files are loaded in table batches, and BigQuery Hive partitioning reads `partition_month=YYYYMM` from the GCS path into a `partition_month` column.
 
 ## Setup
 

@@ -1,6 +1,6 @@
 """Google Cloud BigQuery 数据源实现。
 
-本模块通过 google-cloud-bigquery 连接 BigQuery，从 `ashare_core` dataset
+本模块通过 google-cloud-bigquery 连接 BigQuery，从 `ashare` dataset
 拉取 A 股历史行情。首次查询后写入本地 Parquet 缓存（复用 LocalStorage），
 后续命中本地缓存即跳过 BigQuery 查询，节省查询成本。
 
@@ -48,7 +48,7 @@ class BigQueryDataSource(BaseDataSource):
 
     Args:
         project_id: GCP 项目 ID，如 ``data-aquarium``。
-        dataset: BigQuery dataset 名，如 ``ashare_core``。
+        dataset: BigQuery dataset 名，如 ``ashare``。
         location: BigQuery 位置，如 ``asia-east2``。
         credentials_path: 服务账号 JSON 文件路径（可选）。
             若未提供，则依赖 ``GOOGLE_APPLICATION_CREDENTIALS`` 环境变量。
@@ -64,7 +64,7 @@ class BigQueryDataSource(BaseDataSource):
     def __init__(
         self,
         project_id: str,
-        dataset: str = "ashare_core",
+        dataset: str = "ashare",
         location: str = "asia-east2",
         credentials_path: Optional[str] = None,
         storage: Optional[LocalStorage] = None,

@@ -9,10 +9,12 @@ gcs:
   bucket: "data-aquarium"
   prefix: "a-share/standardized_parquet"
 
-datasets:
-  raw: "ashare_raw"
-  core: "ashare_core"
-  mart: "ashare_mart"
+dataset: "ashare"
+table_prefixes:
+  ods: "ods_"
+  dwd: "dwd_"
+  dws: "dws_"
+  ads: "ads_"
 
 defaults:
   load_mode: "staging_only"
