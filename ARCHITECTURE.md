@@ -50,7 +50,7 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `bigquery_source.py` | **当前默认数据源**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。接入进度：✅ 日K线（`fact_equity_kline_1d` / `fact_fund_kline_1d` / `fact_index_kline_1d` 表，内置 adjust_type 字段同时支持 none/qfq/hfq）；✅ 股票列表（`dim_security` 表）；✅ 指数成分股（`fact_board_component_1d` 表）；⚠️ 分钟K线表尚未建立。详见 §4.7 / §4.8 / §4.9。 |
+| `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。代码侧期望 `ashare_core` 已存在标准字段表；截至 2026-05-23，GCS Parquet 已完成并装载到 `ashare_raw.stg_*`，`ashare_core` 标准表仍需按 PRD_20260523_05 做字段标准化后验收。详见 §4.6 / §4.7 / §4.8。 |
 | `maxcompute_source.py` | 阿里云 MaxCompute 数据源实现（保留为备选）。通过 pyodps 连接。历史支持：5min K 线、15min ETF K 线。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
@@ -246,25 +246,35 @@ context.order(code, target_qty - current_qty)
 
 ### 4.6 为什么默认数据源切换为 BigQuery？
 
-历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`）。BigQuery 提供标准 SQL、列式存储与自动分区，且日K线表内置 `adjust_type` 字段（none/qfq/hfq），无需 Python 侧即时复权计算。
+历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，目标核心 dataset `ashare_core`）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
+
+截至 2026-05-23，数据迁移处于 **staging 已完成、core 标准化待完成** 的状态：
+
+- GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`，`13744` 个文件。
+- BigQuery staging 已完成：`ashare_raw.stg_*`，36 张表均已装载且有行数。
+- Load manifest 已同步：`ashare_raw.gcs_load_manifest`。
+- `ashare_core` 标准字段表仍需按 PRD_20260523_05 生成和验收。
+
+因此，`BigQueryDataSource` 是当前默认数据源实现，但它依赖的 `ashare_core` 标准表必须完成字段映射、类型转换和审计后，才能作为回测的真实生产数据源使用。
 
 **实现要点**：
 - `BigQueryDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入。
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
+- GCS 到 BigQuery 的装载由 `gcs_to_bigquery/pipeline.py` 负责，当前仅保证 `ashare_raw.stg_*` staging 层可审计可重跑，不保证 `ashare_core` 已可直接回测。
 
 ### 4.7 BigQuery 表结构与接入进度
 
-> **当前状态**（截至 PRD_20260522_02 完成）：
+> **当前状态**（截至 PRD_20260523_05）：代码侧已按 `ashare_core` 标准表设计完成读取接口；数据侧已完成 `ashare_raw.stg_*` 装载，但 `ashare_core` 标准表仍待生成和验收。
 
 | 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
 |------|----------------------------------|------|------|
-| 股票日K线 | `data.bigquery.tables.kline_1d_equity` | ✅ **已接入** | 表 `fact_equity_kline_1d`，内置 `adjust_type`（none/qfq/hfq） |
-| 基金日K线 | `data.bigquery.tables.kline_1d_fund` | ✅ **已接入** | 表 `fact_fund_kline_1d`，ETF/LOF |
-| 指数日K线 | `data.bigquery.tables.kline_1d_index` | ✅ **已接入** | 表 `fact_index_kline_1d`，用于基准对比 |
-| 股票列表 | `data.bigquery.tables.dim_security` | ✅ **已接入** | 表 `dim_security`，含 `security_type / exchange / list_date` |
-| 指数成分股 | `data.bigquery.tables.board_component` | ✅ **已接入** | 表 `fact_board_component_1d` |
+| 股票日K线 | `data.bigquery.tables.kline_1d_equity` | 🟡 **代码已接入，core 待验收** | staging 已有 `ashare_raw.stg_fact_equity_kline_1d`；core 表需生成 `fact_equity_kline_1d` 标准字段 |
+| 基金日K线 | `data.bigquery.tables.kline_1d_fund` | 🟡 **代码已接入，core 待验收** | staging 已有 `ashare_raw.stg_fact_fund_kline_1d`；core 表需生成 `fact_fund_kline_1d` 标准字段 |
+| 指数日K线 | `data.bigquery.tables.kline_1d_index` | 🟡 **代码已接入，core 待验收** | staging 已有 `ashare_raw.stg_fact_index_kline_1d`；core 表需生成 `fact_index_kline_1d` 标准字段 |
+| 股票列表 | `data.bigquery.tables.dim_security` | 🟡 **代码已接入，core 待验收** | staging 已有 `ashare_raw.stg_dim_security`；core 表需生成 `dim_security` 标准字段 |
+| 指数成分股 | `data.bigquery.tables.board_component` | 🟡 **代码已接入，core 待验收** | staging 已有 `ashare_raw.stg_fact_board_component_1d`；core 表需生成标准字段 |
 | 复权因子 | `data.bigquery.tables.adjust_factor` | 🟡 接口预留 | 日K表已内置复权，单独复权因子表待按需启用 |
 | 1min K | `data.bigquery.tables.kline_1min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
 | 5min K | `data.bigquery.tables.kline_5min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
@@ -275,7 +285,7 @@ context.order(code, target_qty - current_qty)
 
 ### 4.8 BigQuery 日K线表接入细节
 
-**表结构**（PRD_20260522_01 规范）：
+**目标 core 表结构**（PRD_20260522_01 / PRD_20260523_05 规范）：
 
 | 列 | 类型 | 含义 |
 |---|---|---|
@@ -293,12 +303,13 @@ context.order(code, target_qty - current_qty)
 
 1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ`，**无需像 MaxCompute 那样做 shXXXXXX 双向映射**。
 2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `partition_month` 列表（`_partition_months_in_range()`），SQL 中以 `partition_month IN (202001, 202002, ...)` 触发分区裁剪。**不裁剪则全表扫描，查询成本显著增加。**
-3. **内置复权**：日K表通过 `adjust_type` 字段同时保存 none/qfq/hfq 三种数据。`get_bars(adjust="qfq")` 直接在 SQL 中 `WHERE adjust_type = 'qfq'`，**无需 Python 侧即时复权计算**，结果更准确且避免跨表 JOIN。
+3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。若 staging 源字段暂未提供复权口径，core 转换不得伪造 qfq/hfq；第一版只能安全生成 `none` 或明确来源可验证的复权类型。
 4. **资产类型自动路由**：`BigQueryDataSource._resolve_kline_table()` 根据代码前缀自动判断：
    - ETF/LOF（51/56/58/11.SH, 15/16.SZ）→ `fact_fund_kline_1d`
    - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
    - 其他 → `fact_equity_kline_1d`
 5. **数据时间覆盖**：日K线数据覆盖范围由数据迁移 PRD 决定，超出范围的请求返回空 DataFrame，不报错。
+6. **staging 到 core 的红线**：`ashare_raw.stg_*` 中的中文源字段不能直接进入回测读取路径；必须经显式字段映射、类型转换、主键去重和 `audit-core` 验收后，才允许写入 `ashare_core`。
 
 ### 4.10 订单类型撮合规则（PRD_20260520_06）
 
@@ -530,6 +541,9 @@ handle_data → Context.limit_order / stop_order
 | `config/backtest.yaml` | 配置 | 回测参数与费率 |
 | `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
+| `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/` |
+| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery staging 的装载管道；支持 manifest、table batch load、staging audit、manifest 同步 |
+| `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery 装载配置，定义 project、bucket、datasets、load 策略和表配置 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
 | `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（保留备选） |
