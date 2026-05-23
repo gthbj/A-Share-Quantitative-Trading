@@ -1,4 +1,4 @@
-# DWD 转换与 BigQueryDataSource 适配 PRD
+# 完整 DWD 转换与 BigQueryDataSource 适配 PRD
 
 ## 1. 元信息
 
@@ -10,7 +10,7 @@
 | 关联 Commit | 09ae287；本次按用户决策修订 |
 | 需求优先级 | P0 |
 | 所属拆分 | PRD_20260523_06 拆分子项 6/6 |
-| 依赖 | PRD_20260523_11 已完成，`ashare.ods_*` 装载并 audit 通过 |
+| 依赖 | PRD_20260523_11 已完成，`ashare.ods_*` external table 全量覆盖并 audit 通过 |
 | 取代 | PRD_20260523_05 |
 
 ## 2. 背景与动机
@@ -21,6 +21,7 @@ PRD_11 完成后，当前状态应为：
 - ODS 表位于 `data-aquarium.ashare.ods_*`，类型为 BigQuery external table over GCS Parquet
 - ODS 保留贴源 schema，不复制业务数据，不要求全部英文严格类型
 - `data-aquarium.ashare.dwd_*` 仍待生成
+- ODS external table 已覆盖当前 GCS manifest 中全部源表，当前预期 36 张
 
 本 PRD 完成最后的可回测数据层：
 
@@ -29,6 +30,8 @@ ashare.ods_* external table -> ashare.dwd_* native table -> BigQueryDataSource -
 ```
 
 用户已确认旧 BigQuery dataset 不作为 rollback。PRD_12 的验收不能依赖旧 `ashare_core` 对照回测，而应以 DWD 内部质量、GCS/ODS/DWD 对账和同参重复回测一致性为准。
+
+本 PRD 不是只创建示例 DWD 数据。`sample` 或 `smoke-query` 只能用于快速验证 SQL、字段映射和读取链路；最终完成标准必须是 `full` 模式生成完整 DWD native 表层。
 
 ## 3. 影响模块声明
 
@@ -71,12 +74,21 @@ def merge_table(config: dict, target_table: str) -> None:
 
 ### 5.1 功能目标
 
-- 生成 P0 DWD 表：
+- 生成完整 DWD native 表层：
+  - 以 PRD_11 的 `ashare.ods_*` external table 和 manifest 为来源。
+  - 当前预期覆盖 36 张源表。
+  - 每张非空 ODS 源表必须生成对应 `ashare.dwd_*` 表，或进入显式排除清单并附原因；排除清单必须经用户确认。
+  - 不允许只生成 P0 表后声明 PRD_12 完成。
+- P0 回测链路表必须生产可用：
   - `ashare.dwd_fact_equity_kline_1d`
   - `ashare.dwd_fact_fund_kline_1d`
   - `ashare.dwd_fact_index_kline_1d`
   - `ashare.dwd_fact_board_component_1d`
   - `ashare.dwd_dim_security`
+- 其他 DWD 表按 manifest/config 生成，至少覆盖行情辅助、板块、财务指标等当前 GCS 已存在源表，例如 `fact_financial_indicator`。
+- 支持两种运行模式：
+  - `sample`：仅用于 dry-run、字段探测或小样本 smoke，不能作为最终验收。
+  - `full`：全历史、全分区、全源表生成生产 DWD 表，是本 PRD 唯一完成口径。
 - DWD 股票事实表使用 `equity_code`。
 - `dwd_dim_security` 继续使用 `security_code`。
 - 基金、指数、板块事实表分别使用 `fund_code`、`index_code`、`board_code`。
@@ -87,7 +99,7 @@ def merge_table(config: dict, target_table: str) -> None:
 
 ### 5.2 DWD schema
 
-以股票日 K 为例：
+以股票日 K 为例。完整 DWD 覆盖不要求在本文逐张列出 36 张表的全部字段，但 `gcs_to_bigquery/config.yaml:dwd_tables` 和 DWD coverage report 必须成为最终事实来源。
 
 ```yaml
 dwd_tables:
@@ -176,6 +188,13 @@ WHERE rn = 1;
 - 对 ODS 中不存在的候选字段，生成 SQL 时必须跳过，不能生成无效 SQL。
 - 财务表的可见日期必须来自公告日期字段；`report_period` 只能作为报告期，不得作为回测可见日期。
 
+完整转换规则：
+
+- `transform-dwd --mode full` 必须遍历全部 `dwd_tables` 配置；配置缺失时必须从 PRD_11 manifest 发现缺口并失败。
+- `transform-dwd --mode sample` 可以限制表、分区或行数，但只能输出 smoke 结果，不得覆盖生产完成状态。
+- 所有 DWD 表必须写入 `source_file`、`source_hash`、`ingested_at` 或等价血缘字段，确保可以回溯到当前 GCS prefix。
+- 对非回测 P0 表，也必须完成字段英文标准化、基础类型转换、主键/去重策略和行数对账；不能只把 ODS schema 原样复制为 DWD。
+
 ### 5.4 BigQueryDataSource 适配
 
 - `BigQueryDataSource` 默认 dataset：`ashare`。
@@ -227,6 +246,9 @@ PRD_11 audit-ods PASS（ODS external table 可查）
 | `dwd_tables.<table>.source_ods_table` | STRING | 按表 | ODS 来源表 |
 | `dwd_tables.<table>.primary_key` | LIST | 按表 | 去重主键 |
 | `dwd_tables.<table>.code_column` | STRING | 按表 | 资产代码字段 |
+| `defaults.dwd.mode` | STRING | `full` | 最终生成模式 |
+| `defaults.dwd.required_full_coverage` | BOOL | `true` | 是否要求 ODS/DWD 全覆盖 |
+| `defaults.dwd.sample_limit` | INT | 按需 | 仅 sample 模式可用 |
 | `defaults.dwd.audit.null_rate_threshold` | FLOAT | `0.001` | 类型转换空值率阈值 |
 
 `config/backtest.yaml` 必须为：
@@ -252,6 +274,8 @@ data:
 - 不修改 `engine/`、`account/`、`strategy/`。
 - 股票事实表不再使用 `security_code` 作为主代码字段。
 - `dim_security` 不改成 `dim_equity`，也不把 `security_code` 改成 `equity_code`。
+- 不允许把 `sample`、`smoke-query` 或只生成 P0 表当作 PRD_12 完成。
+- 不允许为完成 DWD 覆盖而重生成 GCS `standardized_parquet` 或创建 `standardized_parquet_v2`。
 - `audit-dwd` 任一项失败时，不允许声明完成。
 
 ## 8. 修改范围与位置
@@ -259,7 +283,7 @@ data:
 | 文件 | 修改位置 | 修改内容 |
 | --- | --- | --- |
 | `gcs_to_bigquery/pipeline.py` | 新增 `transform_dwd()` / `audit_dwd()` / `smoke_query()` | DWD 转换和验收 |
-| `gcs_to_bigquery/config.yaml` | `dwd_tables` / `field_mappings` | DWD 表配置 |
+| `gcs_to_bigquery/config.yaml` | `dwd_tables` / `field_mappings` | DWD 全量表配置 |
 | `data_layer/bigquery_source.py` | `_resolve_kline_table()` / `_fetch_daily_bars()` / `get_stock_list()` | dataset 和字段适配 |
 | `tests/test_bigquery_dwd_transform.py` | 新增 | transform SQL、字段映射、审计测试 |
 | `tests/test_bigquery_source.py` | 如已有 | BigQueryDataSource 表名与字段测试 |
@@ -271,7 +295,14 @@ data:
 
 ### 9.1 DWD 表
 
-P0 DWD 表全部存在且行数 > 0：
+完整 DWD 层必须满足：
+
+- `ashare.dwd_*` 生产表覆盖 PRD_11 manifest 中全部非空 ODS 源表，当前预期为 36 张。
+- 每张非空 ODS 源表都有对应 DWD 表，或进入用户确认的显式排除清单。
+- `dwd_coverage_report` 或等价 audit 输出必须列出：ODS 表名、DWD 表名、行数、分区范围、转换状态。
+- 只生成 sample 表、临时表或 P0 表时，本节验收失败。
+
+P0 回测链路表必须全部存在且行数 > 0：
 
 - `ashare.dwd_fact_equity_kline_1d`
 - `ashare.dwd_fact_fund_kline_1d`
@@ -292,11 +323,13 @@ P0 DWD 表全部存在且行数 > 0：
 `audit-dwd` 必须输出 PASS：
 
 - 表存在。
+- DWD 覆盖数与 ODS 非空源表数一致；当前预期 36 张。
 - DWD 行数 <= ODS 行数。
 - 主键唯一。
 - 关键字段非空。
 - 类型转换空值率在阈值内。
 - `partition_month` 与 `date` 一致。
+- `sample` 模式运行结果不会被计入生产 DWD 完成状态。
 
 ### 9.4 smoke-query
 
@@ -353,8 +386,19 @@ python run_backtest.py --strategy double_ma --start 20240101 --end 20240331 \
 - 输入：`get_bars('510300.SH', '20240101', '20240131')`
 - 预期：返回非空 DataFrame，统一代码列名为 `code`
 
+**用例 4：完整 DWD 覆盖**
+
+- 输入：`audit-dwd --scope full` 或等价命令输出
+- 预期：非空 ODS 源表数量与 DWD 生产表数量一致；当前预期 36；无未确认排除项
+
+**用例 5：sample 不可作为最终完成**
+
+- 输入：仅执行 `transform-dwd --mode sample` 后运行完成检查
+- 预期：完成检查失败，并提示必须运行 `transform-dwd --mode full` 和 `audit-dwd --scope full`
+
 ## 10. 备注
 
 - 本 PRD 不再与旧 `ashare_core` 做对照回测，因为旧 dataset 不作为 rollback 保留。
 - 若需要历史对照，只能在旧 dataset 删除前临时执行，不作为本 PRD 必需验收项。
 - 当前 GCS prefix 是长期可重装载输入源，不能随着旧 BigQuery dataset 一起删。
+- 本 PRD 的最终交付是完整 DWD 层；示例或 sample DWD 数据只用于开发验证。

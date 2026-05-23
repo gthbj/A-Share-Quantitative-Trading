@@ -248,12 +248,12 @@ context.order(code, target_qty - current_qty)
 
 历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，单 dataset `ashare`，通过表前缀 `ods_` / `dwd_` / `dws_` / `ads_` 表达数据分层）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
 
-截至 PRD_20260523_07，数据迁移处于 **单 dataset 已确认、ods 层已装载、dwd 层待生成** 的状态：
+截至 PRD_20260523_10，数据迁移处于 **单 dataset 已确认、GCS Parquet 已完成、ODS/DWD 全量覆盖待 PRD_11/12 收尾** 的状态：
 
 - GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`。
-- BigQuery ods 层已装载：`ashare.ods_*`，36 张表均已装载且有行数。
+- BigQuery ODS 目标：基于当前 GCS prefix 创建 `ashare.ods_*` external table，最终覆盖 manifest 中全部源表（当前预期 36 张）；P0 表只能作为 smoke subset。
 - ODS external manifest 同步目标为：`ashare.ods_external_manifest`。
-- `ashare.dwd_*` 标准字段表仍待后续 PRD 生成和验收。
+- `ashare.dwd_*` 标准字段表需由 PRD_12 以 full 模式完整生成和验收，sample 只用于开发验证。
 
 因此，`BigQueryDataSource` 是当前默认数据源实现，但它依赖的 `ashare.dwd_*` 标准表必须完成字段映射、类型转换和审计后，才能作为回测的真实生产数据源使用。
 
@@ -268,7 +268,7 @@ context.order(code, target_qty - current_qty)
 
 ### 4.7 BigQuery 表结构与接入进度
 
-> **当前状态**（截至 PRD_20260523_07）：代码侧已按 `ashare.dwd_*` 标准表设计完成读取接口；数据侧已完成 `ashare.ods_*` 装载，但 `ashare.dwd_*` 标准表仍待生成和验收。
+> **当前状态**（截至 PRD_20260523_10）：代码侧已按 `ashare.dwd_*` 标准表设计完成读取接口；数据侧需由 PRD_11 基于当前 GCS prefix 补齐全量 `ashare.ods_*` external table，再由 PRD_12 生成完整 `ashare.dwd_*` 标准表。
 
 | 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
 |------|----------------------------------|------|------|
