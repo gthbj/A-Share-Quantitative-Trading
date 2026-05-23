@@ -1,5 +1,27 @@
 # GCS 到 BigQuery 数据装载 Pipeline PRD
 
+> **⚠️ 修订说明（2026-05-24 追加）**
+>
+> 本 PRD 由 Codex 在 2026-05-22 输出，是 GCS→BigQuery pipeline 的**初版设计**。其设计选择中有以下三点已被后续 PRD 修订或取代，**新实施应以新 PRD 为准**：
+>
+> | 本 PRD 设计选择 | 后续修订 |
+> |---|---|
+> | §3 非目标第 4 条："完整中文字段到英文字段的清洗映射" 列为非目标 | **被 PRD_20260523_09 收回并改写**——不重生成 Parquet；现有 GCS Parquet 作为 ODS 输入，字段映射放到 DWD transform |
+> | §4 数据分层用 `ashare_raw / ashare_core / ashare_mart` | **被 PRD_20260523_07 取代**——改为单 dataset `ashare` + 表前缀 `ods_ / dwd_ / dws_ / ads_`，控制表改为 `ashare.ods_external_*` |
+> | §6.1 manifest schema 不含 `source_file / source_entry / source_hash / row_count` | **被 PRD_20260523_10 扩展**——补回 PRD_20260522_01 §6.1 完整溯源字段 |
+> | §6.2 "staging 表使用 BigQuery autodetect、无显式 schema" | **被 PRD_20260523_10 取代**——ODS 改为 BigQuery external table over GCS Parquet，不再复制出 native ODS 业务表 |
+> | §7.4 "失败时停止，后续可从失败对象继续"（默认 `WRITE_TRUNCATE` + `WRITE_APPEND` 多 chunk）| **被 PRD_20260523_10 取代**——ODS 不再使用 native load；改为 `create-ods-external` 创建/更新外部表 |
+> | §8 manifest_path 默认 `D:/A_Share_Transfer_Work/bigquery_load_manifest.jsonl` | **被 PRD_20260523_08 修订**——改为 `~/.local/state/ashare/ods_pipeline_manifest.jsonl`（持久路径）；`column_name_character_map: V2` 为兼容现有 GCS Parquet 贴源字段保留 |
+> | §9 "质量检查"分两层（管道级 + "后续增加"数据级）| **被 PRD_20260523_10 取代**——`audit-ods` 检查 external table 存在、schema 可读、sample query、GCS URI 和 manifest 对账 |
+>
+> **本 PRD 实施已完成**（commit `d2c720d`），但实施成果中已包含上述需要修订的设计盲区。用户已确认只使用当前 GCS 输入源 `gs://data-aquarium/a-share/standardized_parquet/`，不再生成 `standardized_parquet_v2/`。完整修订路线图见：
+> - PRD_20260523_06（路线图总览）
+> - PRD_20260523_07 ~ PRD_20260523_12（6 个子 PRD）
+>
+> **本 PRD 保留为历史文档**，不删除；新读者请直接参考新 PRD 系列。
+>
+> ---
+
 ## 1. 背景
 
 当前项目已经有 `data_transfer` 目录负责把 `D:\A Share` 中的非分钟级 A 股数据整理并上传到 GCS：

@@ -1,5 +1,30 @@
 # BigQuery 核心层标准化与成本收尾 PRD
 
+> **⚠️ 取代说明（2026-05-24 追加）**
+>
+> 本 PRD 由 Codex 在 2026-05-23 输出，设想从 `ashare_raw.stg_*`（中文 STRING 字段）→ `ashare_core.fact_*`（英文严格类型）做 SQL transform。
+>
+> 后续讨论中决定：
+>
+> 1. **数据分层重命名**为单 dataset `ashare` + 表前缀 `ods_ / dwd_ / dws_ / ads_`（详见 PRD_20260523_07）
+> 2. **不重生成 GCS Parquet**，只使用当前 `gs://data-aquarium/a-share/standardized_parquet/`
+> 3. **ODS 改为 BigQuery external table over GCS Parquet**，不再复制一份 native ODS 业务表
+> 4. **字段标准化放到 DWD transform 阶段**（详见 PRD_20260523_09 / PRD_20260523_12）——ODS 保留现有 GCS Parquet 的贴源 schema，DWD 生成标准英文严格类型表
+>
+> 因此本 PRD 被 **PRD_20260523_12** 取代。PRD_12 承担余下的工作：
+>
+> - ODS external table（贴源字段）→ DWD native table（英文严格类型）的 SQL transform
+> - 主键去重、`SAFE_CAST` 类型转换
+> - `BigQueryDataSource` SQL 模板适配 DWD
+> - `transform-dwd / audit-dwd / smoke-query` 子命令
+> - 回测一致性验证
+>
+> **本 PRD 不再实施**，保留为历史。新读者请直接看：
+> - PRD_20260523_06（路线图总览）
+> - PRD_20260523_12（DWD 转换适配，取代本 PRD）
+>
+> ---
+
 ## 1. 元信息
 
 | 字段 | 内容 |
