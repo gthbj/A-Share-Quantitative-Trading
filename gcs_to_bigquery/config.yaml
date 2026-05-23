@@ -17,10 +17,10 @@ table_prefixes:
   ads: "ads_"
 
 defaults:
-  load_mode: "staging_only"
+  ods:
+    external_table_type: "external"
+    ods_table_prefix: "ods_"
   skip_loaded: true
-  load_strategy: "table_batch"
-  replace_staging_tables: true
   allow_unconfigured_tables: true
   max_source_uris_per_job: 9000
   retry_failed: true
@@ -31,49 +31,91 @@ defaults:
     allow_quoted_newlines: true
     encoding: "UTF-8"
 
+ods_external_tables:
+  fact_equity_kline_1d:
+    destination_table: "ods_fact_equity_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_equity_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_equity_kline_1d/"
+    require_hive_partition_filter: false
+  fact_fund_kline_1d:
+    destination_table: "ods_fact_fund_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_fund_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_fund_kline_1d/"
+    require_hive_partition_filter: false
+  fact_index_kline_1d:
+    destination_table: "ods_fact_index_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_index_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_index_kline_1d/"
+    require_hive_partition_filter: false
+  fact_board_component_1d:
+    destination_table: "ods_fact_board_component_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_board_component_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_board_component_1d/"
+    require_hive_partition_filter: false
+  dim_security:
+    destination_table: "ods_dim_security"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/dim_security/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/dim_security/"
+    require_hive_partition_filter: false
+
 tables:
   fact_equity_kline_1d:
-    primary_key: ["security_code", "date", "adjust_type"]
+    primary_key: ["equity_code", "date", "adjust_type"]
     partition_field: "date"
-    clustering_fields: ["security_code", "adjust_type"]
-    load_mode: "staging_only"
+    clustering_fields: ["equity_code", "adjust_type"]
   fact_fund_kline_1d:
     primary_key: ["fund_code", "date", "adjust_type"]
     partition_field: "date"
     clustering_fields: ["fund_code", "fund_type", "adjust_type"]
-    load_mode: "staging_only"
   fact_index_kline_1d:
     primary_key: ["index_code", "date"]
     partition_field: "date"
     clustering_fields: ["index_code", "source"]
-    load_mode: "staging_only"
   fact_board_kline_1d:
     primary_key: ["board_code", "date", "source"]
     partition_field: "date"
     clustering_fields: ["board_code", "board_type", "source"]
-    load_mode: "staging_only"
   fact_adjust_factor:
-    primary_key: ["security_code", "date", "adjust_type"]
+    primary_key: ["equity_code", "date", "adjust_type"]
     partition_field: "date"
-    clustering_fields: ["security_code", "adjust_type"]
-    load_mode: "staging_only"
+    clustering_fields: ["equity_code", "adjust_type"]
   fact_limit_price_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code"]
-    load_mode: "staging_only"
+    clustering_fields: ["equity_code"]
   fact_suspend_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code"]
-    load_mode: "staging_only"
+    clustering_fields: ["equity_code"]
   fact_st_status_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code", "st_type"]
-    load_mode: "staging_only"
+    clustering_fields: ["equity_code", "st_type"]
   fact_board_component_1d:
-    primary_key: ["date", "board_code", "security_code", "source"]
+    primary_key: ["date", "board_code", "equity_code", "source"]
     partition_field: "date"
-    clustering_fields: ["board_code", "security_code", "source"]
-    load_mode: "staging_only"
+    clustering_fields: ["board_code", "equity_code", "source"]
+  dim_security:
+    primary_key: ["security_code"]
+    partition_field: null
+    clustering_fields: ["security_code"]

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,10 @@ import yaml
 
 VALID_STATUSES_TO_SKIP = {"loaded", "merged", "skipped"}
 LOADABLE_STATUSES = {"pending"}
+
+_REQUIREMENTS_HINT = (
+    "Install it with: python -m pip install -r gcs_to_bigquery/requirements.txt"
+)
 
 
 @dataclass(frozen=True)
@@ -56,8 +61,7 @@ def require_bigquery():
         from google.cloud import bigquery
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-cloud-bigquery. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-cloud-bigquery. {_REQUIREMENTS_HINT}"
         ) from exc
     return bigquery
 
@@ -67,8 +71,7 @@ def require_storage():
         from google.cloud import storage
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-cloud-storage. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-cloud-storage. {_REQUIREMENTS_HINT}"
         ) from exc
     return storage
 
@@ -91,8 +94,7 @@ def gcloud_credentials():
         from google.oauth2.credentials import Credentials
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-auth. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-auth. {_REQUIREMENTS_HINT}"
         ) from exc
     return Credentials(gcloud_access_token())
 
@@ -115,6 +117,7 @@ def storage_client(config: dict):
     if use_gcloud_access_token(config):
         kwargs["credentials"] = gcloud_credentials()
     return storage.Client(**kwargs)
+
 
 
 def dataset_id(config: dict) -> str:
@@ -264,6 +267,43 @@ def ensure_table(client, table) -> None:
     print(f"Ensured table: {full_table_id}")
 
 
+# ---------------------------------------------------------------------------
+# Control table schemas — ODS external (PRD_20260523_10)
+# ---------------------------------------------------------------------------
+
+def ods_manifest_schema() -> list:
+    bigquery = require_bigquery()
+    return [
+        bigquery.SchemaField("batch_id", "STRING"),
+        bigquery.SchemaField("synced_at", "TIMESTAMP"),
+        bigquery.SchemaField("gcs_uri", "STRING"),
+        bigquery.SchemaField("target_table", "STRING"),
+        bigquery.SchemaField("destination_table", "STRING"),
+        bigquery.SchemaField("partition_month", "INT64"),
+        bigquery.SchemaField("object_size", "INT64"),
+        bigquery.SchemaField("object_generation", "STRING"),
+        bigquery.SchemaField("source_format", "STRING"),
+        bigquery.SchemaField("status", "STRING"),
+        bigquery.SchemaField("error_message", "STRING"),
+    ]
+
+
+def ods_errors_schema() -> list:
+    bigquery = require_bigquery()
+    return [
+        bigquery.SchemaField("occurred_at", "TIMESTAMP"),
+        bigquery.SchemaField("batch_id", "STRING"),
+        bigquery.SchemaField("target_table", "STRING"),
+        bigquery.SchemaField("destination_table", "STRING"),
+        bigquery.SchemaField("error_type", "STRING"),
+        bigquery.SchemaField("error_message", "STRING"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Legacy control table schemas
+# ---------------------------------------------------------------------------
+
 def control_manifest_schema() -> list:
     bigquery = require_bigquery()
     return [
@@ -295,6 +335,10 @@ def control_errors_schema() -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# init — deprecated; kept for reference
+# ---------------------------------------------------------------------------
+
 def init(config: dict) -> None:
     bigquery = require_bigquery()
     client = bq_client(config)
@@ -309,6 +353,36 @@ def init(config: dict) -> None:
     errors_table.time_partitioning = bigquery.TimePartitioning(field="occurred_at")
     ensure_table(client, errors_table)
 
+
+# ---------------------------------------------------------------------------
+# init-ods — create ashare dataset + native control tables (PRD_20260523_10)
+# ---------------------------------------------------------------------------
+
+def init_ods(config: dict) -> None:
+    bigquery = require_bigquery()
+    client = bq_client(config)
+    location = config["location"]
+    full_dataset_id = dataset_id(config)
+    ensure_dataset(client, full_dataset_id, location)
+
+    manifest_table = bigquery.Table(
+        table_id(config, "ods_external_manifest"),
+        schema=ods_manifest_schema(),
+    )
+    manifest_table.time_partitioning = bigquery.TimePartitioning(field="synced_at")
+    ensure_table(client, manifest_table)
+
+    errors_table = bigquery.Table(
+        table_id(config, "ods_external_errors"),
+        schema=ods_errors_schema(),
+    )
+    errors_table.time_partitioning = bigquery.TimePartitioning(field="occurred_at")
+    ensure_table(client, errors_table)
+
+
+# ---------------------------------------------------------------------------
+# load helpers (legacy staging load)
+# ---------------------------------------------------------------------------
 
 def load_job_config(config: dict, record: LoadRecord, write_disposition: str | None = None):
     bigquery = require_bigquery()
@@ -370,7 +444,7 @@ def load_table_batch(config: dict, client, target_table: str, records: list[Load
     bigquery = require_bigquery()
     destination = table_id(config, ods_table_name(target_table))
     max_source_uris = int(config.get("defaults", {}).get("max_source_uris_per_job", 9000))
-    replace_staging = bool(config.get("defaults", {}).get("replace_staging_tables", True))
+    replace_staging = bool(config.get("defaults", {}).get("replace_staging_tables", False))
     loaded: list[LoadRecord] = []
     chunks = list(chunked(records, max_source_uris))
     for chunk_idx, chunk in enumerate(chunks, start=1):
@@ -409,18 +483,19 @@ def load_table_batch(config: dict, client, target_table: str, records: list[Load
 
 
 def load(config: dict, dry_run: bool) -> None:
-    manifest_path = norm_path(config["manifest_path"])
-    records = read_manifest(manifest_path)
+    mf_path = norm_path(config["manifest_path"])
+    records = read_manifest(mf_path)
     if not records:
         records = list(iter_gcs_records(config))
-        write_manifest(manifest_path, records)
+        write_manifest(mf_path, records)
 
     loadable_statuses = set(LOADABLE_STATUSES)
-    if config.get("defaults", {}).get("retry_failed", True):
+    if config.get("defaults", {}).get("retry_failed", False):
         loadable_statuses.add("failed")
     pending = [
         r for r in records
-        if r.status in loadable_statuses and not (config.get("defaults", {}).get("skip_loaded", True) and r.status in VALID_STATUSES_TO_SKIP)
+        if r.status in loadable_statuses
+        and not (config.get("defaults", {}).get("skip_loaded", True) and r.status in VALID_STATUSES_TO_SKIP)
     ]
 
     if dry_run:
@@ -440,9 +515,9 @@ def load(config: dict, dry_run: bool) -> None:
             pending_by_table[record.target_table].append(record)
         for target_table, table_records in sorted(pending_by_table.items()):
             try:
-                for loaded in load_table_batch(config, client, target_table, table_records):
-                    updated_by_key[(loaded.gcs_uri, loaded.object_generation)] = loaded
-                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+                for loaded_item in load_table_batch(config, client, target_table, table_records):
+                    updated_by_key[(loaded_item.gcs_uri, loaded_item.object_generation)] = loaded_item
+                write_manifest(mf_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
             except Exception as exc:
                 failed_at = utc_now()
                 for record in table_records:
@@ -455,7 +530,7 @@ def load(config: dict, dry_run: bool) -> None:
                             "error_message": str(exc),
                         }
                     )
-                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+                write_manifest(mf_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
                 print(f"failed table={target_table}: {exc}", flush=True)
                 raise
         return
@@ -466,8 +541,8 @@ def load(config: dict, dry_run: bool) -> None:
             updated.append(record)
             continue
         try:
-            loaded = load_to_staging(config, client, record)
-            updated.append(loaded)
+            loaded_item = load_to_staging(config, client, record)
+            updated.append(loaded_item)
             print(f"[{idx}/{len(records)}] loaded {record.gcs_uri}")
         except Exception as exc:
             failed = LoadRecord(
@@ -480,14 +555,165 @@ def load(config: dict, dry_run: bool) -> None:
                 }
             )
             updated.append(failed)
-            write_manifest(manifest_path, updated + records[idx:])
+            write_manifest(mf_path, updated + records[idx:])
             print(f"[{idx}/{len(records)}] failed {record.gcs_uri}: {exc}")
             raise
 
         if idx % 25 == 0:
-            write_manifest(manifest_path, updated + records[idx:])
-    write_manifest(manifest_path, updated)
+            write_manifest(mf_path, updated + records[idx:])
+    write_manifest(mf_path, updated)
 
+
+# ---------------------------------------------------------------------------
+# create-ods-external — create ashare.ods_* external tables (PRD_20260523_10)
+# ---------------------------------------------------------------------------
+
+def create_ods_external(config: dict) -> None:
+    bigquery = require_bigquery()
+    client = bq_client(config)
+    full_dataset_id = dataset_id(config)
+
+    ods_tables = config.get("ods_external_tables", {})
+    if not ods_tables:
+        raise RuntimeError("No ods_external_tables configured.")
+
+    for table_key, table_cfg in sorted(ods_tables.items()):
+        destination = table_cfg["destination_table"]
+        full_table_id = f"{full_dataset_id}.{destination}"
+
+        source_format_str = table_cfg.get("source_format", "PARQUET")
+        try:
+            source_format = bigquery.SourceFormat[source_format_str]
+        except KeyError:
+            source_formats = [f.name for f in bigquery.SourceFormat]
+            raise ValueError(
+                f"Unsupported source_format '{source_format_str}'. Available: {source_formats}"
+            ) from None
+
+        external_config = bigquery.ExternalConfig(source_format)
+        external_config.source_uris = table_cfg["source_uris"]
+
+        hive_cfg = table_cfg.get("hive_partitioning")
+        if hive_cfg:
+            hive_opts = bigquery.HivePartitioningOptions()
+            hive_opts.mode = hive_cfg.get("mode", "AUTO")
+            if "source_uri_prefix" in hive_cfg:
+                hive_opts.source_uri_prefix = hive_cfg["source_uri_prefix"]
+            external_config.hive_partitioning = hive_opts
+
+        if "require_hive_partition_filter" in table_cfg:
+            external_config.require_hive_partition_filter = bool(
+                table_cfg["require_hive_partition_filter"]
+            )
+
+        table = bigquery.Table(full_table_id)
+        table.external_data_configuration = external_config
+
+        client.create_table(table, exists_ok=True)
+        print(
+            f"Created/updated external table: {full_table_id} "
+            f"({len(external_config.source_uris)} URI(s))"
+        )
+
+    print(f"ODS external tables ensured: {len(ods_tables)}")
+
+
+# ---------------------------------------------------------------------------
+# audit-ods — validate external tables + schema + GCS URI + sample query
+# ---------------------------------------------------------------------------
+
+def audit_ods_external(config: dict) -> None:
+    client = bq_client(config)
+    full_dataset_id = dataset_id(config)
+    ods_tables = config.get("ods_external_tables", {})
+    if not ods_tables:
+        raise RuntimeError("No ods_external_tables configured.")
+
+    gcs_prefix = (
+        f"gs://{config['gcs']['bucket']}/{config['gcs']['prefix'].strip('/')}/"
+    )
+
+    missing: list[str] = []
+    no_external_config: list[str] = []
+    wrong_format: list[str] = []
+    wrong_uri_prefix: list[str] = []
+    sample_failures: list[str] = []
+
+    for table_key, table_cfg in sorted(ods_tables.items()):
+        destination = table_cfg["destination_table"]
+        full_table_id = f"{full_dataset_id}.{destination}"
+        expected_format = table_cfg.get("source_format", "PARQUET")
+
+        try:
+            table = client.get_table(full_table_id)
+        except Exception as exc:
+            missing.append(f"{full_table_id}: {exc}")
+            continue
+
+        ext = table.external_data_configuration
+        if ext is None:
+            no_external_config.append(full_table_id)
+            print(f"{full_table_id}: SKIP (native table, not external)")
+            continue
+
+        if ext.source_format != expected_format:
+            wrong_format.append(
+                f"{full_table_id}: expected={expected_format} actual={ext.source_format}"
+            )
+
+        for uri in ext.source_uris:
+            if not uri.startswith(gcs_prefix):
+                wrong_uri_prefix.append(f"{full_table_id}: {uri}")
+
+        try:
+            job = client.query(f"SELECT * FROM `{full_table_id}` LIMIT 1")
+            rows = list(job.result())
+            if not rows:
+                sample_failures.append(f"{full_table_id}: sample query returned 0 rows")
+            else:
+                print(
+                    f"{full_table_id}: OK (sample query returned row, "
+                    f"fields={len(table.schema)}, "
+                    f"source_format={ext.source_format})"
+                )
+        except Exception as exc:
+            sample_failures.append(f"{full_table_id}: {exc}")
+
+    errors: list[str] = []
+    if missing:
+        errors.append(
+            f"missing external tables ({len(missing)}):\n" + "\n".join(missing[:10])
+        )
+    if no_external_config:
+        errors.append(
+            f"tables without externalDataConfiguration ({len(no_external_config)}):\n"
+            + "\n".join(no_external_config)
+        )
+    if wrong_format:
+        errors.append(
+            f"wrong source_format ({len(wrong_format)}):\n"
+            + "\n".join(wrong_format[:5])
+        )
+    if wrong_uri_prefix:
+        errors.append(
+            f"GCS URI mismatch ({len(wrong_uri_prefix)}):\n"
+            + "\n".join(wrong_uri_prefix[:5])
+        )
+    if sample_failures:
+        errors.append(
+            f"sample query failures ({len(sample_failures)}):\n"
+            + "\n".join(sample_failures[:5])
+        )
+
+    if errors:
+        raise RuntimeError("ODS external table audit failed:\n" + "\n".join(errors))
+
+    print(f"ODS external table audit passed: {len(ods_tables)} tables OK")
+
+
+# ---------------------------------------------------------------------------
+# merge_table (legacy, deprecated by PRD_12 transform-dwd)
+# ---------------------------------------------------------------------------
 
 def field_names(schema: list) -> list[str]:
     return [field.name for field in schema]
@@ -498,8 +724,7 @@ def require_table(client, full_table_id: str):
         from google.api_core.exceptions import NotFound
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-api-core. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-api-core. {_REQUIREMENTS_HINT}"
         ) from exc
     try:
         return client.get_table(full_table_id)
@@ -552,30 +777,69 @@ WHEN NOT MATCHED THEN
     print(f"Merged {staging_id} into {core_id}; job_id={job.job_id}")
 
 
+# ---------------------------------------------------------------------------
+# progress — local manifest summary
+# ---------------------------------------------------------------------------
+
 def progress(config: dict) -> None:
     records = read_manifest(norm_path(config["manifest_path"]))
     summarize(records)
 
 
+# ---------------------------------------------------------------------------
+# sync-manifest — append to ods_external_manifest (idempotent by batch_id)
+# ---------------------------------------------------------------------------
+
 def sync_manifest(config: dict) -> None:
     bigquery = require_bigquery()
-    manifest_path = norm_path(config["manifest_path"])
-    records = read_manifest(manifest_path)
+    mf_path = norm_path(config["manifest_path"])
+    records = read_manifest(mf_path)
     if not records:
         raise RuntimeError("Manifest is empty. Run manifest or load first.")
     client = bq_client(config)
-    destination = table_id(config, "ods_gcs_load_manifest")
+    destination = table_id(config, "ods_external_manifest")
+    current_batch = batch_id()
+
+    ods_payloads: list[dict] = []
+    synced_at = utc_now()
+    for record in records:
+        ods_payloads.append({
+            "batch_id": current_batch,
+            "synced_at": synced_at,
+            "gcs_uri": record.gcs_uri,
+            "target_table": record.target_table,
+            "destination_table": f"ods_{record.target_table}",
+            "partition_month": record.partition_month,
+            "object_size": record.object_size,
+            "object_generation": record.object_generation,
+            "source_format": record.source_format,
+            "status": record.status,
+            "error_message": record.error_message,
+        })
+
+    ndjson_path = mf_path.with_suffix(".ods_ndjson")
+    with ndjson_path.open("w", encoding="utf-8") as fh:
+        for payload in ods_payloads:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        schema=control_manifest_schema(),
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=ods_manifest_schema(),
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
-    with manifest_path.open("rb") as fh:
+    with ndjson_path.open("rb") as fh:
         job = client.load_table_from_file(fh, destination, job_config=job_config)
     job.result()
-    print(f"Synced manifest rows={len(records)} to {destination}; job_id={job.job_id}")
+    print(
+        f"Synced manifest rows={len(ods_payloads)} batch_id={current_batch} "
+        f"to {destination}; job_id={job.job_id}"
+    )
 
+
+# ---------------------------------------------------------------------------
+# audit-staging — legacy staging audit (deprecated; use audit-ods)
+# ---------------------------------------------------------------------------
 
 def audit_staging(config: dict) -> None:
     records = read_manifest(norm_path(config["manifest_path"]))
@@ -607,16 +871,32 @@ def audit_staging(config: dict) -> None:
     print(f"Staging audit passed: tables={len(loaded_tables)}")
 
 
+# ---------------------------------------------------------------------------
+# manifest — scan GCS prefix, produce local manifest
+# ---------------------------------------------------------------------------
+
 def build_manifest(config: dict) -> None:
     records = list(iter_gcs_records(config))
     write_manifest(norm_path(config["manifest_path"]), records)
     summarize(records)
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Load standardized A-share GCS objects into BigQuery.")
+    parser = argparse.ArgumentParser(
+        description="Load standardized A-share GCS objects into BigQuery."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # New ODS external table commands (PRD_20260523_10)
+    for command in ("init-ods", "create-ods-external", "audit-ods"):
+        p = sub.add_parser(command)
+        p.add_argument("--config", default="gcs_to_bigquery/config.yaml")
+
+    # Legacy / utility commands (kept for transition)
     for command in ("init", "manifest", "load", "progress", "sync-manifest", "audit-staging"):
         p = sub.add_parser(command)
         p.add_argument("--config", default="gcs_to_bigquery/config.yaml")
@@ -629,13 +909,32 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(Path(args.config))
 
+    # -- New ODS external table commands --
+    if args.command == "init-ods":
+        init_ods(config)
+        return 0
+    if args.command == "create-ods-external":
+        create_ods_external(config)
+        return 0
+    if args.command == "audit-ods":
+        audit_ods_external(config)
+        return 0
+
+    # -- Legacy commands (deprecated, kept for reference) --
     if args.command == "init":
+        print(
+            "WARNING: 'init' is deprecated; use 'init-ods' instead.", file=sys.stderr
+        )
         init(config)
         return 0
     if args.command == "manifest":
         build_manifest(config)
         return 0
     if args.command == "load":
+        print(
+            "WARNING: 'load' is deprecated for the ODS flow; use 'create-ods-external'.",
+            file=sys.stderr,
+        )
         load(config, dry_run=args.dry_run)
         return 0
     if args.command == "merge":
@@ -648,8 +947,13 @@ def main() -> int:
         sync_manifest(config)
         return 0
     if args.command == "audit-staging":
+        print(
+            "WARNING: 'audit-staging' is deprecated; use 'audit-ods' instead.",
+            file=sys.stderr,
+        )
         audit_staging(config)
         return 0
+
     raise AssertionError(args.command)
 
 

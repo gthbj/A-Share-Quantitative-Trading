@@ -248,13 +248,27 @@ context.order(code, target_qty - current_qty)
 
 历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，单 dataset `ashare`，通过表前缀 `ods_` / `dwd_` / `dws_` / `ads_` 表达数据分层）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
 
-截至 PRD_20260523_07，数据迁移处于 **单 dataset 已确认、ods 层已装载、dwd 层待生成** 的状态：
+**数据流**：
 
-- GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`。
-- BigQuery ods 层已装载：`ashare.ods_*`，36 张表均已装载且有行数。
-- Load manifest 已同步：`ashare.ods_gcs_load_manifest`。
-- `ashare.dwd_*` 标准字段表仍待后续 PRD 生成和验收。
+```text
+GCS Parquet (gs://data-aquarium/a-share/standardized_parquet/)
+  -> ashare.ods_*  (BigQuery external tables, 直接读取 GCS, 不复制数据)
+  -> ashare.dwd_*  (BigQuery native tables, PRD_12 transform-dwd 生成)
+  -> BigQueryDataSource 读取回测
+```
 
+**ODS 层（external table）**：由 PRD_20260523_10 实现。ODS 表为 BigQuery external table，挂载到 `gs://data-aquarium/a-share/standardized_parquet/` 下的 Parquet 文件集合。ODS 不做 native copy，避免了 GCS Parquet 与 BigQuery native ODS 表之间的重复存储。查询 ODS external table 时实时读取 GCS Parquet，性能通常弱于 native table（贴源层可接受成本）。
+
+- 控制表（native）：`ashare.ods_external_manifest`、`ashare.ods_external_errors`，用于审计和追踪。
+- CLI 命令：`init-ods`、`create-ods-external`、`audit-ods`、`sync-manifest`。
+
+**DWD 层（native table）**：由 PRD_20260523_12 实现。DWD 是回测读取层，必须是 native BigQuery table，用于稳定性能、去重和强类型。DWD transform 从 `ashare.ods_*` external table 读取并写入 `ashare.dwd_*` native table。
+
+截至 PRD_20260523_10，数据迁移处于 **dataset 已确认、ods external table 已支持、dwd 层待生成** 的状态。
+
+GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`（`13744` 个文件）。
+BigQuery ods external table 已配置：`ashare.ods_*`。
+Load manifest 已同步：`ashare.ods_gcs_load_manifest`。
 因此，`BigQueryDataSource` 是当前默认数据源实现，但它依赖的 `ashare.dwd_*` 标准表必须完成字段映射、类型转换和审计后，才能作为回测的真实生产数据源使用。
 
 **实现要点**：
@@ -262,19 +276,19 @@ context.order(code, target_qty - current_qty)
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入。
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
-- GCS 到 BigQuery 的装载由 `gcs_to_bigquery/pipeline.py` 负责，当前仅保证 `ashare.ods_*` staging 层可审计可重跑，不保证 `ashare.dwd_*` 已可直接回测。
+- GCS 到 BigQuery 的装载由 `gcs_to_bigquery/pipeline.py` 负责，ODS external table 已可审计可重跑，DWD native table 待 PRD_12 生成。
 
 ### 4.7 BigQuery 表结构与接入进度
 
-> **当前状态**（截至 PRD_20260523_07）：代码侧已按 `ashare.dwd_*` 标准表设计完成读取接口；数据侧已完成 `ashare.ods_*` 装载，但 `ashare.dwd_*` 标准表仍待生成和验收。
+> **当前状态**（截至 PRD_20260523_10）：ODS 层已采用 BigQuery external table 方案（不复制 GCS Parquet）；DWD native 标准表仍待 PRD_12 生成和验收。
 
 | 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
 |------|----------------------------------|------|------|
-| 股票日K线 | `data.bigquery.tables.kline_1d_equity` | 🟡 **代码已接入，dwd 待验收** | ods 已有 `ashare.ods_fact_equity_kline_1d`；dwd 表需生成 `dwd_fact_equity_kline_1d` 标准字段 |
-| 基金日K线 | `data.bigquery.tables.kline_1d_fund` | 🟡 **代码已接入，dwd 待验收** | ods 已有 `ashare.ods_fact_fund_kline_1d`；dwd 表需生成 `dwd_fact_fund_kline_1d` 标准字段 |
-| 指数日K线 | `data.bigquery.tables.kline_1d_index` | 🟡 **代码已接入，dwd 待验收** | ods 已有 `ashare.ods_fact_index_kline_1d`；dwd 表需生成 `dwd_fact_index_kline_1d` 标准字段 |
-| 股票列表 | `data.bigquery.tables.dim_security` | 🟡 **代码已接入，dwd 待验收** | ods 已有 `ashare.ods_dim_security`；dwd 表需生成 `dwd_dim_security` 标准字段 |
-| 指数成分股 | `data.bigquery.tables.board_component` | 🟡 **代码已接入，dwd 待验收** | ods 已有 `ashare.ods_fact_board_component_1d`；dwd 表需生成 `dwd_fact_board_component_1d` 标准字段 |
+| 股票日K线 | `data.bigquery.tables.kline_1d_equity` | 🟡 **代码已接入，dwd 待验收** | ods external: `ashare.ods_fact_equity_kline_1d`；dwd 待生成 `dwd_fact_equity_kline_1d` |
+| 基金日K线 | `data.bigquery.tables.kline_1d_fund` | 🟡 **代码已接入，dwd 待验收** | ods external: `ashare.ods_fact_fund_kline_1d`；dwd 待生成 `dwd_fact_fund_kline_1d` |
+| 指数日K线 | `data.bigquery.tables.kline_1d_index` | 🟡 **代码已接入，dwd 待验收** | ods external: `ashare.ods_fact_index_kline_1d`；dwd 待生成 `dwd_fact_index_kline_1d` |
+| 股票列表 | `data.bigquery.tables.dim_security` | 🟡 **代码已接入，dwd 待验收** | ods external: `ashare.ods_dim_security`；dwd 待生成 `dwd_dim_security` |
+| 指数成分股 | `data.bigquery.tables.board_component` | 🟡 **代码已接入，dwd 待验收** | ods external: `ashare.ods_fact_board_component_1d`；dwd 待生成 `dwd_fact_board_component_1d` |
 | 复权因子 | `data.bigquery.tables.adjust_factor` | 🟡 接口预留 | 日K表已内置复权，单独复权因子表待按需启用 |
 | 1min K | `data.bigquery.tables.kline_1min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
 | 5min K | `data.bigquery.tables.kline_5min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
@@ -309,7 +323,7 @@ context.order(code, target_qty - current_qty)
    - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
    - 其他 → `fact_equity_kline_1d`
 5. **数据时间覆盖**：日K线数据覆盖范围由数据迁移 PRD 决定，超出范围的请求返回空 DataFrame，不报错。
-6. **ods 到 dwd 的红线**：`ashare.ods_*` 中的中文源字段不能直接进入回测读取路径；必须经显式字段映射、类型转换、主键去重和 `audit-dwd` 验收后，才允许写入 `ashare.dwd_*`。
+6. **ods 到 dwd 的红线**：`ashare.ods_*`（external table，贴源字段）不能直接进入回测读取路径；必须经显式字段映射、类型转换、主键去重和 `audit-dwd` 验收后，才允许写入 `ashare.dwd_*` native table。
 
 ### 4.10 订单类型撮合规则（PRD_20260520_06）
 
@@ -542,7 +556,7 @@ handle_data → Context.limit_order / stop_order
 | `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/` |
-| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery staging 的装载管道；支持 manifest、table batch load、staging audit、manifest 同步 |
+| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery 的装载管道；支持 ODS external table（create-ods-external / audit-ods）、manifest、sync-manifest、progress |
 | `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery 装载配置，定义 project、bucket、datasets、load 策略和表配置 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
