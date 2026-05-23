@@ -2324,35 +2324,8 @@ def main() -> int:
     merge_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
     merge_parser.add_argument("--table", required=True)
 
-    transform_dwd_parser = sub.add_parser("transform-dwd")
-    transform_dwd_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    transform_dwd_parser.add_argument("--mode", choices=("full", "sample"), default="full")
-    transform_dwd_parser.add_argument("--table")
-    transform_dwd_parser.add_argument("--sample-limit", type=int)
-
-    audit_dwd_parser = sub.add_parser("audit-dwd")
-    audit_dwd_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    audit_dwd_parser.add_argument("--scope", choices=("full", "sample"), default="full")
-    audit_dwd_parser.add_argument("--table")
-
     smoke_parser = sub.add_parser("smoke-query")
     smoke_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-
-    transform_dws_parser = sub.add_parser("transform-dws")
-    transform_dws_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    transform_dws_parser.add_argument("--table")
-
-    audit_dws_parser = sub.add_parser("audit-dws")
-    audit_dws_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    audit_dws_parser.add_argument("--table")
-
-    transform_ads_parser = sub.add_parser("transform-ads")
-    transform_ads_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    transform_ads_parser.add_argument("--table")
-
-    audit_ads_parser = sub.add_parser("audit-ads")
-    audit_ads_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
-    audit_ads_parser.add_argument("--table")
 
     args = parser.parse_args()
     config = load_config(Path(args.config))
@@ -2384,26 +2357,8 @@ def main() -> int:
     if args.command == "merge":
         merge_table(config, args.table)
         return 0
-    if args.command == "transform-dwd":
-        transform_dwd(config, mode=args.mode, target_table=args.table, sample_limit=args.sample_limit)
-        return 0
-    if args.command == "audit-dwd":
-        audit_dwd(config, scope=args.scope, target_table=args.table)
-        return 0
     if args.command == "smoke-query":
         smoke_query(config)
-        return 0
-    if args.command == "transform-dws":
-        transform_dws(config, target_table=args.table)
-        return 0
-    if args.command == "audit-dws":
-        audit_dws(config, target_table=args.table)
-        return 0
-    if args.command == "transform-ads":
-        transform_ads(config, target_table=args.table)
-        return 0
-    if args.command == "audit-ads":
-        audit_ads(config, target_table=args.table)
         return 0
     if args.command == "progress":
         progress(config)

@@ -440,3 +440,6 @@ class TestCli:
         assert "init-ods" in captured.out
         assert "create-ods-external" in captured.out
         assert "audit-ods" in captured.out
+        assert "transform-dwd" not in captured.out
+        assert "transform-dws" not in captured.out
+        assert "transform-ads" not in captured.out
