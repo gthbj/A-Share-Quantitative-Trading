@@ -325,20 +325,54 @@ def align_to_schema(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return frame
 
 
-def build_table(config: dict, table: str, sources: list[tuple[Path, str | None]]) -> tuple[list[ParquetRecord], dict[str, int]]:
+def table_build_int(config: dict, table: str, key: str, default: int) -> int:
+    build_config = config.get("build", {})
+    per_table = build_config.get(f"table_{key}", {})
+    if isinstance(per_table, dict) and table in per_table:
+        return int(per_table[table])
+    return int(build_config.get(key, default))
+
+
+def table_parallel_workers(config: dict, table: str) -> int:
+    workers = config.get("build", {}).get("table_parallel_workers", {})
+    if not isinstance(workers, dict):
+        return 1
+    return max(1, int(workers.get(table, 1)))
+
+
+def split_round_robin(items: list[tuple[Path, str | None]], parts: int) -> list[list[tuple[Path, str | None]]]:
+    shards: list[list[tuple[Path, str | None]]] = [[] for _ in range(parts)]
+    for idx, item in enumerate(items):
+        shards[idx % parts].append(item)
+    return [shard for shard in shards if shard]
+
+
+def build_table(
+    config: dict,
+    table: str,
+    sources: list[tuple[Path, str | None]],
+    columns: list[str] | None = None,
+    cleanup_outputs: bool = True,
+    write_checkpoint: bool = True,
+    file_prefix: str | None = None,
+    progress_label: str | None = None,
+) -> tuple[list[ParquetRecord], dict[str, int]]:
+    cached_zip.cache_clear()
     records: list[ParquetRecord] = []
-    chunksize = int(config.get("build", {}).get("chunksize", 50000))
-    flush_rows = int(config.get("build", {}).get("flush_rows", 50000))
+    chunksize = table_build_int(config, table, "chunksize", 50000)
+    flush_rows = table_build_int(config, table, "flush_rows", 50000)
+    progress_interval = table_build_int(config, table, "progress_interval", 1000)
     skipped_no_date: dict[str, int] = {}
     parquet_root = norm_path(config["parquet_root"])
-    if checkpoint_enabled(config):
+    if cleanup_outputs and checkpoint_enabled(config):
         cleanup_table_outputs(config, table)
 
-    columns = schema_columns_for_sources(sources)
+    columns = columns or schema_columns_for_sources(sources)
     schema = pa.schema([pa.field(column, pa.string()) for column in columns])
     writers: dict[str, PartitionWriter] = {}
     source_count_by_month: dict[str, int] = {}
-    print(f"building {table}: sources={len(sources)} columns={len(columns)}", flush=True)
+    label = progress_label or table
+    print(f"building {label}: sources={len(sources)} columns={len(columns)}", flush=True)
 
     for source_idx, (source, entry) in enumerate(sources, start=1):
         source_months: set[str] = set()
@@ -360,7 +394,8 @@ def build_table(config: dict, table: str, sources: list[tuple[Path, str | None]]
                 if not re.fullmatch(r"\d{6}|all", partition_month):
                     raise RuntimeError(f"Invalid partition_month={partition_month}: {source} :: {entry}")
                 if partition_month not in writers:
-                    part_path = parquet_root / table / f"partition_month={partition_month}" / f"part-{source_hash[:8]}-{len(writers):05d}.parquet"
+                    prefix = f"{file_prefix}-" if file_prefix else ""
+                    part_path = parquet_root / table / f"partition_month={partition_month}" / f"part-{prefix}{source_hash[:8]}-{len(writers):05d}.parquet"
                     writers[partition_month] = PartitionWriter(part_path, schema, flush_rows)
                 aligned = align_to_schema(month_frame, columns)
                 writers[partition_month].write(aligned, schema)
@@ -369,8 +404,8 @@ def build_table(config: dict, table: str, sources: list[tuple[Path, str | None]]
             skipped_no_date[table] = skipped_no_date.get(table, 0) + 1
         for partition_month in source_months:
             source_count_by_month[partition_month] = source_count_by_month.get(partition_month, 0) + 1
-        if source_idx % 1000 == 0:
-            print(f"  {table}: processed_sources={source_idx}/{len(sources)} open_partitions={len(writers)}", flush=True)
+        if source_idx % progress_interval == 0:
+            print(f"  {label}: processed_sources={source_idx}/{len(sources)} open_partitions={len(writers)}", flush=True)
 
     for partition_month, writer in sorted(writers.items()):
         writer.close(schema)
@@ -387,6 +422,48 @@ def build_table(config: dict, table: str, sources: list[tuple[Path, str | None]]
                 fingerprint=fingerprint(writer.path, stat.st_size, stat.st_mtime_ns),
             )
         )
+    if write_checkpoint and checkpoint_enabled(config) and not skipped_no_date:
+        write_table_checkpoint(config, table, records)
+    return records, skipped_no_date
+
+
+def build_table_parallel(config: dict, table: str, sources: list[tuple[Path, str | None]], workers: int) -> tuple[list[ParquetRecord], dict[str, int]]:
+    if checkpoint_enabled(config):
+        cleanup_table_outputs(config, table)
+
+    columns = schema_columns_for_sources(sources)
+    cached_zip.cache_clear()
+    shards = split_round_robin(sources, min(workers, len(sources)))
+    print(
+        f"parallel table build enabled: table={table} workers={len(shards)} sources={len(sources)} columns={len(columns)}",
+        flush=True,
+    )
+    records: list[ParquetRecord] = []
+    skipped_no_date: dict[str, int] = {}
+    with ProcessPoolExecutor(max_workers=len(shards)) as executor:
+        futures = {
+            executor.submit(
+                build_table,
+                config,
+                table,
+                shard,
+                columns,
+                False,
+                False,
+                f"shard-{shard_idx:03d}",
+                f"{table} shard={shard_idx + 1}/{len(shards)}",
+            ): shard_idx
+            for shard_idx, shard in enumerate(shards)
+        }
+        for future in as_completed(futures):
+            shard_idx = futures[future]
+            shard_records, shard_skipped = future.result()
+            records.extend(shard_records)
+            for key, value in shard_skipped.items():
+                skipped_no_date[key] = skipped_no_date.get(key, 0) + value
+            print(f"finished {table} shard={shard_idx + 1}/{len(shards)}: parquet_files={len(shard_records)}", flush=True)
+
+    records.sort(key=lambda r: (r.target_table, r.partition_month, r.local_path))
     if checkpoint_enabled(config) and not skipped_no_date:
         write_table_checkpoint(config, table, records)
     return records, skipped_no_date
@@ -464,21 +541,34 @@ def build(config: dict, limit: int | None = None) -> list[ParquetRecord]:
         items.append((table, sources))
     if limit or max_workers <= 1 or len(items) <= 1:
         for table, sources in items:
-            table_records, table_skipped = build_table(config, table, sources)
+            table_workers = 1 if limit else table_parallel_workers(config, table)
+            if table_workers > 1 and len(sources) > 1:
+                table_records, table_skipped = build_table_parallel(config, table, sources, table_workers)
+            else:
+                table_records, table_skipped = build_table(config, table, sources)
             records.extend(table_records)
             for key, value in table_skipped.items():
                 skipped_no_date[key] = skipped_no_date.get(key, 0) + value
     else:
-        print(f"parallel build enabled: max_workers={max_workers} tables={len(items)}", flush=True)
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(build_table, config, table, sources): table for table, sources in items}
-            for future in as_completed(futures):
-                table = futures[future]
-                table_records, table_skipped = future.result()
-                records.extend(table_records)
-                for key, value in table_skipped.items():
-                    skipped_no_date[key] = skipped_no_date.get(key, 0) + value
-                print(f"finished {table}: parquet_files={len(table_records)}", flush=True)
+        table_parallel_items = [(table, sources) for table, sources in items if table_parallel_workers(config, table) > 1 and len(sources) > 1]
+        regular_items = [(table, sources) for table, sources in items if (table, sources) not in table_parallel_items]
+        if regular_items:
+            print(f"parallel build enabled: max_workers={max_workers} tables={len(regular_items)}", flush=True)
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(build_table, config, table, sources): table for table, sources in regular_items}
+                for future in as_completed(futures):
+                    table = futures[future]
+                    table_records, table_skipped = future.result()
+                    records.extend(table_records)
+                    for key, value in table_skipped.items():
+                        skipped_no_date[key] = skipped_no_date.get(key, 0) + value
+                    print(f"finished {table}: parquet_files={len(table_records)}", flush=True)
+        for table, sources in table_parallel_items:
+            table_records, table_skipped = build_table_parallel(config, table, sources, table_parallel_workers(config, table))
+            records.extend(table_records)
+            for key, value in table_skipped.items():
+                skipped_no_date[key] = skipped_no_date.get(key, 0) + value
+            print(f"finished {table}: parquet_files={len(table_records)}", flush=True)
 
     if skipped_no_date:
         detail = ", ".join(f"{table}:{count}" for table, count in sorted(skipped_no_date.items()))
@@ -717,7 +807,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-

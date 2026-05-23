@@ -20,3 +20,11 @@ build:
   flush_rows: 50000
   max_workers: 12
   resume_checkpoint: true
+  table_parallel_workers:
+    fact_financial_indicator: 6
+  table_chunksize:
+    fact_financial_indicator: 20000
+  table_flush_rows:
+    fact_financial_indicator: 5000
+  table_progress_interval:
+    fact_financial_indicator: 100

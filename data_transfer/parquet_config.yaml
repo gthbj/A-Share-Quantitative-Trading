@@ -23,3 +23,11 @@ build:
   chunksize: 10000
   flush_rows: 1000
   max_workers: 1
+  table_parallel_workers:
+    fact_financial_indicator: 6
+  table_chunksize:
+    fact_financial_indicator: 20000
+  table_flush_rows:
+    fact_financial_indicator: 5000
+  table_progress_interval:
+    fact_financial_indicator: 100
