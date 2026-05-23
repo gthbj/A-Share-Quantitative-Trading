@@ -3,7 +3,7 @@
 Loads table-organized GCS objects from:
 
 ```text
-gs://data-aquarium/a-share/standardized/
+gs://data-aquarium/a-share/standardized_parquet/
 ```
 
 into BigQuery datasets:
@@ -12,7 +12,7 @@ into BigQuery datasets:
 - `ashare_core`
 - `ashare_mart`
 
-The first implementation defaults to `staging_only` so GCS objects land in `ashare_raw.stg_*` tables before any merge into core tables is enabled.
+The pipeline defaults to `staging_only` so GCS objects land in `ashare_raw.stg_*` tables before any merge into core tables is enabled. Parquet files are loaded in table batches, and BigQuery Hive partitioning reads `partition_month=YYYYMM` from the GCS path into a `partition_month` column.
 
 ## Setup
 
@@ -65,4 +65,16 @@ Show local manifest progress:
 
 ```powershell
 python gcs_to_bigquery\pipeline.py progress --config gcs_to_bigquery\config.yaml
+```
+
+Sync the local manifest into the BigQuery control table:
+
+```powershell
+python gcs_to_bigquery\pipeline.py sync-manifest --config gcs_to_bigquery\config.yaml
+```
+
+Verify all loaded staging tables exist and contain rows:
+
+```powershell
+python gcs_to_bigquery\pipeline.py audit-staging --config gcs_to_bigquery\config.yaml
 ```

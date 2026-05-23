@@ -1,10 +1,13 @@
 project_id: "data-aquarium"
 location: "asia-east2"
-manifest_path: "D:/A_Share_Transfer_Work/bigquery_load_manifest.jsonl"
+manifest_path: "/tmp/ashare_bigquery_load_manifest.jsonl"
+
+auth:
+  use_gcloud_access_token: true
 
 gcs:
   bucket: "data-aquarium"
-  prefix: "a-share/standardized"
+  prefix: "a-share/standardized_parquet"
 
 datasets:
   raw: "ashare_raw"
@@ -14,6 +17,12 @@ datasets:
 defaults:
   load_mode: "staging_only"
   skip_loaded: true
+  load_strategy: "table_batch"
+  replace_staging_tables: true
+  allow_unconfigured_tables: true
+  max_source_uris_per_job: 9000
+  retry_failed: true
+  column_name_character_map: "V2"
   csv:
     skip_leading_rows: 1
     autodetect: true

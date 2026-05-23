@@ -4,15 +4,18 @@ import argparse
 import json
 import os
 import re
+import subprocess
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import yaml
 
 
 VALID_STATUSES_TO_SKIP = {"loaded", "merged", "skipped"}
+LOADABLE_STATUSES = {"pending"}
 
 
 @dataclass(frozen=True)
@@ -70,14 +73,48 @@ def require_storage():
     return storage
 
 
+def gcloud_access_token() -> str:
+    result = subprocess.run(
+        ["gcloud", "auth", "print-access-token", "--quiet"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError("gcloud did not return an access token")
+    return token
+
+
+def gcloud_credentials():
+    try:
+        from google.oauth2.credentials import Credentials
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency: google-auth. "
+            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+        ) from exc
+    return Credentials(gcloud_access_token())
+
+
+def use_gcloud_access_token(config: dict) -> bool:
+    return bool(config.get("auth", {}).get("use_gcloud_access_token", False))
+
+
 def bq_client(config: dict):
     bigquery = require_bigquery()
-    return bigquery.Client(project=config["project_id"], location=config.get("location"))
+    kwargs = {"project": config["project_id"], "location": config.get("location")}
+    if use_gcloud_access_token(config):
+        kwargs["credentials"] = gcloud_credentials()
+    return bigquery.Client(**kwargs)
 
 
 def storage_client(config: dict):
     storage = require_storage()
-    return storage.Client(project=config["project_id"])
+    kwargs = {"project": config["project_id"]}
+    if use_gcloud_access_token(config):
+        kwargs["credentials"] = gcloud_credentials()
+    return storage.Client(**kwargs)
 
 
 def dataset_id(config: dict, key: str) -> str:
@@ -92,6 +129,19 @@ def staging_table_name(target_table: str) -> str:
     return f"stg_{target_table}"
 
 
+def table_is_configured(config: dict, target_table: str) -> bool:
+    return target_table in config.get("tables", {})
+
+
+def allow_unconfigured_tables(config: dict) -> bool:
+    return bool(config.get("defaults", {}).get("allow_unconfigured_tables", True))
+
+
+def source_uri_prefix(config: dict, target_table: str) -> str:
+    prefix = config["gcs"]["prefix"].strip("/")
+    return f"gs://{config['gcs']['bucket']}/{prefix}/{target_table}/"
+
+
 def parse_object(config: dict, blob, current_batch_id: str) -> LoadRecord:
     prefix = config["gcs"]["prefix"].strip("/") + "/"
     relative = blob.name.removeprefix(prefix)
@@ -101,9 +151,10 @@ def parse_object(config: dict, blob, current_batch_id: str) -> LoadRecord:
     status = "pending"
     error_message = None
 
-    match = re.search(r"partition_month=(\d{6})", relative)
+    match = re.search(r"partition_month=(\d{6}|all)", relative)
     if match:
-        partition_month = int(match.group(1))
+        partition_value = match.group(1)
+        partition_month = int(partition_value) if partition_value != "all" else None
     else:
         status = "invalid"
         error_message = "Cannot parse partition_month from object path"
@@ -118,7 +169,11 @@ def parse_object(config: dict, blob, current_batch_id: str) -> LoadRecord:
         status = "invalid"
         error_message = f"Unsupported source format: {suffix or '<none>'}"
 
-    if target_table not in config.get("tables", {}):
+    if target_table.startswith("fact_") and partition_month is None:
+        status = "invalid"
+        error_message = f"Fact table has non-numeric partition_month: {target_table}"
+
+    if not table_is_configured(config, target_table) and not allow_unconfigured_tables(config):
         status = "invalid"
         error_message = f"Target table is not configured: {target_table}"
 
@@ -196,8 +251,13 @@ def ensure_dataset(client, full_dataset_id: str, location: str) -> None:
 
 
 def ensure_table(client, table) -> None:
-    client.create_table(table, exists_ok=True)
-    print(f"Ensured table: {table.full_table_id.replace(':', '.')}")
+    created = client.create_table(table, exists_ok=True)
+    full_table_id = getattr(created, "full_table_id", None) or getattr(table, "full_table_id", None)
+    if full_table_id:
+        full_table_id = full_table_id.replace(":", ".")
+    else:
+        full_table_id = str(table.reference)
+    print(f"Ensured table: {full_table_id}")
 
 
 def control_manifest_schema() -> list:
@@ -247,25 +307,37 @@ def init(config: dict) -> None:
     ensure_table(client, errors_table)
 
 
-def load_job_config(config: dict, record: LoadRecord):
+def load_job_config(config: dict, record: LoadRecord, write_disposition: str | None = None):
     bigquery = require_bigquery()
+    write_disposition = write_disposition or bigquery.WriteDisposition.WRITE_APPEND
+    column_name_character_map = config.get("defaults", {}).get("column_name_character_map")
     if record.source_format == "CSV":
         csv_cfg = config.get("defaults", {}).get("csv", {})
-        return bigquery.LoadJobConfig(
+        job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.CSV,
             skip_leading_rows=csv_cfg.get("skip_leading_rows", 1),
             autodetect=csv_cfg.get("autodetect", True),
             allow_quoted_newlines=csv_cfg.get("allow_quoted_newlines", True),
             encoding=csv_cfg.get("encoding", "UTF-8"),
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            write_disposition=write_disposition,
             create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
         )
+        if column_name_character_map and hasattr(job_config, "column_name_character_map"):
+            job_config.column_name_character_map = column_name_character_map
+        return job_config
     if record.source_format == "PARQUET":
-        return bigquery.LoadJobConfig(
+        job_config = bigquery.LoadJobConfig(
             source_format=bigquery.SourceFormat.PARQUET,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+            write_disposition=write_disposition,
             create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
         )
+        hive = bigquery.HivePartitioningOptions()
+        hive.mode = "AUTO"
+        hive.source_uri_prefix = source_uri_prefix(config, record.target_table)
+        job_config.hive_partitioning = hive
+        if column_name_character_map and hasattr(job_config, "column_name_character_map"):
+            job_config.column_name_character_map = column_name_character_map
+        return job_config
     raise ValueError(f"Unsupported source format: {record.source_format}")
 
 
@@ -286,6 +358,53 @@ def load_to_staging(config: dict, client, record: LoadRecord) -> LoadRecord:
     )
 
 
+def chunked(values: Sequence[LoadRecord], size: int) -> Iterable[list[LoadRecord]]:
+    for idx in range(0, len(values), size):
+        yield list(values[idx:idx + size])
+
+
+def load_table_batch(config: dict, client, target_table: str, records: list[LoadRecord]) -> list[LoadRecord]:
+    bigquery = require_bigquery()
+    destination = table_id(config, "raw", staging_table_name(target_table))
+    max_source_uris = int(config.get("defaults", {}).get("max_source_uris_per_job", 9000))
+    replace_staging = bool(config.get("defaults", {}).get("replace_staging_tables", True))
+    loaded: list[LoadRecord] = []
+    chunks = list(chunked(records, max_source_uris))
+    for chunk_idx, chunk in enumerate(chunks, start=1):
+        started_at = utc_now()
+        write_disposition = (
+            bigquery.WriteDisposition.WRITE_TRUNCATE
+            if replace_staging and chunk_idx == 1
+            else bigquery.WriteDisposition.WRITE_APPEND
+        )
+        uris = [record.gcs_uri for record in chunk]
+        job = client.load_table_from_uri(
+            uris,
+            destination,
+            job_config=load_job_config(config, chunk[0], write_disposition=write_disposition),
+        )
+        job.result()
+        finished_at = utc_now()
+        for record in chunk:
+            loaded.append(
+                LoadRecord(
+                    **{
+                        **asdict(record),
+                        "status": "loaded",
+                        "bq_job_id": job.job_id,
+                        "started_at": started_at,
+                        "finished_at": finished_at,
+                        "error_message": None,
+                    }
+                )
+            )
+        print(
+            f"loaded table={target_table} chunk={chunk_idx}/{len(chunks)} files={len(chunk)} job_id={job.job_id}",
+            flush=True,
+        )
+    return loaded
+
+
 def load(config: dict, dry_run: bool) -> None:
     manifest_path = norm_path(config["manifest_path"])
     records = read_manifest(manifest_path)
@@ -293,9 +412,12 @@ def load(config: dict, dry_run: bool) -> None:
         records = list(iter_gcs_records(config))
         write_manifest(manifest_path, records)
 
+    loadable_statuses = set(LOADABLE_STATUSES)
+    if config.get("defaults", {}).get("retry_failed", True):
+        loadable_statuses.add("failed")
     pending = [
         r for r in records
-        if r.status == "pending" and not (config.get("defaults", {}).get("skip_loaded", True) and r.status in VALID_STATUSES_TO_SKIP)
+        if r.status in loadable_statuses and not (config.get("defaults", {}).get("skip_loaded", True) and r.status in VALID_STATUSES_TO_SKIP)
     ]
 
     if dry_run:
@@ -306,7 +428,35 @@ def load(config: dict, dry_run: bool) -> None:
             print(f"... {len(pending) - 20} more")
         return
 
+    use_table_batch = config.get("defaults", {}).get("load_strategy", "table_batch") == "table_batch"
     client = bq_client(config)
+    if use_table_batch:
+        updated_by_key = {(r.gcs_uri, r.object_generation): r for r in records}
+        pending_by_table: dict[str, list[LoadRecord]] = defaultdict(list)
+        for record in pending:
+            pending_by_table[record.target_table].append(record)
+        for target_table, table_records in sorted(pending_by_table.items()):
+            try:
+                for loaded in load_table_batch(config, client, target_table, table_records):
+                    updated_by_key[(loaded.gcs_uri, loaded.object_generation)] = loaded
+                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+            except Exception as exc:
+                failed_at = utc_now()
+                for record in table_records:
+                    updated_by_key[(record.gcs_uri, record.object_generation)] = LoadRecord(
+                        **{
+                            **asdict(record),
+                            "status": "failed",
+                            "started_at": record.started_at or failed_at,
+                            "finished_at": failed_at,
+                            "error_message": str(exc),
+                        }
+                    )
+                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+                print(f"failed table={target_table}: {exc}", flush=True)
+                raise
+        return
+
     updated: list[LoadRecord] = []
     for idx, record in enumerate(records, start=1):
         if record.status != "pending":
@@ -404,6 +554,56 @@ def progress(config: dict) -> None:
     summarize(records)
 
 
+def sync_manifest(config: dict) -> None:
+    bigquery = require_bigquery()
+    manifest_path = norm_path(config["manifest_path"])
+    records = read_manifest(manifest_path)
+    if not records:
+        raise RuntimeError("Manifest is empty. Run manifest or load first.")
+    client = bq_client(config)
+    destination = table_id(config, "raw", "gcs_load_manifest")
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        schema=control_manifest_schema(),
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+    )
+    with manifest_path.open("rb") as fh:
+        job = client.load_table_from_file(fh, destination, job_config=job_config)
+    job.result()
+    print(f"Synced manifest rows={len(records)} to {destination}; job_id={job.job_id}")
+
+
+def audit_staging(config: dict) -> None:
+    records = read_manifest(norm_path(config["manifest_path"]))
+    loaded_tables = sorted({record.target_table for record in records if record.status == "loaded"})
+    if not loaded_tables:
+        raise RuntimeError("No loaded tables found in manifest.")
+
+    client = bq_client(config)
+    missing: list[str] = []
+    zero_rows: list[str] = []
+    for target_table in loaded_tables:
+        destination = table_id(config, "raw", staging_table_name(target_table))
+        try:
+            table = client.get_table(destination)
+        except Exception as exc:
+            missing.append(f"{destination}: {exc}")
+            continue
+        print(f"{destination}: rows={table.num_rows} fields={len(table.schema)}")
+        if table.num_rows == 0:
+            zero_rows.append(destination)
+
+    if missing or zero_rows:
+        details = []
+        if missing:
+            details.append("missing tables:\n" + "\n".join(missing[:20]))
+        if zero_rows:
+            details.append("zero-row tables:\n" + "\n".join(zero_rows[:20]))
+        raise RuntimeError("Staging audit failed:\n" + "\n".join(details))
+    print(f"Staging audit passed: tables={len(loaded_tables)}")
+
+
 def build_manifest(config: dict) -> None:
     records = list(iter_gcs_records(config))
     write_manifest(norm_path(config["manifest_path"]), records)
@@ -414,7 +614,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Load standardized A-share GCS objects into BigQuery.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("init", "manifest", "load", "progress"):
+    for command in ("init", "manifest", "load", "progress", "sync-manifest", "audit-staging"):
         p = sub.add_parser(command)
         p.add_argument("--config", default="gcs_to_bigquery/config.yaml")
     sub.choices["load"].add_argument("--dry-run", action="store_true")
@@ -440,6 +640,12 @@ def main() -> int:
         return 0
     if args.command == "progress":
         progress(config)
+        return 0
+    if args.command == "sync-manifest":
+        sync_manifest(config)
+        return 0
+    if args.command == "audit-staging":
+        audit_staging(config)
         return 0
     raise AssertionError(args.command)
 
