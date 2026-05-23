@@ -6,9 +6,12 @@ import io
 import json
 import os
 import re
+import shutil
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
@@ -100,51 +103,72 @@ def iter_sources(config: dict):
                     continue
 
 
+@lru_cache(maxsize=256)
+def cached_zip(path: str) -> zipfile.ZipFile:
+    return zipfile.ZipFile(path)
+
+
 def source_bytes(source: Path, entry: str | None) -> bytes | Path:
     if entry:
-        with zipfile.ZipFile(source) as zf:
-            return zf.read(entry)
+        return cached_zip(str(source)).read(entry)
     return source
 
 
 def read_csv_chunks(source: Path, entry: str | None, chunksize: int):
-    payload = source_bytes(source, entry)
     encodings = ("utf-8-sig", "utf-8", "gb18030")
+    engines = ("c", "python")
     last_error: Exception | None = None
     for encoding in encodings:
-        try:
-            handle = io.BytesIO(payload) if isinstance(payload, bytes) else payload
-            yield from pd.read_csv(
-                handle,
-                dtype=str,
-                chunksize=chunksize,
-                encoding=encoding,
-                on_bad_lines="skip",
-                keep_default_na=False,
-            )
-            return
-        except UnicodeDecodeError as exc:
-            last_error = exc
-            continue
+        for engine in engines:
+            try:
+                if entry:
+                    with cached_zip(str(source)).open(entry) as handle:
+                        yield from pd.read_csv(
+                            handle,
+                            dtype=str,
+                            chunksize=chunksize,
+                            encoding=encoding,
+                            engine=engine,
+                            on_bad_lines="skip",
+                            keep_default_na=False,
+                        )
+                else:
+                    yield from pd.read_csv(
+                        source,
+                        dtype=str,
+                        chunksize=chunksize,
+                        encoding=encoding,
+                        engine=engine,
+                        on_bad_lines="skip",
+                        keep_default_na=False,
+                    )
+                return
+            except (UnicodeDecodeError, pd.errors.ParserError, MemoryError) as exc:
+                last_error = exc
+                continue
     if last_error:
         raise last_error
 
 
 def read_csv_header(source: Path, entry: str | None) -> list[str]:
-    payload = source_bytes(source, entry)
     last_error: Exception | None = None
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
-            handle = io.BytesIO(payload) if isinstance(payload, bytes) else payload
-            frame = pd.read_csv(handle, dtype=str, nrows=0, encoding=encoding, on_bad_lines="skip")
+            if entry:
+                with cached_zip(str(source)).open(entry) as handle:
+                    frame = pd.read_csv(handle, dtype=str, nrows=0, encoding=encoding, on_bad_lines="skip")
+            else:
+                frame = pd.read_csv(source, dtype=str, nrows=0, encoding=encoding, on_bad_lines="skip")
             return [str(c).strip().lstrip("\ufeff") for c in frame.columns]
         except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+        except (pd.errors.ParserError, MemoryError) as exc:
             last_error = exc
             continue
     if last_error:
         raise last_error
     return []
-
 
 def detect_date_column(columns: list[str], table: str) -> str | None:
     for column in DATE_COLUMNS:
@@ -236,19 +260,34 @@ def parquet_path(config: dict, table: str, partition_month: str, source: Path, e
 
 
 class PartitionWriter:
-    def __init__(self, path: Path, schema: pa.Schema):
+    def __init__(self, path: Path, schema: pa.Schema, flush_rows: int):
         self.path = path
         self.temp_path = path.with_suffix(".parquet.tmp")
         self.rows = 0
+        self.flush_rows = flush_rows
+        self.buffer_rows = 0
+        self.buffers: list[pd.DataFrame] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.writer = pq.ParquetWriter(self.temp_path, schema=schema, compression="zstd")
 
     def write(self, frame: pd.DataFrame, schema: pa.Schema) -> None:
+        self.buffers.append(frame)
+        self.buffer_rows += len(frame)
+        if self.buffer_rows >= self.flush_rows:
+            self.flush(schema)
+
+    def flush(self, schema: pa.Schema) -> None:
+        if not self.buffers:
+            return
+        frame = pd.concat(self.buffers, ignore_index=True)
         table = pa.Table.from_pandas(frame, schema=schema, preserve_index=False)
         self.writer.write_table(table)
         self.rows += len(frame)
+        self.buffers.clear()
+        self.buffer_rows = 0
 
-    def close(self) -> None:
+    def close(self, schema: pa.Schema) -> None:
+        self.flush(schema)
         self.writer.close()
         os.replace(self.temp_path, self.path)
 
@@ -274,18 +313,129 @@ def schema_columns_for_sources(sources: list[tuple[Path, str | None]]) -> list[s
 
 
 def align_to_schema(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    for column in columns:
-        if column not in frame.columns:
-            frame[column] = pd.NA
+    missing = [column for column in columns if column not in frame.columns]
+    if missing:
+        frame = pd.concat(
+            [frame, pd.DataFrame({column: pd.NA for column in missing}, index=frame.index)],
+            axis=1,
+        )
     frame = frame[columns]
     for column in frame.columns:
         frame[column] = frame[column].astype("string")
     return frame
 
 
-def build(config: dict, limit: int | None = None) -> list[ParquetRecord]:
+def build_table(config: dict, table: str, sources: list[tuple[Path, str | None]]) -> tuple[list[ParquetRecord], dict[str, int]]:
     records: list[ParquetRecord] = []
     chunksize = int(config.get("build", {}).get("chunksize", 50000))
+    flush_rows = int(config.get("build", {}).get("flush_rows", 50000))
+    skipped_no_date: dict[str, int] = {}
+    parquet_root = norm_path(config["parquet_root"])
+    if checkpoint_enabled(config):
+        cleanup_table_outputs(config, table)
+
+    columns = schema_columns_for_sources(sources)
+    schema = pa.schema([pa.field(column, pa.string()) for column in columns])
+    writers: dict[str, PartitionWriter] = {}
+    source_count_by_month: dict[str, int] = {}
+    print(f"building {table}: sources={len(sources)} columns={len(columns)}", flush=True)
+
+    for source_idx, (source, entry) in enumerate(sources, start=1):
+        source_months: set[str] = set()
+        source_has_usable_rows = False
+        source_missing_date = False
+        source_hash = fingerprint(source.relative_to(norm_path(config["source_root"])).as_posix(), entry)[:16]
+        for chunk in read_csv_chunks(source, entry, chunksize):
+            frame, date_col = enrich_frame(chunk, table, source, entry)
+            if frame.empty:
+                if table.startswith("fact_") and not date_col:
+                    source_missing_date = True
+                continue
+            source_has_usable_rows = True
+            months = partition_months(frame, table)
+            for partition_month, month_frame in frame.groupby(months, dropna=True):
+                partition_month = str(partition_month)
+                if table.startswith("fact_") and not re.fullmatch(r"\d{6}", partition_month):
+                    raise RuntimeError(f"Invalid fact partition {partition_month}: {source} :: {entry}")
+                if not re.fullmatch(r"\d{6}|all", partition_month):
+                    raise RuntimeError(f"Invalid partition_month={partition_month}: {source} :: {entry}")
+                if partition_month not in writers:
+                    part_path = parquet_root / table / f"partition_month={partition_month}" / f"part-{source_hash[:8]}-{len(writers):05d}.parquet"
+                    writers[partition_month] = PartitionWriter(part_path, schema, flush_rows)
+                aligned = align_to_schema(month_frame, columns)
+                writers[partition_month].write(aligned, schema)
+                source_months.add(partition_month)
+        if table.startswith("fact_") and source_missing_date and not source_has_usable_rows:
+            skipped_no_date[table] = skipped_no_date.get(table, 0) + 1
+        for partition_month in source_months:
+            source_count_by_month[partition_month] = source_count_by_month.get(partition_month, 0) + 1
+        if source_idx % 1000 == 0:
+            print(f"  {table}: processed_sources={source_idx}/{len(sources)} open_partitions={len(writers)}", flush=True)
+
+    for partition_month, writer in sorted(writers.items()):
+        writer.close(schema)
+        stat = writer.path.stat()
+        records.append(
+            ParquetRecord(
+                target_table=table,
+                partition_month=partition_month,
+                local_path=str(writer.path),
+                gcs_uri=gcs_uri(config, writer.path),
+                size=stat.st_size,
+                rows=writer.rows,
+                source_count=source_count_by_month.get(partition_month, 0),
+                fingerprint=fingerprint(writer.path, stat.st_size, stat.st_mtime_ns),
+            )
+        )
+    if checkpoint_enabled(config) and not skipped_no_date:
+        write_table_checkpoint(config, table, records)
+    return records, skipped_no_date
+
+
+def checkpoint_enabled(config: dict) -> bool:
+    return bool(config.get("build", {}).get("resume_checkpoint", False))
+
+
+def table_checkpoint_dir(config: dict) -> Path:
+    work_dir = norm_path(config.get("work_dir", norm_path(config["manifest_path"]).parent))
+    return work_dir / "table_manifests"
+
+
+def table_checkpoint_path(config: dict, table: str) -> Path:
+    return table_checkpoint_dir(config) / f"{table}.jsonl.done"
+
+
+def write_table_checkpoint(config: dict, table: str, records: list[ParquetRecord]) -> None:
+    write_manifest(table_checkpoint_path(config, table), records)
+
+
+def read_table_checkpoint(config: dict, table: str) -> list[ParquetRecord]:
+    return read_manifest(table_checkpoint_path(config, table))
+
+
+def cleanup_table_outputs(config: dict, table: str) -> None:
+    table_root = norm_path(config["parquet_root"]) / table
+    if table_root.exists():
+        shutil.rmtree(table_root)
+
+
+def checkpoint_is_valid(config: dict, table: str) -> tuple[bool, list[ParquetRecord]]:
+    path = table_checkpoint_path(config, table)
+    if not path.exists():
+        return False, []
+    records = read_manifest(path)
+    if not records:
+        return False, []
+    try:
+        validate_records(config, records, local=True)
+    except RuntimeError as exc:
+        print(f"checkpoint invalid for {table}: {exc}", flush=True)
+        return False, []
+    return True, records
+
+
+def build(config: dict, limit: int | None = None) -> list[ParquetRecord]:
+    records: list[ParquetRecord] = []
     skipped_no_date: dict[str, int] = {}
     grouped_sources: dict[str, list[tuple[Path, str | None]]] = {}
 
@@ -298,73 +448,45 @@ def build(config: dict, limit: int | None = None) -> list[ParquetRecord]:
             break
 
     parquet_root = norm_path(config["parquet_root"])
-    if parquet_root.exists():
-        import shutil
-
+    resume = checkpoint_enabled(config) and not limit
+    if parquet_root.exists() and not resume:
         shutil.rmtree(parquet_root)
 
+    max_workers = int(config.get("build", {}).get("max_workers", 1))
+    items = []
     for table, sources in sorted(grouped_sources.items()):
-        columns = schema_columns_for_sources(sources)
-        schema = pa.schema([pa.field(column, pa.string()) for column in columns])
-        writers: dict[str, PartitionWriter] = {}
-        source_count_by_month: dict[str, int] = {}
-        print(f"building {table}: sources={len(sources)} columns={len(columns)}", flush=True)
-
-        for source_idx, (source, entry) in enumerate(sources, start=1):
-            source_months: set[str] = set()
-            source_has_usable_rows = False
-            source_missing_date = False
-            source_hash = fingerprint(source.relative_to(norm_path(config["source_root"])).as_posix(), entry)[:16]
-            for chunk in read_csv_chunks(source, entry, chunksize):
-                frame, date_col = enrich_frame(chunk, table, source, entry)
-                if frame.empty:
-                    if table.startswith("fact_") and not date_col:
-                        source_missing_date = True
-                    continue
-                source_has_usable_rows = True
-                months = partition_months(frame, table)
-                for partition_month, month_frame in frame.groupby(months, dropna=True):
-                    partition_month = str(partition_month)
-                    if table.startswith("fact_") and not re.fullmatch(r"\d{6}", partition_month):
-                        raise RuntimeError(f"Invalid fact partition {partition_month}: {source} :: {entry}")
-                    if not re.fullmatch(r"\d{6}|all", partition_month):
-                        raise RuntimeError(f"Invalid partition_month={partition_month}: {source} :: {entry}")
-                    if partition_month not in writers:
-                        part_path = parquet_root / table / f"partition_month={partition_month}" / f"part-{source_hash[:8]}-{len(writers):05d}.parquet"
-                        writers[partition_month] = PartitionWriter(part_path, schema)
-                    aligned = align_to_schema(month_frame, columns)
-                    writers[partition_month].write(aligned, schema)
-                    source_months.add(partition_month)
-            if table.startswith("fact_") and source_missing_date and not source_has_usable_rows:
-                skipped_no_date[table] = skipped_no_date.get(table, 0) + 1
-            for partition_month in source_months:
-                source_count_by_month[partition_month] = source_count_by_month.get(partition_month, 0) + 1
-            if source_idx % 1000 == 0:
-                print(f"  {table}: processed_sources={source_idx}/{len(sources)} open_partitions={len(writers)}", flush=True)
-
-        for partition_month, writer in sorted(writers.items()):
-            writer.close()
-            stat = writer.path.stat()
-            records.append(
-                ParquetRecord(
-                    target_table=table,
-                    partition_month=partition_month,
-                    local_path=str(writer.path),
-                    gcs_uri=gcs_uri(config, writer.path),
-                    size=stat.st_size,
-                    rows=writer.rows,
-                    source_count=source_count_by_month.get(partition_month, 0),
-                    fingerprint=fingerprint(writer.path, stat.st_size, stat.st_mtime_ns),
-                )
-            )
+        if resume:
+            ok, checkpoint_records = checkpoint_is_valid(config, table)
+            if ok:
+                records.extend(checkpoint_records)
+                print(f"resume skip {table}: parquet_files={len(checkpoint_records)}", flush=True)
+                continue
+        items.append((table, sources))
+    if limit or max_workers <= 1 or len(items) <= 1:
+        for table, sources in items:
+            table_records, table_skipped = build_table(config, table, sources)
+            records.extend(table_records)
+            for key, value in table_skipped.items():
+                skipped_no_date[key] = skipped_no_date.get(key, 0) + value
+    else:
+        print(f"parallel build enabled: max_workers={max_workers} tables={len(items)}", flush=True)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(build_table, config, table, sources): table for table, sources in items}
+            for future in as_completed(futures):
+                table = futures[future]
+                table_records, table_skipped = future.result()
+                records.extend(table_records)
+                for key, value in table_skipped.items():
+                    skipped_no_date[key] = skipped_no_date.get(key, 0) + value
+                print(f"finished {table}: parquet_files={len(table_records)}", flush=True)
 
     if skipped_no_date:
         detail = ", ".join(f"{table}:{count}" for table, count in sorted(skipped_no_date.items()))
         raise RuntimeError(f"Fact CSV chunks without a usable date column: {detail}")
+    records.sort(key=lambda r: (r.target_table, r.partition_month, r.local_path))
     write_manifest(norm_path(config["manifest_path"]), records)
     validate_records(config, records, local=True)
     return records
-
 
 def write_manifest(path: Path, records: list[ParquetRecord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -526,10 +648,47 @@ def progress(config: dict) -> None:
     print(f"Remote GiB: {uploaded_bytes / 1024**3:.3f}/{total_bytes / 1024**3:.3f}")
 
 
+def checkpoint_existing(config: dict) -> None:
+    parquet_root = norm_path(config["parquet_root"])
+    table_count = 0
+    record_count = 0
+    for table_root in sorted(p for p in parquet_root.iterdir() if p.is_dir()):
+        table = table_root.name
+        records: list[ParquetRecord] = []
+        for parquet_file in sorted(table_root.glob("partition_month=*/*.parquet")):
+            partition_name = parquet_file.parent.name
+            if not partition_name.startswith("partition_month="):
+                continue
+            partition_month = partition_name.removeprefix("partition_month=")
+            stat = parquet_file.stat()
+            try:
+                rows = pq.read_metadata(parquet_file).num_rows
+            except Exception:
+                continue
+            records.append(
+                ParquetRecord(
+                    target_table=table,
+                    partition_month=partition_month,
+                    local_path=str(parquet_file),
+                    gcs_uri=gcs_uri(config, parquet_file),
+                    size=stat.st_size,
+                    rows=rows,
+                    source_count=0,
+                    fingerprint=fingerprint(parquet_file, stat.st_size, stat.st_mtime_ns),
+                )
+            )
+        if records:
+            validate_records(config, records, local=True)
+            write_table_checkpoint(config, table, records)
+            table_count += 1
+            record_count += len(records)
+    print(f"checkpointed tables={table_count} parquet_files={record_count}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare month-partitioned Parquet files and upload them to GCS.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("build", "upload", "audit", "progress"):
+    for name in ("build", "upload", "audit", "progress", "checkpoint-existing"):
         p = sub.add_parser(name)
         p.add_argument("--config", default="data_transfer/parquet_config.yaml")
     sub.choices["build"].add_argument("--limit", type=int)
@@ -550,8 +709,15 @@ def main() -> int:
     if args.command == "progress":
         progress(config)
         return 0
+    if args.command == "checkpoint-existing":
+        checkpoint_existing(config)
+        return 0
     raise AssertionError(args.command)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+

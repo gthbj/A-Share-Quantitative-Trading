@@ -1,0 +1,22 @@
+source_root: "/mnt/localssd/raw"
+work_dir: "/mnt/localssd/work"
+parquet_root: "/mnt/localssd/parquet"
+manifest_path: "/mnt/localssd/work/parquet_manifest.jsonl"
+
+gcs:
+  project_id: "data-aquarium"
+  bucket: "data-aquarium"
+  prefix: "a-share/standardized_parquet"
+  location: "asia-east2"
+
+upload:
+  skip_if_remote_size_matches: true
+  verify_after_upload: true
+  keep_local_files: true
+  audit_sample_files: 100
+
+build:
+  chunksize: 50000
+  flush_rows: 50000
+  max_workers: 12
+  resume_checkpoint: true

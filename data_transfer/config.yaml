@@ -9,12 +9,10 @@ ignore_dirs:
 gcs:
   project_id: "data-aquarium"
   bucket: "data-aquarium"
-  prefix: "a-share/raw"
+  prefix: "a-share/raw/source_snapshot=20260523"
   location: "asia-east2"
 
 credentials:
-  # Service account key creation is disabled by org policy in this project.
-  # Use local Application Default Credentials for local uploads.
   mode: "application_default_credentials"
   service_account_json: "D:/A_Share_Transfer_Work/gcp-service-account.json"
   secrets_yaml: "D:/git/A-Share-Quantitative-Trading/config/secrets.yaml"

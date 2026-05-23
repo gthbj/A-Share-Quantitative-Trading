@@ -18,3 +18,8 @@ upload:
   verify_after_upload: true
   keep_local_files: true
   audit_sample_files: 30
+
+build:
+  chunksize: 10000
+  flush_rows: 1000
+  max_workers: 1
