@@ -1,9 +1,10 @@
 project_id: "data-aquarium"
 location: "asia-east2"
-manifest_path: "/tmp/ashare_bigquery_load_manifest.jsonl"
+manifest_path: "${HOME}/.local/state/ashare/ods_pipeline_manifest.jsonl"
 
 auth:
-  use_gcloud_access_token: true
+  use_gcloud_access_token: false
+  gcloud_token_timeout_seconds: 30
 
 gcs:
   bucket: "data-aquarium"
@@ -17,11 +18,14 @@ datasets:
 defaults:
   load_mode: "staging_only"
   skip_loaded: true
+  # deprecated, ODS external table no longer uses native load
   load_strategy: "table_batch"
+  # deprecated, ODS external table no longer uses native load
   replace_staging_tables: true
-  allow_unconfigured_tables: true
+  allow_unconfigured_tables: false
   max_source_uris_per_job: 9000
-  retry_failed: true
+  retry_failed: false
+  # Keep V2 for current GCS Parquet source fields; do not remove until ODS schema is verified.
   column_name_character_map: "V2"
   csv:
     skip_leading_rows: 1

@@ -5,9 +5,10 @@ import json
 import os
 import re
 import subprocess
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -16,6 +17,9 @@ import yaml
 
 VALID_STATUSES_TO_SKIP = {"loaded", "merged", "skipped"}
 LOADABLE_STATUSES = {"pending"}
+DEFAULT_MANIFEST_PATH = "${HOME}/.local/state/ashare/ods_pipeline_manifest.jsonl"
+WINDOWS_MANIFEST_RELATIVE_PATH = "AppData/Local/ashare/ods_pipeline_manifest.jsonl"
+REQUIREMENTS_INSTALL_HINT = "Install it with: python -m pip install -r gcs_to_bigquery/requirements.txt"
 
 
 @dataclass(frozen=True)
@@ -44,11 +48,42 @@ def batch_id() -> str:
 
 
 def load_config(path: Path) -> dict:
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    config.setdefault("manifest_path", DEFAULT_MANIFEST_PATH)
+    return config
 
 
-def norm_path(value: str) -> Path:
-    return Path(value.replace("/", os.sep)).resolve()
+def default_manifest_path() -> Path:
+    home = os.environ.get("HOME")
+    if home:
+        return Path(home) / ".local" / "state" / "ashare" / "ods_pipeline_manifest.jsonl"
+
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        return Path(userprofile) / WINDOWS_MANIFEST_RELATIVE_PATH
+
+    return Path.home() / ".local" / "state" / "ashare" / "ods_pipeline_manifest.jsonl"
+
+
+def norm_path(value: str | None) -> Path:
+    if not value:
+        return default_manifest_path().resolve()
+
+    if "${HOME}" in value and not os.environ.get("HOME") and os.environ.get("USERPROFILE"):
+        if value == DEFAULT_MANIFEST_PATH:
+            value = str(Path(os.environ["USERPROFILE"]) / WINDOWS_MANIFEST_RELATIVE_PATH)
+        else:
+            value = value.replace("${HOME}", os.environ["USERPROFILE"])
+
+    return Path(os.path.expandvars(os.path.expanduser(value))).resolve()
+
+
+def manifest_path(config: dict) -> Path:
+    return norm_path(config.get("manifest_path"))
+
+
+def ensure_manifest_parent(config: dict) -> None:
+    manifest_path(config).parent.mkdir(parents=True, exist_ok=True)
 
 
 def require_bigquery():
@@ -56,8 +91,7 @@ def require_bigquery():
         from google.cloud import bigquery
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-cloud-bigquery. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-cloud-bigquery. {REQUIREMENTS_INSTALL_HINT}"
         ) from exc
     return bigquery
 
@@ -67,18 +101,23 @@ def require_storage():
         from google.cloud import storage
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-cloud-storage. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-cloud-storage. {REQUIREMENTS_INSTALL_HINT}"
         ) from exc
     return storage
 
 
-def gcloud_access_token() -> str:
+def gcloud_token_timeout_seconds(config: dict | None = None) -> int:
+    auth_config = (config or {}).get("auth", {})
+    return int(auth_config.get("gcloud_token_timeout_seconds", 30))
+
+
+def gcloud_access_token(config: dict | None = None) -> str:
     result = subprocess.run(
         ["gcloud", "auth", "print-access-token", "--quiet"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=gcloud_token_timeout_seconds(config),
     )
     token = result.stdout.strip()
     if not token:
@@ -86,15 +125,25 @@ def gcloud_access_token() -> str:
     return token
 
 
-def gcloud_credentials():
+def gcloud_credentials(config: dict):
     try:
-        from google.oauth2.credentials import Credentials
+        from google.auth.credentials import Credentials
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-auth. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-auth. {REQUIREMENTS_INSTALL_HINT}"
         ) from exc
-    return Credentials(gcloud_access_token())
+
+    class GcloudAccessTokenCredentials(Credentials):
+        def __init__(self, credential_config: dict) -> None:
+            super().__init__()
+            self._credential_config = credential_config
+            self.refresh(None)
+
+        def refresh(self, request) -> None:
+            self.token = gcloud_access_token(self._credential_config)
+            self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=50)
+
+    return GcloudAccessTokenCredentials(config)
 
 
 def use_gcloud_access_token(config: dict) -> bool:
@@ -105,7 +154,7 @@ def bq_client(config: dict):
     bigquery = require_bigquery()
     kwargs = {"project": config["project_id"], "location": config.get("location")}
     if use_gcloud_access_token(config):
-        kwargs["credentials"] = gcloud_credentials()
+        kwargs["credentials"] = gcloud_credentials(config)
     return bigquery.Client(**kwargs)
 
 
@@ -113,7 +162,7 @@ def storage_client(config: dict):
     storage = require_storage()
     kwargs = {"project": config["project_id"]}
     if use_gcloud_access_token(config):
-        kwargs["credentials"] = gcloud_credentials()
+        kwargs["credentials"] = gcloud_credentials(config)
     return storage.Client(**kwargs)
 
 
@@ -134,7 +183,7 @@ def table_is_configured(config: dict, target_table: str) -> bool:
 
 
 def allow_unconfigured_tables(config: dict) -> bool:
-    return bool(config.get("defaults", {}).get("allow_unconfigured_tables", True))
+    return bool(config.get("defaults", {}).get("allow_unconfigured_tables", False))
 
 
 def source_uri_prefix(config: dict, target_table: str) -> str:
@@ -405,15 +454,15 @@ def load_table_batch(config: dict, client, target_table: str, records: list[Load
     return loaded
 
 
-def load(config: dict, dry_run: bool) -> None:
-    manifest_path = norm_path(config["manifest_path"])
-    records = read_manifest(manifest_path)
+def load(config: dict, dry_run: bool, retry_failed: bool = False) -> None:
+    manifest_file = manifest_path(config)
+    records = read_manifest(manifest_file)
     if not records:
         records = list(iter_gcs_records(config))
-        write_manifest(manifest_path, records)
+        write_manifest(manifest_file, records)
 
     loadable_statuses = set(LOADABLE_STATUSES)
-    if config.get("defaults", {}).get("retry_failed", True):
+    if retry_failed or config.get("defaults", {}).get("retry_failed", False):
         loadable_statuses.add("failed")
     pending = [
         r for r in records
@@ -439,7 +488,7 @@ def load(config: dict, dry_run: bool) -> None:
             try:
                 for loaded in load_table_batch(config, client, target_table, table_records):
                     updated_by_key[(loaded.gcs_uri, loaded.object_generation)] = loaded
-                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+                write_manifest(manifest_file, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
             except Exception as exc:
                 failed_at = utc_now()
                 for record in table_records:
@@ -452,14 +501,14 @@ def load(config: dict, dry_run: bool) -> None:
                             "error_message": str(exc),
                         }
                     )
-                write_manifest(manifest_path, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
+                write_manifest(manifest_file, [updated_by_key[(r.gcs_uri, r.object_generation)] for r in records])
                 print(f"failed table={target_table}: {exc}", flush=True)
                 raise
         return
 
     updated: list[LoadRecord] = []
     for idx, record in enumerate(records, start=1):
-        if record.status != "pending":
+        if record.status not in loadable_statuses:
             updated.append(record)
             continue
         try:
@@ -477,13 +526,13 @@ def load(config: dict, dry_run: bool) -> None:
                 }
             )
             updated.append(failed)
-            write_manifest(manifest_path, updated + records[idx:])
+            write_manifest(manifest_file, updated + records[idx:])
             print(f"[{idx}/{len(records)}] failed {record.gcs_uri}: {exc}")
             raise
 
         if idx % 25 == 0:
-            write_manifest(manifest_path, updated + records[idx:])
-    write_manifest(manifest_path, updated)
+            write_manifest(manifest_file, updated + records[idx:])
+    write_manifest(manifest_file, updated)
 
 
 def field_names(schema: list) -> list[str]:
@@ -495,8 +544,7 @@ def require_table(client, full_table_id: str):
         from google.api_core.exceptions import NotFound
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency: google-api-core. "
-            "Install it with: python -m pip install -r gcs_to_bigquery\\requirements.txt"
+            f"Missing dependency: google-api-core. {REQUIREMENTS_INSTALL_HINT}"
         ) from exc
     try:
         return client.get_table(full_table_id)
@@ -550,14 +598,14 @@ WHEN NOT MATCHED THEN
 
 
 def progress(config: dict) -> None:
-    records = read_manifest(norm_path(config["manifest_path"]))
+    records = read_manifest(manifest_path(config))
     summarize(records)
 
 
 def sync_manifest(config: dict) -> None:
     bigquery = require_bigquery()
-    manifest_path = norm_path(config["manifest_path"])
-    records = read_manifest(manifest_path)
+    manifest_file = manifest_path(config)
+    records = read_manifest(manifest_file)
     if not records:
         raise RuntimeError("Manifest is empty. Run manifest or load first.")
     client = bq_client(config)
@@ -568,14 +616,14 @@ def sync_manifest(config: dict) -> None:
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
     )
-    with manifest_path.open("rb") as fh:
+    with manifest_file.open("rb") as fh:
         job = client.load_table_from_file(fh, destination, job_config=job_config)
     job.result()
     print(f"Synced manifest rows={len(records)} to {destination}; job_id={job.job_id}")
 
 
 def audit_staging(config: dict) -> None:
-    records = read_manifest(norm_path(config["manifest_path"]))
+    records = read_manifest(manifest_path(config))
     loaded_tables = sorted({record.target_table for record in records if record.status == "loaded"})
     if not loaded_tables:
         raise RuntimeError("No loaded tables found in manifest.")
@@ -606,7 +654,7 @@ def audit_staging(config: dict) -> None:
 
 def build_manifest(config: dict) -> None:
     records = list(iter_gcs_records(config))
-    write_manifest(norm_path(config["manifest_path"]), records)
+    write_manifest(manifest_path(config), records)
     summarize(records)
 
 
@@ -618,6 +666,7 @@ def main() -> int:
         p = sub.add_parser(command)
         p.add_argument("--config", default="gcs_to_bigquery/config.yaml")
     sub.choices["load"].add_argument("--dry-run", action="store_true")
+    sub.choices["load"].add_argument("--retry-failed", action="store_true")
 
     merge_parser = sub.add_parser("merge")
     merge_parser.add_argument("--config", default="gcs_to_bigquery/config.yaml")
@@ -625,6 +674,7 @@ def main() -> int:
 
     args = parser.parse_args()
     config = load_config(Path(args.config))
+    ensure_manifest_parent(config)
 
     if args.command == "init":
         init(config)
@@ -633,7 +683,12 @@ def main() -> int:
         build_manifest(config)
         return 0
     if args.command == "load":
-        load(config, dry_run=args.dry_run)
+        print(
+            "WARNING: 'load' is deprecated for the ODS flow; use create-ods-external "
+            "after PRD_10 external table support is implemented.",
+            file=sys.stderr,
+        )
+        load(config, dry_run=args.dry_run, retry_failed=args.retry_failed)
         return 0
     if args.command == "merge":
         merge_table(config, args.table)

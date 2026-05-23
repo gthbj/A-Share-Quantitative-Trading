@@ -84,14 +84,16 @@ nohup .venv/bin/python data_transfer/prepare_parquet_to_gcs.py build \
 Restart cloud build while preserving table-level checkpoints:
 
 ```bash
-bash /home/admin/ashare_pipeline/data_transfer/restart_cloud_parquet_build.sh
+bash scripts/legacy/restart_cloud_parquet_build.sh
 ```
 
 Remove stale checkpoint files whose Parquet files no longer exist:
 
 ```bash
-python data_transfer/cleanup_invalid_checkpoints.py
+python scripts/legacy/cleanup_invalid_checkpoints.py
 ```
+
+The two commands above are legacy GCE recovery utilities with hard-coded `/mnt/localssd/...` and `/home/admin/ashare_pipeline` paths. They are kept under `scripts/legacy/` for historical reference only and are not part of the new GCS to BigQuery flow.
 
 Audit local Parquet:
 

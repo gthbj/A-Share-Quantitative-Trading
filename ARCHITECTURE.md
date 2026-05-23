@@ -263,6 +263,8 @@ context.order(code, target_qty - current_qty)
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
 - GCS 到 BigQuery 的装载由 `gcs_to_bigquery/pipeline.py` 负责，当前仅保证 `ashare_raw.stg_*` staging 层可审计可重跑，不保证 `ashare_core` 已可直接回测。
+- `gcs_to_bigquery` 默认使用 Google Application Default Credentials；`auth.use_gcloud_access_token` 仅作为 fallback，且 gcloud token 支持超时与刷新。
+- `gcs_to_bigquery` 本地 manifest 默认写入 `${HOME}/.local/state/ashare/ods_pipeline_manifest.jsonl`，不再写入 `/tmp`。
 
 ### 4.7 BigQuery 表结构与接入进度
 
@@ -542,8 +544,9 @@ handle_data → Context.limit_order / stop_order
 | `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/` |
-| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery staging 的装载管道；支持 manifest、table batch load、staging audit、manifest 同步 |
+| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery staging 的装载管道；支持 ADC 默认认证、持久 manifest、table batch load、staging audit、manifest 同步 |
 | `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery 装载配置，定义 project、bucket、datasets、load 策略和表配置 |
+| `scripts/legacy/` | 工具 | 历史 GCE VM 恢复脚本归档，包含硬编码 `/mnt/localssd/...` 路径，不属于新装载流程 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
 | `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（保留备选） |
