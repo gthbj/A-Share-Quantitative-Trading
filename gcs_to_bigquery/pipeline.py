@@ -475,7 +475,7 @@ def load(config: dict, dry_run: bool, retry_failed: bool = False) -> None:
     if dry_run:
         summarize(pending)
         for record in pending[:20]:
-            print(f"{record.gcs_uri} -> {config['dataset']}.{ods_table_name(record.target_table)}")
+            print(f"{record.gcs_uri} -> {config.get('dataset', 'ashare')}.{ods_table_name(record.target_table)}")
         if len(pending) > 20:
             print(f"... {len(pending) - 20} more")
         return
@@ -536,6 +536,88 @@ def load(config: dict, dry_run: bool, retry_failed: bool = False) -> None:
         if idx % 25 == 0:
             write_manifest(manifest_file, updated + records[idx:])
     write_manifest(manifest_file, updated)
+
+
+def normalize_security_code(value: object) -> str | None:
+    text = "" if value is None else str(value).strip().upper()
+    if not text:
+        return None
+    text = text.replace("_", ".")
+    if re.fullmatch(r"\d{6}", text):
+        if text.startswith(("43", "83", "87", "88", "92")):
+            return f"{text}.BJ"
+        if text.startswith(("5", "6", "9")):
+            return f"{text}.SH"
+        return f"{text}.SZ"
+    if re.fullmatch(r"(SH|SZ|BJ)\d{6}", text):
+        return f"{text[2:]}.{text[:2]}"
+    return text
+
+
+def resolve_source_column(available_columns: list[str], candidates: list[str]) -> str | None:
+    for candidate in candidates:
+        if candidate in available_columns:
+            return candidate
+    return None
+
+
+def get_code_column_config(config: dict, target_table: str) -> dict | None:
+    return config.get("field_mappings", {}).get("per_table", {}).get(target_table)
+
+
+def _add_rename(rename_map: dict[str, str], available: list[str], source: str | None, target: str) -> None:
+    if not source or source == target:
+        return
+    if target in available:
+        return
+    if target in rename_map.values():
+        return
+    rename_map[source] = target
+
+
+def apply_field_mappings(config: dict, target_table: str, df: "pd.DataFrame") -> "pd.DataFrame":
+    common_mappings = config.get("field_mappings", {}).get("common", {})
+    table_cfg = get_code_column_config(config, target_table)
+    available = list(df.columns)
+    rename_map: dict[str, str] = {}
+
+    for source_col in available:
+        target_col = common_mappings.get(source_col)
+        if target_col:
+            _add_rename(rename_map, available, source_col, target_col)
+
+    if table_cfg:
+        if "code_column" in table_cfg:
+            target_code = table_cfg["code_column"]
+            source = resolve_source_column(available, table_cfg.get("source_candidates", []))
+            _add_rename(rename_map, available, source, target_code)
+        elif "code_columns" in table_cfg:
+            board_target, equity_target = table_cfg["code_columns"]
+            board_source = resolve_source_column(available, table_cfg.get("board_source_candidates", []))
+            equity_source = resolve_source_column(available, table_cfg.get("equity_source_candidates", []))
+            _add_rename(rename_map, available, board_source, board_target)
+            _add_rename(rename_map, available, equity_source, equity_target)
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    normalizable_code_columns = {"equity_code", "fund_code", "index_code", "security_code"}
+    if table_cfg:
+        configured_columns = [table_cfg["code_column"]] if "code_column" in table_cfg else table_cfg.get("code_columns", [])
+        for code_column in configured_columns:
+            if code_column in normalizable_code_columns and code_column in df.columns:
+                df[code_column] = df[code_column].map(normalize_security_code)
+
+    return df
+
+
+def validate_financial_date_policy(config: dict, df: "pd.DataFrame", target_table: str) -> "pd.DataFrame":
+    policy = config.get("financial_date_policy", {})
+    if not policy.get("report_period_is_not_visible_date", False):
+        return df
+    if "report_period_raw" in df.columns and "announcement_date_raw" not in df.columns:
+        df["announcement_date_raw"] = None
+    return df
 
 
 def field_names(schema: list) -> list[str]:

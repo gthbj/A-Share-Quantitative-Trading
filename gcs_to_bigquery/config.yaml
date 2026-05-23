@@ -37,9 +37,9 @@ defaults:
 
 tables:
   fact_equity_kline_1d:
-    primary_key: ["security_code", "date", "adjust_type"]
+    primary_key: ["equity_code", "date", "adjust_type"]
     partition_field: "date"
-    clustering_fields: ["security_code", "adjust_type"]
+    clustering_fields: ["equity_code", "adjust_type"]
     load_mode: "staging_only"
   fact_fund_kline_1d:
     primary_key: ["fund_code", "date", "adjust_type"]
@@ -57,27 +57,80 @@ tables:
     clustering_fields: ["board_code", "board_type", "source"]
     load_mode: "staging_only"
   fact_adjust_factor:
-    primary_key: ["security_code", "date", "adjust_type"]
+    primary_key: ["equity_code", "date", "adjust_type"]
     partition_field: "date"
-    clustering_fields: ["security_code", "adjust_type"]
+    clustering_fields: ["equity_code", "adjust_type"]
     load_mode: "staging_only"
   fact_limit_price_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code"]
+    clustering_fields: ["equity_code"]
     load_mode: "staging_only"
   fact_suspend_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code"]
+    clustering_fields: ["equity_code"]
     load_mode: "staging_only"
   fact_st_status_1d:
-    primary_key: ["security_code", "date"]
+    primary_key: ["equity_code", "date"]
     partition_field: "date"
-    clustering_fields: ["security_code", "st_type"]
+    clustering_fields: ["equity_code", "st_type"]
     load_mode: "staging_only"
   fact_board_component_1d:
-    primary_key: ["date", "board_code", "security_code", "source"]
+    primary_key: ["date", "board_code", "equity_code", "source"]
     partition_field: "date"
-    clustering_fields: ["board_code", "security_code", "source"]
+    clustering_fields: ["board_code", "equity_code", "source"]
     load_mode: "staging_only"
+  dim_security:
+    primary_key: ["security_code"]
+    partition_field: null
+    clustering_fields: ["security_code"]
+    load_mode: "staging_only"
+
+field_mappings:
+  common:
+    股票代码: equity_code
+    证券代码: security_code
+    基金代码: fund_code
+    基金交易代码: fund_code
+    指数代码: index_code
+    板块代码: board_code
+    成分股票代码: equity_code
+    日期: date_raw
+    交易日期: date_raw
+    公告日期: announcement_date_raw
+    实际公告日期: actual_announcement_date_raw
+    报告期: report_period_raw
+    开盘: open_raw
+    收盘: close_raw
+    最高: high_raw
+    最低: low_raw
+    成交量: volume_raw
+    成交额: amount_raw
+    名称: security_name
+    证券名称: security_name
+
+  per_table:
+    fact_equity_kline_1d:
+      code_column: equity_code
+      source_candidates: ["equity_code", "security_code", "股票代码", "证券代码", "代码"]
+    fact_fund_kline_1d:
+      code_column: fund_code
+      source_candidates: ["fund_code", "security_code", "基金代码", "基金交易代码", "代码"]
+    fact_index_kline_1d:
+      code_column: index_code
+      source_candidates: ["index_code", "security_code", "指数代码", "代码"]
+    fact_board_kline_1d:
+      code_column: board_code
+      source_candidates: ["board_code", "板块代码", "代码"]
+    fact_board_component_1d:
+      code_columns: ["board_code", "equity_code"]
+      board_source_candidates: ["board_code", "板块代码"]
+      equity_source_candidates: ["equity_code", "security_code", "成分股票代码", "股票代码", "代码"]
+    dim_security:
+      code_column: security_code
+      source_candidates: ["security_code", "证券代码", "股票代码", "基金代码", "指数代码", "代码"]
+
+financial_date_policy:
+  strict_visible_date: "announcement_date"
+  report_period_is_not_visible_date: true
