@@ -18,12 +18,11 @@ table_prefixes:
   ads: "ads_"
 
 defaults:
+  ods:
+    external_table_type: "external"
+    ods_table_prefix: "ods_"
   load_mode: "staging_only"
   skip_loaded: true
-  # deprecated, ODS external table no longer uses native load
-  load_strategy: "table_batch"
-  # deprecated, ODS external table no longer uses native load
-  replace_staging_tables: true
   allow_unconfigured_tables: false
   max_source_uris_per_job: 9000
   retry_failed: false
@@ -34,6 +33,53 @@ defaults:
     autodetect: true
     allow_quoted_newlines: true
     encoding: "UTF-8"
+
+ods_external_tables:
+  fact_equity_kline_1d:
+    destination_table: "ods_fact_equity_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_equity_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_equity_kline_1d/"
+    require_hive_partition_filter: false
+  fact_fund_kline_1d:
+    destination_table: "ods_fact_fund_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_fund_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_fund_kline_1d/"
+    require_hive_partition_filter: false
+  fact_index_kline_1d:
+    destination_table: "ods_fact_index_kline_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_index_kline_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_index_kline_1d/"
+    require_hive_partition_filter: false
+  fact_board_component_1d:
+    destination_table: "ods_fact_board_component_1d"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/fact_board_component_1d/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/fact_board_component_1d/"
+    require_hive_partition_filter: false
+  dim_security:
+    destination_table: "ods_dim_security"
+    source_uris:
+      - "gs://data-aquarium/a-share/standardized_parquet/dim_security/**/*.parquet"
+    source_format: "PARQUET"
+    hive_partitioning:
+      mode: "AUTO"
+      source_uri_prefix: "gs://data-aquarium/a-share/standardized_parquet/dim_security/"
+    require_hive_partition_filter: false
 
 tables:
   fact_equity_kline_1d:

@@ -252,7 +252,7 @@ context.order(code, target_qty - current_qty)
 
 - GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`。
 - BigQuery ods 层已装载：`ashare.ods_*`，36 张表均已装载且有行数。
-- Load manifest 已同步：`ashare.ods_gcs_load_manifest`。
+- ODS external manifest 同步目标为：`ashare.ods_external_manifest`。
 - `ashare.dwd_*` 标准字段表仍待后续 PRD 生成和验收。
 
 因此，`BigQueryDataSource` 是当前默认数据源实现，但它依赖的 `ashare.dwd_*` 标准表必须完成字段映射、类型转换和审计后，才能作为回测的真实生产数据源使用。
@@ -262,7 +262,7 @@ context.order(code, target_qty - current_qty)
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入。
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
-- GCS 到 BigQuery 的装载由 `gcs_to_bigquery/pipeline.py` 负责，当前仅保证 `ashare.ods_*` staging 层可审计可重跑，不保证 `ashare.dwd_*` 已可直接回测。
+- GCS 到 BigQuery 的 ODS 接入由 `gcs_to_bigquery/pipeline.py` 负责，当前保证 `ashare.ods_*` external table 可审计可重跑，不把 ODS 业务表复制成 BigQuery native 表；`ashare.dwd_*` 仍待生成后才能直接回测。
 - `gcs_to_bigquery` 默认使用 Google Application Default Credentials；`auth.use_gcloud_access_token` 仅作为 fallback，且 gcloud token 支持超时与刷新。
 - `gcs_to_bigquery` 本地 manifest 默认写入 `${HOME}/.local/state/ashare/ods_pipeline_manifest.jsonl`，不再写入 `/tmp`。
 
@@ -305,7 +305,7 @@ context.order(code, target_qty - current_qty)
 
 1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ`，**无需像 MaxCompute 那样做 shXXXXXX 双向映射**。
 2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `partition_month` 列表（`_partition_months_in_range()`），SQL 中以 `partition_month IN (202001, 202002, ...)` 触发分区裁剪。**不裁剪则全表扫描，查询成本显著增加。**
-3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。若 staging 源字段暂未提供复权口径，core 转换不得伪造 qfq/hfq；第一版只能安全生成 `none` 或明确来源可验证的复权类型。
+3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。若 ODS 贴源字段暂未提供复权口径，DWD 转换不得伪造 qfq/hfq；第一版只能安全生成 `none` 或明确来源可验证的复权类型。
 4. **资产类型自动路由**：`BigQueryDataSource._resolve_kline_table()` 根据代码前缀自动判断：
    - ETF/LOF（51/56/58/11.SH, 15/16.SZ）→ `fact_fund_kline_1d`
    - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
@@ -512,7 +512,7 @@ handle_data → Context.limit_order / stop_order
 
 | 层级 | 前缀 | 职责 |
 |------|------|------|
-| ODS | `ods_` | 贴源层，保留 GCS Parquet 原始 schema 和中文字段 |
+| ODS | `ods_` | 贴源 external table，保留 GCS Parquet 原始 schema 和中文字段，不重复存储业务数据 |
 | DWD | `dwd_` | 标准字段层，英文字段名、严格类型、主键去重、分区聚簇 |
 | DWS | `dws_` | 汇总层（后续特征工程） |
 | ADS | `ads_` | 应用层（后续信号、组合） |
@@ -590,8 +590,8 @@ handle_data → Context.limit_order / stop_order
 | `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/` |
-| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery staging 的装载管道；支持 ADC 默认认证、持久 manifest、table batch load、staging audit、manifest 同步 |
-| `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery 装载配置，定义 project、bucket、datasets、load 策略和表配置 |
+| `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery ODS external table 与 DWD 映射辅助管道；支持 ADC 默认认证、持久 manifest、ODS external 创建/审计、manifest 同步 |
+| `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery 配置，定义 project、bucket、单 dataset、ODS external table、字段映射和表配置 |
 | `scripts/legacy/` | 工具 | 历史 GCE VM 恢复脚本归档，包含硬编码 `/mnt/localssd/...` 路径，不属于新装载流程 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |

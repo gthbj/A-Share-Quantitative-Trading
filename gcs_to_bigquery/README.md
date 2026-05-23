@@ -8,12 +8,12 @@ gs://data-aquarium/a-share/standardized_parquet/
 
 into BigQuery dataset `ashare` with layer prefixes:
 
-- `ods_*` — 原始层（staging / 外部表）
-- `dwd_*` — 明细层（core 事实表与维表）
+- `ods_*` — 原始层（external table）
+- `dwd_*` — 明细层（native 事实表与维表）
 - `dws_*` — 汇总层（待后续 PRD 启用）
 - `ads_*` — 应用层（待后续 PRD 启用）
 
-The pipeline defaults to `staging_only` so GCS objects land in `ashare.ods_*` tables before any merge into dwd tables is enabled. Parquet files are loaded in table batches, and BigQuery Hive partitioning reads `partition_month=YYYYMM` from the GCS path into a `partition_month` column.
+ODS uses BigQuery external tables over the existing GCS Parquet files. The pipeline does not create native BigQuery copies for ODS business tables; only manifest and error control tables are native. DWD tables are native and are produced by later transform steps.
 
 ## Setup
 
@@ -36,10 +36,10 @@ The default local manifest is persisted at `${HOME}/.local/state/ashare/ods_pipe
 
 ## Commands
 
-Create datasets and control tables:
+Create the dataset and ODS native control tables:
 
 ```bash
-python gcs_to_bigquery/pipeline.py init --config gcs_to_bigquery/config.yaml
+python gcs_to_bigquery/pipeline.py init-ods --config gcs_to_bigquery/config.yaml
 ```
 
 Build a local GCS load manifest:
@@ -48,19 +48,25 @@ Build a local GCS load manifest:
 python gcs_to_bigquery/pipeline.py manifest --config gcs_to_bigquery/config.yaml
 ```
 
-Preview load work:
+Create or update ODS external tables:
+
+```bash
+python gcs_to_bigquery/pipeline.py create-ods-external --config gcs_to_bigquery/config.yaml
+```
+
+Audit ODS external tables:
+
+```bash
+python gcs_to_bigquery/pipeline.py audit-ods --config gcs_to_bigquery/config.yaml
+```
+
+Preview legacy load work. This command is deprecated for the ODS external-table flow and is kept only as a historical compatibility entry.
 
 ```bash
 python gcs_to_bigquery/pipeline.py load --config gcs_to_bigquery/config.yaml --dry-run
 ```
 
-Load pending objects into staging tables. This command is deprecated for the ODS external-table flow and is kept only as a historical compatibility entry until `create-ods-external` is implemented.
-
-```bash
-python gcs_to_bigquery/pipeline.py load --config gcs_to_bigquery/config.yaml
-```
-
-Merge one staging table into core after its schema and primary key are confirmed:
+Merge one ODS table into DWD after its schema and primary key are confirmed. This command is also deprecated in favor of explicit DWD transform commands.
 
 ```bash
 python gcs_to_bigquery/pipeline.py merge --config gcs_to_bigquery/config.yaml --table fact_equity_kline_1d
@@ -72,13 +78,13 @@ Show local manifest progress:
 python gcs_to_bigquery/pipeline.py progress --config gcs_to_bigquery/config.yaml
 ```
 
-Sync the local manifest into the BigQuery control table:
+Sync the local manifest into the ODS external manifest control table:
 
 ```bash
 python gcs_to_bigquery/pipeline.py sync-manifest --config gcs_to_bigquery/config.yaml
 ```
 
-Verify all loaded staging tables exist and contain rows:
+Legacy staging audit, retained only for old native-load runs:
 
 ```bash
 python gcs_to_bigquery/pipeline.py audit-staging --config gcs_to_bigquery/config.yaml

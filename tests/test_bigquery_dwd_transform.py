@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 import pytest
 import yaml
@@ -123,6 +125,13 @@ class TestResolveSourceColumn:
 
 
 class TestGetCodeColumnConfig:
+    def test_repository_config_has_field_mappings(self):
+        config_path = Path(__file__).resolve().parent.parent / "gcs_to_bigquery" / "config.yaml"
+        repo_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert repo_config["field_mappings"]["per_table"]["fact_equity_kline_1d"]["code_column"] == "equity_code"
+        assert repo_config["field_mappings"]["per_table"]["dim_security"]["code_column"] == "security_code"
+
     def test_equity_table(self, config):
         result = get_code_column_config(config, "fact_equity_kline_1d")
         assert result["code_column"] == "equity_code"
@@ -161,6 +170,8 @@ class TestApplyFieldMappings:
         result = apply_field_mappings(config, "fact_board_component_1d", df)
         assert "board_code" in result.columns
         assert "equity_code" in result.columns
+        assert list(result["board_code"]) == ["000001"]
+        assert list(result["equity_code"]) == ["000002.SZ"]
 
     def test_bj_code_normalized(self, config):
         df = pd.DataFrame({"security_code": ["430139", "830799"], "open": [1.0, 2.0]})
