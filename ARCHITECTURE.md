@@ -504,6 +504,52 @@ handle_data → Context.limit_order / stop_order
 
 **实现**：`_fetch_etf_15min_bars()` — code 参数直接透传至 SQL，返回时亦原样保留。
 
+### 4.16 BigQuery 数据分层与字段映射（PRD_20260523_06/09）
+
+**数据分层架构**（单 dataset `ashare` + 表名前缀）：
+
+| 层级 | 前缀 | 职责 |
+|------|------|------|
+| ODS | `ods_` | 贴源层，保留 GCS Parquet 原始 schema 和中文字段 |
+| DWD | `dwd_` | 标准字段层，英文字段名、严格类型、主键去重、分区聚簇 |
+| DWS | `dws_` | 汇总层（后续特征工程） |
+| ADS | `ads_` | 应用层（后续信号、组合） |
+
+**字段映射配置**（`gcs_to_bigquery/config.yaml`）：
+
+- `field_mappings.common`：通用中英字段候选映射（如 `股票代码 → equity_code`）
+- `field_mappings.per_table.<table>.code_column`：DWD 目标代码字段
+- `field_mappings.per_table.<table>.source_candidates`：ODS 可能存在的源字段候选列表
+- `financial_date_policy.strict_visible_date`：财务表可见日期来源（`announcement_date`）
+- `financial_date_policy.report_period_is_not_visible_date`：禁止用 `report_period` 作为可见日期
+
+**资产代码字段命名规则**：
+
+| 表类型 | DWD 字段 | 说明 |
+|--------|----------|------|
+| 股票事实表 | `equity_code` | `fact_equity_kline_1d`, `fact_adjust_factor`, `fact_limit_price_1d`, `fact_suspend_1d`, `fact_st_status_1d` |
+| 基金事实表 | `fund_code` | `fact_fund_kline_1d` |
+| 指数事实表 | `index_code` | `fact_index_kline_1d` |
+| 板块事实表 | `board_code` | `fact_board_kline_1d` |
+| 板块成分表 | `board_code` + `equity_code` | `fact_board_component_1d` |
+| 多资产维表 | `security_code` | `dim_security`（多资产统称，不改为 `equity_code`） |
+
+**北交所代码规范化**（`normalize_security_code`）：
+
+| 输入模式 | 输出 | 说明 |
+|----------|------|------|
+| `430xxx` / `83xxxx` / `87xxxx` / `88xxxx` / `920xxx` | `XXXXXX.BJ` | 北交所 |
+| `5xxxxx` / `6xxxxx` / `9xxxxx`（非 92） | `XXXXXX.SH` | 沪市 |
+| 其他 6 位数字 | `XXXXXX.SZ` | 深市 |
+| `SH/SZ/BJ` + 6 位 | `XXXXXX.EX` | 交易所前缀格式 |
+
+**DWD 转换辅助函数**（`gcs_to_bigquery/pipeline.py`）：
+
+- `normalize_security_code(value)`：代码规范化，含北交所规则
+- `resolve_source_column(available, candidates)`：从候选列表选择存在的源字段
+- `apply_field_mappings(config, target_table, df)`：应用字段映射到 DataFrame
+- `validate_financial_date_policy(config, df, target_table)`：校验财务日期策略
+
 ---
 
 ## 5. 扩展指南
