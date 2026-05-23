@@ -117,16 +117,20 @@ def storage_client(config: dict):
     return storage.Client(**kwargs)
 
 
-def dataset_id(config: dict, key: str) -> str:
-    return f"{config['project_id']}.{config['datasets'][key]}"
+def dataset_id(config: dict) -> str:
+    return f"{config['project_id']}.{config['dataset']}"
 
 
-def table_id(config: dict, dataset_key: str, table_name: str) -> str:
-    return f"{dataset_id(config, dataset_key)}.{table_name}"
+def table_id(config: dict, table_name: str) -> str:
+    return f"{dataset_id(config)}.{table_name}"
 
 
-def staging_table_name(target_table: str) -> str:
-    return f"stg_{target_table}"
+def ods_table_name(target_table: str) -> str:
+    return f"ods_{target_table}"
+
+
+def dwd_table_name(target_table: str) -> str:
+    return f"dwd_{target_table}"
 
 
 def table_is_configured(config: dict, target_table: str) -> bool:
@@ -295,14 +299,13 @@ def init(config: dict) -> None:
     bigquery = require_bigquery()
     client = bq_client(config)
     location = config["location"]
-    for key in ("raw", "core", "mart"):
-        ensure_dataset(client, dataset_id(config, key), location)
+    ensure_dataset(client, dataset_id(config), location)
 
-    manifest_table = bigquery.Table(table_id(config, "raw", "gcs_load_manifest"), schema=control_manifest_schema())
+    manifest_table = bigquery.Table(table_id(config, "ods_gcs_load_manifest"), schema=control_manifest_schema())
     manifest_table.time_partitioning = bigquery.TimePartitioning(field="started_at")
     ensure_table(client, manifest_table)
 
-    errors_table = bigquery.Table(table_id(config, "raw", "gcs_load_errors"), schema=control_errors_schema())
+    errors_table = bigquery.Table(table_id(config, "ods_gcs_load_errors"), schema=control_errors_schema())
     errors_table.time_partitioning = bigquery.TimePartitioning(field="occurred_at")
     ensure_table(client, errors_table)
 
@@ -343,7 +346,7 @@ def load_job_config(config: dict, record: LoadRecord, write_disposition: str | N
 
 def load_to_staging(config: dict, client, record: LoadRecord) -> LoadRecord:
     started_at = utc_now()
-    destination = table_id(config, "raw", staging_table_name(record.target_table))
+    destination = table_id(config, ods_table_name(record.target_table))
     job = client.load_table_from_uri(record.gcs_uri, destination, job_config=load_job_config(config, record))
     job.result()
     return LoadRecord(
@@ -365,7 +368,7 @@ def chunked(values: Sequence[LoadRecord], size: int) -> Iterable[list[LoadRecord
 
 def load_table_batch(config: dict, client, target_table: str, records: list[LoadRecord]) -> list[LoadRecord]:
     bigquery = require_bigquery()
-    destination = table_id(config, "raw", staging_table_name(target_table))
+    destination = table_id(config, ods_table_name(target_table))
     max_source_uris = int(config.get("defaults", {}).get("max_source_uris_per_job", 9000))
     replace_staging = bool(config.get("defaults", {}).get("replace_staging_tables", True))
     loaded: list[LoadRecord] = []
@@ -423,7 +426,7 @@ def load(config: dict, dry_run: bool) -> None:
     if dry_run:
         summarize(pending)
         for record in pending[:20]:
-            print(f"{record.gcs_uri} -> ashare_raw.{staging_table_name(record.target_table)}")
+            print(f"{record.gcs_uri} -> {config['dataset']}.{ods_table_name(record.target_table)}")
         if len(pending) > 20:
             print(f"... {len(pending) - 20} more")
         return
@@ -513,8 +516,8 @@ def merge_table(config: dict, target_table: str) -> None:
         raise ValueError(f"Table has no primary_key configured: {target_table}")
 
     client = bq_client(config)
-    staging_id = table_id(config, "raw", staging_table_name(target_table))
-    core_id = table_id(config, "core", target_table)
+    staging_id = table_id(config, ods_table_name(target_table))
+    core_id = table_id(config, dwd_table_name(target_table))
     staging = require_table(client, staging_id)
     core = require_table(client, core_id)
     staging_fields = set(field_names(staging.schema))
@@ -561,7 +564,7 @@ def sync_manifest(config: dict) -> None:
     if not records:
         raise RuntimeError("Manifest is empty. Run manifest or load first.")
     client = bq_client(config)
-    destination = table_id(config, "raw", "gcs_load_manifest")
+    destination = table_id(config, "ods_gcs_load_manifest")
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         schema=control_manifest_schema(),
@@ -584,7 +587,7 @@ def audit_staging(config: dict) -> None:
     missing: list[str] = []
     zero_rows: list[str] = []
     for target_table in loaded_tables:
-        destination = table_id(config, "raw", staging_table_name(target_table))
+        destination = table_id(config, ods_table_name(target_table))
         try:
             table = client.get_table(destination)
         except Exception as exc:
