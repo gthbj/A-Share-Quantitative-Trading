@@ -24,6 +24,9 @@
 from __future__ import annotations
 
 import time
+import os
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -41,6 +44,38 @@ _FUND_PREFIXES_SZ = ("15", "16")
 
 # 指数代码前缀（用于路由到 fact_index_kline_1d）
 _INDEX_PREFIXES = ("000", "399", "930", "950", "932")
+
+
+def _use_gcloud_access_token() -> bool:
+    return os.environ.get("ASHARE_USE_GCLOUD_ACCESS_TOKEN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _gcloud_credentials():
+    from google.auth.credentials import Credentials
+
+    class GcloudAccessTokenCredentials(Credentials):
+        def refresh(self, request) -> None:
+            result = subprocess.run(
+                ["gcloud", "auth", "print-access-token", "--quiet"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            token = result.stdout.strip()
+            if not token:
+                raise RuntimeError("gcloud did not return an access token")
+            self.token = token
+            self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=50)
+
+    credentials = GcloudAccessTokenCredentials()
+    credentials.refresh(None)
+    return credentials
 
 
 class BigQueryDataSource(BaseDataSource):
@@ -107,6 +142,8 @@ class BigQueryDataSource(BaseDataSource):
                     self.credentials_path
                 )
                 kwargs["credentials"] = credentials
+            elif _use_gcloud_access_token():
+                kwargs["credentials"] = _gcloud_credentials()
             self._client = bigquery.Client(**kwargs)
             logger.info(
                 f"BigQuery 连接已建立: project={self.project_id}, "
@@ -224,12 +261,12 @@ class BigQueryDataSource(BaseDataSource):
                 return "kline_1d_index", "index_code", "index"
             if self._is_fund_code(code):
                 return "kline_1d_fund", "fund_code", "fund"
-            return "kline_1d_equity", "security_code", "equity"
+            return "kline_1d_equity", "equity_code", "equity"
 
         if period in ("1min", "5min", "15min", "30min", "60min"):
             # 分钟级暂时统一用 equity 前缀，未来可按资产类型拆分
             key = f"kline_{period}_equity"
-            return key, "security_code", "equity"
+            return key, "equity_code", "equity"
 
         raise ValueError(f"不支持的 period: {period}")
 
@@ -319,9 +356,10 @@ class BigQueryDataSource(BaseDataSource):
         返回列：[code, name, list_date, industry]
         其中 industry 字段当前为空字符串（dim_security 未提供该字段）。
         """
-        cached = self.storage.load_stock_list()
-        if not cached.empty:
-            return cached
+        if self.use_cache:
+            cached = self.storage.load_stock_list()
+            if not cached.empty:
+                return cached
 
         table = self._require_table("dim_security")
         sql = (
@@ -362,7 +400,7 @@ class BigQueryDataSource(BaseDataSource):
         table = self._require_table("board_component")
         # 取该指数最新日期的成分股
         sql = (
-            f"SELECT security_code\n"
+            f"SELECT equity_code\n"
             f"FROM `{self.project_id}.{self.dataset}.{table}`\n"
             f"WHERE board_code = '{index_code}'\n"
             f"  AND date = (\n"
@@ -370,7 +408,7 @@ class BigQueryDataSource(BaseDataSource):
             f"    FROM `{self.project_id}.{self.dataset}.{table}`\n"
             f"    WHERE board_code = '{index_code}'\n"
             f"  )\n"
-            f"ORDER BY security_code"
+            f"ORDER BY equity_code"
         )
         df = self._execute_sql(sql)
         if df.empty:
@@ -378,7 +416,7 @@ class BigQueryDataSource(BaseDataSource):
                 f"get_index_constituents: BigQuery 返回空结果（index_code={index_code}）"
             )
             return []
-        return df["security_code"].astype(str).tolist()
+        return df["equity_code"].astype(str).tolist()
 
     # ------------------------------------------------------------------ #
     # SQL 拼接与执行

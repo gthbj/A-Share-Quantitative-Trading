@@ -188,7 +188,12 @@ class TestApplyFieldMappings:
         df = pd.DataFrame({"指数代码": ["000001", "399001"], "open": [1.0, 2.0]})
         result = apply_field_mappings(config, "fact_index_kline_1d", df)
         assert "index_code" in result.columns
-        assert list(result["index_code"]) == ["000001.SZ", "399001.SZ"]
+        assert list(result["index_code"]) == ["000001.SH", "399001.SZ"]
+
+    def test_index_table_rewrites_000_dotted_suffix(self, config):
+        df = pd.DataFrame({"指数代码": ["000300.SZ", "399300.SH"], "open": [1.0, 2.0]})
+        result = apply_field_mappings(config, "fact_index_kline_1d", df)
+        assert list(result["index_code"]) == ["000300.SH", "399300.SZ"]
 
 
 class TestFinancialDatePolicy:

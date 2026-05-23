@@ -21,6 +21,28 @@ defaults:
   ods:
     external_table_type: "external"
     ods_table_prefix: "ods_"
+    auto_discover_tables: true
+  dwd:
+    mode: "full"
+    required_full_coverage: true
+  dws:
+    mode: "full"
+  ads:
+    mode: "full"
+    ml_stock_picker_top_n: 50
+    pair_candidate_universe:
+      - "000001.SZ"
+      - "000002.SZ"
+      - "000333.SZ"
+      - "000568.SZ"
+      - "000651.SZ"
+      - "000725.SZ"
+      - "000858.SZ"
+      - "600000.SH"
+      - "600036.SH"
+      - "600519.SH"
+      - "601318.SH"
+      - "601398.SH"
   load_mode: "staging_only"
   skip_loaded: true
   allow_unconfigured_tables: false
