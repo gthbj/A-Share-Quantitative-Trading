@@ -181,6 +181,12 @@ def main() -> int:
         help="逐日诊断中每日候选股 Top N 数量。",
     )
     parser.add_argument(
+        "--early-stop-excess-vs-hs300",
+        type=float,
+        default=None,
+        help="可选回测熔断阈值：当相对沪深300超额收益小于等于该值时停止，例如 -0.10 表示 -10%。",
+    )
+    parser.add_argument(
         "--universe",
         default="",
         help="回测标的代码（多个用逗号分隔，如 510300.SH,510500.SH）；"
@@ -310,6 +316,7 @@ def main() -> int:
         strategy_kwargs=strategy_kwargs,
         daily_log_enabled=args.daily_diagnostics,
         daily_candidate_top_n=args.daily_candidate_top_n,
+        early_stop_excess_vs_hs300=args.early_stop_excess_vs_hs300,
         comparison_benchmarks={
             "hs300": "000300.SH",
             "sz50": "000016.SH",
@@ -323,6 +330,11 @@ def main() -> int:
     if nav_df.empty:
         print("回测结果为空")
         return 1
+    if engine.early_stop_triggered:
+        print(
+            "回测提前停止: "
+            f"date={engine.early_stop_date}, reason={engine.early_stop_reason}"
+        )
 
     # 提取全部成交流水（先于 metrics，因为 metrics 需要 fills 计算交易统计）
     trade_rows = []

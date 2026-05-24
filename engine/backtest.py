@@ -59,6 +59,7 @@ class BacktestEngine:
         daily_log_enabled: bool = False,
         comparison_benchmarks: Optional[Dict[str, str]] = None,
         daily_candidate_top_n: int = 10,
+        early_stop_excess_vs_hs300: Optional[float] = None,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.data_source = data_source
@@ -75,6 +76,7 @@ class BacktestEngine:
         self.daily_log_enabled = daily_log_enabled
         self.comparison_benchmarks: Dict[str, str] = comparison_benchmarks or {}
         self.daily_candidate_top_n = max(int(daily_candidate_top_n), 0)
+        self.early_stop_excess_vs_hs300 = early_stop_excess_vs_hs300
 
         # 校验止损阈值
         if self.stop_loss_enabled and self.stop_loss_threshold <= 0:
@@ -82,6 +84,10 @@ class BacktestEngine:
 
         self.calendar = TradingCalendar()
         self.records: List[DailyRecord] = []
+        self.early_stop_triggered = False
+        self.early_stop_reason = ""
+        self.early_stop_date = ""
+        self.early_stop_value: Optional[float] = None
         self.benchmark_df: Optional[pd.DataFrame] = None
         self.comparison_benchmark_dfs: Dict[str, pd.DataFrame] = {}
         # 待执行的止损队列：code -> qty，由前一日收盘后检查写入
@@ -234,6 +240,8 @@ class BacktestEngine:
             self.records.append(record)
             if self.daily_log_enabled:
                 self._log_daily_record(record)
+            if self._maybe_stop_after_daily_record(record):
+                break
 
     def _build_daily_record(
         self,
@@ -467,6 +475,34 @@ class BacktestEngine:
         if record.candidate_details:
             for row in record.candidate_details:
                 logger.info("DAY_CANDIDATE " + self._as_kv(row))
+
+    def _maybe_stop_after_daily_record(self, record: DailyRecord) -> bool:
+        """按逐日诊断中的相对沪深300超额收益执行可选回测熔断。"""
+        threshold = self.early_stop_excess_vs_hs300
+        if threshold is None:
+            return False
+        raw_value = record.summary.get("excess_vs_hs300_pct") if record.summary else ""
+        if raw_value == "":
+            return False
+        try:
+            excess = float(raw_value)
+        except (TypeError, ValueError):
+            return False
+        if excess > threshold:
+            return False
+
+        self.early_stop_triggered = True
+        self.early_stop_date = record.date
+        self.early_stop_value = excess
+        self.early_stop_reason = (
+            f"excess_vs_hs300_pct={excess:.6f} <= threshold={threshold:.6f}"
+        )
+        logger.warning(
+            "EARLY_STOP "
+            f"date={record.date} reason=excess_vs_hs300 "
+            f"value={excess:.10g} threshold={threshold:.10g}"
+        )
+        return True
 
     @staticmethod
     def _as_kv(row: Dict[str, Any]) -> str:

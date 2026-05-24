@@ -82,7 +82,7 @@
 | 文件 | 职责 |
 |------|------|
 | `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓；⑤ 维护**挂单池**（`pending_orders`）——LIMIT/STOP 当根 Bar 未触发时入池，由 `sweep_pending` 在后续每根 Bar 继续检查直至成交或过期（PRD_20260520_10）。 |
-| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。预加载行情时会按策略实例的 `lookback_days` 向起始日前扩展 warmup 数据，但回测记录、订单执行和净值曲线仍从用户指定起始日开始。可选逐日诊断模式会在每日收盘后生成 `DAY_SUMMARY` / `DAY_POSITION` / `DAY_CANDIDATE` 结构化日志，并把对应明细写入 `DailyRecord` 供 CSV 输出。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。每根 Bar 开始时调用 `trade_engine.sweep_pending()` 扫描并尝试撮合前期挂单。 |
+| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。预加载行情时会按策略实例的 `lookback_days` 向起始日前扩展 warmup 数据，但回测记录、订单执行和净值曲线仍从用户指定起始日开始。可选逐日诊断模式会在每日收盘后生成 `DAY_SUMMARY` / `DAY_POSITION` / `DAY_CANDIDATE` 结构化日志，并把对应明细写入 `DailyRecord` 供 CSV 输出；可通过 CLI 显式传入相对沪深300超额收益阈值，在触达亏损阈值后输出 `EARLY_STOP` 并停止后续交易日，方便快速定位策略失效区间。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。每根 Bar 开始时调用 `trade_engine.sweep_pending()` 扫描并尝试撮合前期挂单。 |
 | `paper_trader.py` | **虚拟盘**（PRD_20260520_09）。状态持久化到 `data/paper_state.json`（含 portfolio / 策略类与构造参数 / user_data / 待执行订单 / 待止损队列），支持断点续跑。`run_once(date=T)` 完整复用回测策略循环：预加载 `[T - lookback_days, T]` 历史行情 → 用 T 日开盘价撮合上次留存订单（**next_open 语义**，与回测一致）→ 调 `before_trading_start` / `handle_data` / `after_trading_end` → 收盘后止损检查 → 持久化新订单与止损队列。重复运行同一天会被拦截。该类已在 `engine/__init__.py` 中导出。 |
 
 **设计要点**：
@@ -141,6 +141,7 @@ strategy/<name>/
 - 参数优先级（高到低）：**CLI 参数 > preset config > 全局 `config/backtest.yaml` > 内置默认**
 - 输出目录优先级：`--output` > `strategy/<preset>/runs/`（preset 模式）> `output/`（兜底）
 - 回测成功后默认将输出目录完整归档到 `gs://data-aquarium/a-share/backtest_runs/{strategy_key}/{run_label}/`；可用 `--no-gcs-archive` 临时跳过，或用 `--gcs-archive-uri` 覆盖目标前缀。
+- 长区间诊断回测可显式传入 `--early-stop-excess-vs-hs300 -0.10`，当逐日诊断里的相对沪深300超额收益低于 -10% 时提前停止并保留已生成结果；默认不启用。
 
 **设计要点**：
 - 策略与引擎完全解耦：策略只知道 `Context` 接口，不感知回测循环细节。
