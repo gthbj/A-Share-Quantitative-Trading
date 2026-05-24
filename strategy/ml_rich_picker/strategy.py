@@ -62,6 +62,7 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         bq_dataset: str = "ashare",
         bq_location: str = "asia-east2",
         adjust_type: str = "qfq",
+        require_rich_features: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -69,49 +70,78 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         self.bq_dataset = bq_dataset
         self.bq_location = bq_location
         self.adjust_type = adjust_type
+        # ── 强制 rich 模式（默认）──
+        # True（默认）：预加载或推理时 rich features 不可用 → 直接 raise，
+        #              避免悄无声息退回 v1 17 维路径让用户拿到误以为是 v2 的回测结果
+        # False：允许退化（仅用于调试/CI；正式回测不要打开）
+        self.require_rich_features = bool(require_rich_features)
         # 预加载的富特征宽表，indexed by (date, equity_code)
         self._rich_features: Optional[pd.DataFrame] = None
         self._rich_features_index: Optional[pd.MultiIndex] = None
+        # before_trading_start 的"第一次"标记（懒加载）
+        self._rich_preloaded: bool = False
 
     # ──────────────────────────────────────────────────────────────
-    # 初始化：预加载富特征
+    # 初始化：注意 initialize 阶段不能取到 all_bars / engine.end_date
+    # （PRD §10.x 修订：BacktestEngine 是先 initialize 再 _preload_bars
+    # 再 context.all_bars=all_bars。所以预加载推迟到 before_trading_start。）
     # ──────────────────────────────────────────────────────────────
 
     def initialize(self, context: Context) -> None:
-        """父类初始化 + 一次性拉富特征宽表。"""
+        """父类初始化。Rich features 预加载推迟到 before_trading_start。"""
         super().initialize(context)
-        try:
-            self._preload_rich_features(context)
-        except Exception as exc:
-            logger.error(
-                f"预加载 rich features 失败，策略将不可推理: {exc}", exc_info=True
-            )
-            self._rich_features = None
+        # 不在这里调 _preload_rich_features —— 此时 context.all_bars 未注入
+
+    def before_trading_start(self, context: Context, data: Dict[str, pd.Series]) -> None:
+        """在第一个交易日调用一次预加载（懒加载到 all_bars 已就绪）。"""
+        super().before_trading_start(context, data)
+        if not self._rich_preloaded:
+            self._rich_preloaded = True   # 无论成败都置 True，避免每日重试
+            try:
+                self._preload_rich_features(context)
+            except Exception as exc:
+                msg = f"预加载 rich features 失败: {exc}"
+                logger.error(msg, exc_info=True)
+                if self.require_rich_features:
+                    # 严格模式：直接抛错，让回测立即停掉而不是退化跑 v1
+                    raise RuntimeError(
+                        f"{msg}（require_rich_features=True；如确认要降级 v1 行为，"
+                        f"显式设 require_rich_features=False）"
+                    ) from exc
+                # 降级模式：保持 _rich_features=None，handle_data 时退到父类逻辑
+                self._rich_features = None
 
     def _preload_rich_features(self, context: Context) -> None:
         """从 BigQuery 拉取整个回测期 + 60 天 warmup 的 rich features。
 
-        本方法在 initialize 中调用一次，把数据缓存到 self._rich_features，
-        后续 handle_data 直接查表。
+        要求 context.all_bars 已经被 BacktestEngine 注入（即在 before_trading_start
+        及之后），通过 all_bars 推导真实回测起止日。
         """
-        # 估算回测时段
-        # BaseStrategy 没有直接暴露 start/end，但引擎 attach 后会有 all_bars
-        # 简化处理：使用配置里的 backtest 时段（如果有）或从 universe / current_date 推算
-        # 实际上回测时段在 _engine.start_date / end_date，可通过 context.engine 拿到
         from datetime import timedelta as _td
 
-        if hasattr(context, "engine") and context.engine is not None:
-            start_date = getattr(context.engine, "start_date", None)
-            end_date = getattr(context.engine, "end_date", None)
-        else:
-            start_date = None
-            end_date = None
+        # ── 1) 从 all_bars 推导真实回测起止日 ──
+        all_bars = getattr(context, "all_bars", None)
+        start_date: Optional[str] = None
+        end_date: Optional[str] = None
+        if all_bars:
+            dates: List[str] = []
+            for df in all_bars.values():
+                if df is None or df.empty or "date" not in df.columns:
+                    continue
+                dates.append(str(df["date"].iloc[0]))
+                dates.append(str(df["date"].iloc[-1]))
+            if dates:
+                start_date = min(dates)[:8]
+                end_date = max(dates)[:8]
 
-        # 兜底：用 current_date - 1 年到 current_date + 5 年作为最大范围
+        # 兜底（极少触发，主要给单测用）：current_date ± 60 天 ~ 5 年
         if not start_date or not end_date:
             cur = pd.to_datetime(context.current_date[:8])
             start_date = (cur - _td(days=60)).strftime("%Y%m%d")
             end_date = (cur + _td(days=365 * 5)).strftime("%Y%m%d")
+            logger.warning(
+                f"all_bars 未提供日期边界，rich 预加载兜底范围 {start_date}~{end_date}"
+            )
 
         # warmup 60 天供 feature_window
         load_start = (
@@ -173,10 +203,24 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         """对 universe 内每只股票计算 buy/sell prob。
 
         覆盖父类：从 self._rich_features 查表（O(1)），不再逐股 get_price 计算。
+
+        如果 _rich_features 未加载：
+          - require_rich_features=True（默认）：抛错（已在 before_trading_start
+            预加载阶段抛过；这里是双重保险）
+          - require_rich_features=False（显式降级）：退到父类 17/22 维路径，并
+            每次都打 WARNING 强提醒
         """
         if self._rich_features is None or self._rich_features.empty:
+            if self.require_rich_features:
+                # 理论上 before_trading_start 已经 raise；走到这里通常意味
+                # 手动注入或单测路径，明确抛错
+                raise RuntimeError(
+                    f"{context.current_date} rich features 未加载，且 "
+                    f"require_rich_features=True；策略拒绝退化为 v1 行为"
+                )
             logger.warning(
-                f"{context.current_date} rich features 未加载，回退父类逻辑"
+                f"{context.current_date} rich features 未加载 → 退化为父类 17/22 维路径 "
+                f"（require_rich_features=False；这不是真正的 rich 策略结果！）"
             )
             return super()._score_universe(context)
 

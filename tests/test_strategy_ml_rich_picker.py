@@ -143,9 +143,106 @@ def test_strategy_construct_minimal():
     assert strat.bq_project == "data-aquarium"
     assert strat.bq_dataset == "ashare"
     assert strat.bq_location == "asia-east2"
+    # 默认严格 rich 模式
+    assert strat.require_rich_features is True
     # 富特征常量挂在类上
     assert strat.RICH_BUY_FEATURE_COLUMNS == RICH_BUY_FEATURE_COLUMNS
     assert strat.RICH_SELL_FEATURE_COLUMNS == RICH_SELL_FEATURE_COLUMNS
+
+
+def test_strategy_require_rich_features_explicit_false():
+    """显式 False 时允许降级。"""
+    strat = MLRichPickerStrategy(require_rich_features=False)
+    assert strat.require_rich_features is False
+
+
+def test_score_universe_raises_when_rich_features_missing_and_strict():
+    """P2 修复：require_rich_features=True 时 rich 缺失应抛错，不静默退化。"""
+    strat = MLRichPickerStrategy(require_rich_features=True)
+    # 模拟 _rich_features 未加载
+    strat._rich_features = None
+
+    class _FakeCtx:
+        current_date = "20240101"
+
+    with pytest.raises(RuntimeError, match="rich features 未加载"):
+        strat._score_universe(_FakeCtx())
+
+
+def test_score_universe_fallback_when_explicit_off(caplog):
+    """require_rich_features=False 时允许退化，但会打 WARNING。"""
+    strat = MLRichPickerStrategy(require_rich_features=False)
+    strat._rich_features = None
+
+    class _FakeCtx:
+        current_date = "20240101"
+
+    # 父类 _score_universe 会试图调 context.get_price 拉数据；这里只验证 WARNING 路径
+    # 不实际跑成功（吞掉父类抛的 AttributeError 即可）
+    try:
+        strat._score_universe(_FakeCtx())
+    except Exception:
+        pass  # 父类需要 portfolio 等更多 context，单测里跑不通
+
+    # 但 WARNING 必须出现，证明走的是"显式降级"路径
+    assert any(
+        "退化为父类" in r.getMessage() or "退化" in r.getMessage() or "rich features 未加载" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_before_trading_start_lazy_loads_only_once():
+    """P1.1 修复：rich 预加载在 before_trading_start 懒加载，且只触发一次。"""
+    strat = MLRichPickerStrategy(require_rich_features=False)
+    calls = []
+
+    def fake_preload(ctx):
+        calls.append(ctx.current_date)
+
+    strat._preload_rich_features = fake_preload  # type: ignore
+
+    class _FakeCtx:
+        current_date = "20200102"
+    ctx = _FakeCtx()
+
+    # 调三次 before_trading_start，应只触发 1 次 preload
+    strat.before_trading_start(ctx, {})
+    strat.before_trading_start(ctx, {})
+    strat.before_trading_start(ctx, {})
+    assert len(calls) == 1
+    assert strat._rich_preloaded is True
+
+
+def test_preload_failure_raises_when_strict():
+    """P2 修复：严格模式下预加载失败 → before_trading_start 抛 RuntimeError。"""
+    strat = MLRichPickerStrategy(require_rich_features=True)
+
+    def fake_preload(ctx):
+        raise ValueError("BQ unavailable")
+    strat._preload_rich_features = fake_preload  # type: ignore
+
+    class _FakeCtx:
+        current_date = "20200102"
+
+    with pytest.raises(RuntimeError, match="预加载 rich features 失败"):
+        strat.before_trading_start(_FakeCtx(), {})
+
+
+def test_preload_failure_swallowed_when_lenient():
+    """非严格模式：预加载失败不抛错，_rich_features 保持 None。"""
+    strat = MLRichPickerStrategy(require_rich_features=False)
+
+    def fake_preload(ctx):
+        raise ValueError("BQ unavailable")
+    strat._preload_rich_features = fake_preload  # type: ignore
+
+    class _FakeCtx:
+        current_date = "20200102"
+
+    # 不应抛
+    strat.before_trading_start(_FakeCtx(), {})
+    assert strat._rich_features is None
+    assert strat._rich_preloaded is True   # 仍标记完成，避免每日重试
 
 
 def test_strategy_bq_overrides():
@@ -184,6 +281,38 @@ def test_walk_forward_module_importable():
     assert hasattr(walk_forward, "main")
     assert hasattr(walk_forward, "_load_rich_features_from_bq")
     assert hasattr(walk_forward, "_train_one_retrain_point_rich")
+
+
+def test_config_yaml_has_universe_top500():
+    """P1.2 修复：config.yaml 必须设 universe_source=liquidity_top + top_n=500，
+    否则父类默认 static 会回退到 40 只 DEFAULT_UNIVERSE，与训练 universe 错配。"""
+    import yaml
+    from pathlib import Path
+    cfg_path = Path("strategy/ml_rich_picker/config.yaml")
+    if not cfg_path.exists():
+        pytest.skip("当前工作目录无 config.yaml")
+    raw = yaml.safe_load(cfg_path.read_text("utf-8"))
+    params = raw.get("params", {})
+    assert params.get("universe_source") == "liquidity_top", \
+        "config 必须明示 universe_source: liquidity_top"
+    assert params.get("liquidity_top_n") == 500, \
+        f"config liquidity_top_n 应为 500，实际 {params.get('liquidity_top_n')}"
+    assert params.get("liquidity_lookback_days") == 60, \
+        f"config liquidity_lookback_days 应为 60，实际 {params.get('liquidity_lookback_days')}"
+
+
+def test_config_yaml_strict_rich_default():
+    """P2 修复：config.yaml 应默认 require_rich_features=true，
+    避免静默退化为 v1 行为。"""
+    import yaml
+    from pathlib import Path
+    cfg_path = Path("strategy/ml_rich_picker/config.yaml")
+    if not cfg_path.exists():
+        pytest.skip("当前工作目录无 config.yaml")
+    raw = yaml.safe_load(cfg_path.read_text("utf-8"))
+    params = raw.get("params", {})
+    assert params.get("require_rich_features") is True, \
+        "config 必须默认 require_rich_features: true"
 
 
 def test_walk_forward_sql_contains_3_tables():
