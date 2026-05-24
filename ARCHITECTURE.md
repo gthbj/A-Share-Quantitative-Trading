@@ -130,6 +130,7 @@ strategy/<name>/
 | `double_ma` | `strategy.double_ma.DoubleMAStrategy` | 双均线（MA5/MA20）金叉买入、死叉卖出，默认 510300.SH × 15min |
 | `ml_stock_picker` | `strategy.ml_stock_picker.MLStockPickerStrategy` | LightGBM/XGBoost 日线选股，优先读取 BigQuery DWS 技术 + 估值/基本面 + 事件/资金流增强特征；模型缺失时使用确定性 fallback score |
 | `ml_multi_horizon_picker` | `strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy` | 多 Horizon 走步 ML 策略，读取 GCS 月度模型 registry，最多 3~5 只持仓；regime 是风险预算开关：bull 最多 5 只/85% 资金，neutral 最多 3 只/45% 资金，bear 目标 0 只/0% 资金并清掉可卖持仓 |
+| `ml_rich_picker` | `strategy.ml_rich_picker.MLRichPickerStrategy` | **富特征版**（PRD_20260525_03）：在 ml_multi_horizon 基础上把特征从 17 维扩展到 30 维（含 8 维基本面 PE/PB/ROE + 5 维资金流/龙虎榜/涨停连板）；initialize 时一次性预拉特征宽表，handle_data O(1) 查表；模型存储 `gs://.../walk_forward_rich/`，与 v1 完全隔离 |
 | `bqml_signal_picker` | `strategy.bqml_signal_picker.BQMLSignalPickerStrategy` | 直接读取 BigQuery ML ADS 候选信号，动态 universe，按真实撮合引擎执行；默认 10 万资金、最多 5 只持仓、5 个交易日固定持有期 |
 
 **preset 加载机制**：
@@ -672,7 +673,9 @@ handle_data → Context.limit_order / stop_order
 | `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
 | `strategy/ml_stock_picker/` | 实验包 | 单模型 LightGBM 选股（5 日固定调仓 + Top-K，无止损/regime）|
 | `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/13/14/15/16、PRD_20260525_01）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + 6 卖出触发；regime 由沪深300趋势/动量/回撤/波动 + 股票池市场广度共同判定，并直接约束风险预算，默认 bull 最多 5 只/85% 资金、neutral 最多 3 只/45% 资金、bear 0 只/0% 资金且清掉可卖持仓；支持走步重训（walk_forward.py / model_registry.py）、可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）、**Cloud Run 并行训练**（build_registry.py + deploy/cloud_run_walk_forward/），并可在回测 preset 中直接读取 `gs://data-aquarium/models/walk_forward/registry.json`；模型按 `train_end_date < current_date` 生效，月末训练模型从下一交易日开始使用；未显式指定 universe 时按回测首日前近 60 日成交额初始化 Top 500 股票池 |
+| `strategy/ml_rich_picker/` | 实验包 | **富特征 ML 策略**（PRD_20260525_03）：继承 ml_multi_horizon，特征从 17 维扩展到 30 维（+ 8 维基本面 PE/PB/ROE/毛利率 + 5 维资金流 龙虎榜/主力净流入/涨停连板/开盘啦）；3 表 BigQuery JOIN 在 SQL 层完成，LEFT JOIN 缺失喂 NaN 给 LightGBM 原生处理；initialize 预拉宽表 + (date, code) 索引，handle_data O(1) 查表（比 v1 推理快 10-20x）；模型存储 `gs://data-aquarium/models/walk_forward_rich/`，与 v1 完全隔离便于 A/B 对比 |
 | `deploy/cloud_run_walk_forward/` | 部署 | Cloud Run Job 并行走步训练（PRD_20260524_14）：Dockerfile + run.sh + walk_forward_cloud_config.yaml；8 并发 ~15 分钟跑完 5 年走步训练，~HK$1 |
+| `deploy/cloud_run_walk_forward_rich/` | 部署 | Cloud Run Job 富特征走步训练（PRD_20260525_03）：复用 walk_forward 部署套路，独立镜像 `ml-rich-picker`、独立模型 GCS 路径 |
 | `deploy/cloud_run_backtest/` | 部署 | Cloud Run Job 完整回测（PRD_20260524_16）：Dockerfile + cloudbuild.yaml + run.sh；复用 GCS walk-forward registry，在 GCP 上运行 2020-01-02 至 2026-04-30 月度重训真实撮合回测，并归档产物到 GCS |
 | `analytics/metrics.py` | 工具 | 绩效指标（含 FIFO 配对胜率/盈亏比） |
 | `analytics/plotter.py` | 工具 | 可视化（自动探测中文字体） |

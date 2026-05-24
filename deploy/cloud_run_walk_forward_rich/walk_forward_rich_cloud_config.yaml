@@ -1,0 +1,68 @@
+# Walk-Forward Rich Cloud Run Job 配置（PRD_20260525_03）
+#
+# 与本地 strategy/ml_rich_picker/walk_forward_config.yaml 一致，仅 model_root 走 GCS。
+
+logging:
+  level: "INFO"
+
+walk_forward:
+  initial_train_start: "20170101"
+  initial_train_end:   "20191231"
+  final_retrain_date:  "20250331"
+  retrain_freq: "month_end"
+  rolling_window_years: 3
+  model_root: "gs://data-aquarium/models/walk_forward_rich"
+
+trading_permissions:
+  allow_bse: false
+  allow_star_market: false
+  allow_chinext: false
+  allow_hk_stock_connect: false
+  allow_neeq: false
+  allow_risk_warning: false
+  allow_delisting: false
+  allow_margin_trading: false
+  allow_stock_options: false
+  allow_convertible_bonds: false
+  allow_cdr: false
+  allow_unknown_security: false
+
+universe:
+  liquidity_top_n: 500
+  liquidity_lookback_days: 60
+  fixed_codes: []
+
+labels:
+  buy_horizons: [1, 5, 10, 20]
+  buy_top_quantile: 0.30
+  buy_bottom_quantile: 0.30
+  sell_lookforward: 5
+  sell_drawdown_threshold: -0.05
+
+lightgbm:
+  objective: "binary"
+  metric: ["binary_logloss", "auc"]
+  num_leaves: 63
+  learning_rate: 0.05
+  feature_fraction: 0.85
+  bagging_fraction: 0.85
+  bagging_freq: 5
+  min_child_samples: 30
+  num_boost_round: 200
+  early_stopping_rounds: 25
+  random_state: 42
+  verbose: -1
+
+data:
+  source: "bigquery"
+  bigquery:
+    project_id: "data-aquarium"
+    dataset: "ashare"
+    location: "asia-east2"
+    table_daily: "dws_equity_daily_features"
+    table_kline: "dwd_fact_equity_kline_1d"
+    table_dim: "dwd_dim_security"
+  adjust_type: "qfq"
+
+validation:
+  valid_days: 60
