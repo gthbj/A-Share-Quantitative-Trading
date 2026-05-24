@@ -1,0 +1,75 @@
+# Walk-Forward 重训配置（PRD_20260524_06）
+#
+# 用法：
+#   export ASHARE_USE_GCLOUD_ACCESS_TOKEN=1
+#   python -m strategy.ml_multi_horizon_picker.walk_forward \
+#       --config strategy/ml_multi_horizon_picker/walk_forward_config.yaml
+
+logging:
+  level: "INFO"
+
+walk_forward:
+  initial_train_start: "20170101"   # 第一次训练数据起点
+  initial_train_end:   "20191231"   # 第一次重训日（也是回测起点的前一天）
+  final_retrain_date:  "20250331"   # 最后一次重训日
+  retrain_freq: "month_end"         # 当前仅支持月末
+  rolling_window_years: 3           # rolling 3 年窗口
+  model_root: "models/walk_forward"
+
+trading_permissions:
+  allow_bse: false
+  allow_star_market: false
+  allow_chinext: false
+  allow_hk_stock_connect: false
+  allow_neeq: false
+  allow_risk_warning: false
+  allow_delisting: false
+  allow_margin_trading: false
+  allow_stock_options: false
+  allow_convertible_bonds: false
+  allow_cdr: false
+  allow_unknown_security: false
+
+universe:
+  # 不预先指定 universe 列表；从 dws_equity_daily_features 自动发现
+  # 然后用 trading_permissions 过滤
+  liquidity_top_n: 500              # 按近 60 日成交额取 Top N
+  liquidity_lookback_days: 60
+  # 如果想用固定列表覆盖自动发现，设这个：
+  fixed_codes: []                    # 为空 → 走自动发现
+
+labels:
+  buy_horizons: [1, 5, 10, 20]
+  buy_top_quantile: 0.30
+  buy_bottom_quantile: 0.30
+  sell_lookforward: 5
+  sell_drawdown_threshold: -0.05
+
+lightgbm:
+  objective: "binary"
+  metric: ["binary_logloss", "auc"]
+  num_leaves: 63
+  learning_rate: 0.05
+  feature_fraction: 0.85
+  bagging_fraction: 0.85
+  bagging_freq: 5
+  min_child_samples: 30
+  num_boost_round: 200
+  early_stopping_rounds: 25
+  random_state: 42
+  verbose: -1
+
+data:
+  source: "bigquery"
+  bigquery:
+    project_id: "data-aquarium"
+    dataset: "ashare"
+    location: "asia-east2"
+    table_daily: "dws_equity_daily_features"
+    table_kline: "dwd_fact_equity_kline_1d"
+    table_dim: "dwd_dim_security"
+  adjust_type: "qfq"
+
+# 验证集留出：用 retrain_date 前 ~60 天作为 valid（早停防过拟合）
+validation:
+  valid_days: 60

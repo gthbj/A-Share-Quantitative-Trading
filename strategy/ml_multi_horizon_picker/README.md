@@ -36,27 +36,75 @@
 
 ## 使用流程
 
-### 1. 训练模型（可选——未训练时走 deterministic fallback）
+策略有**两种训练模式**：
+
+### A. 单组模型模式（PRD_05，一次训练）
+
+适合：固定测试期、快速迭代。
 
 ```bash
 export ASHARE_USE_GCLOUD_ACCESS_TOKEN=1   # 复用 gcloud token 认证
+
+# 训练（一次性，约 5 分钟）
 python -m strategy.ml_multi_horizon_picker.train \
   --config strategy/ml_multi_horizon_picker/train_config.yaml
+
+# 回测
+python run_backtest.py --preset ml_multi_horizon_picker \
+  --start 20240301 --end 20240930
 ```
 
-输出：`models/ml_multi_horizon/{buy_h1,buy_h5,buy_h10,buy_h20,sell_v1}.pkl` + `metadata.json`
+输出：`models/ml_multi_horizon/{buy_h1,buy_h5,buy_h10,buy_h20,sell_v1}.pkl`
 
-### 2. 回测
+### B. 走步重训模式（PRD_06，定期重训）⭐ 推荐用于长回测
+
+适合：5 年长回测、产品级评估。
 
 ```bash
-python run_backtest.py --preset ml_multi_horizon_picker \
-  --start 20240301 --end 20240930 \
-  --capital 1000000
+export ASHARE_USE_GCLOUD_ACCESS_TOKEN=1
+
+# 一次性预训练所有时点（月底重训，全程约 2-3 小时本地 CPU）
+python -m strategy.ml_multi_horizon_picker.walk_forward \
+  --config strategy/ml_multi_horizon_picker/walk_forward_config.yaml
+
+# 输出：models/walk_forward/{YYYYMMDD}/*.pkl + models/walk_forward/registry.json
+
+# 回测时通过 strategy 参数 model_registry_path 加载注册表，自动按日切换
+python run_backtest.py \
+  --strategy strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy \
+  --start 20200102 --end 20250430
+# （需要在 preset/CLI 里把 model_registry_path 传到策略）
 ```
 
-注意：`feature_window=20`，回测期前 ~20 个交易日因数据不足会自动跳过（normal warmup）。
+### Walk-forward 配置要点
 
-### 3. 只训卖出模型 / 只训买入模型
+`walk_forward_config.yaml` 关键字段：
+
+- `initial_train_end`：第一次重训日（回测起点的前一天）
+- `final_retrain_date`：最后一次重训日
+- `rolling_window_years`：滚动训练窗（默认 3 年）
+- `retrain_freq`：当前仅支持 `month_end`
+- `trading_permissions`：可交易过滤（与 BigQueryDataSource API 同 schema）
+- `universe.liquidity_top_n`：按近 60 日成交额自动选 Top N（默认 500）
+
+### Trading Permissions（可交易过滤）
+
+`tradable.py` 提供与主分支 `BigQueryDataSource.trading_permissions` schema 完全一致的过滤：
+
+| 字段 | 含义 | 默认 |
+|---|---|---|
+| `allow_bse` | 北交所 .BJ / 43/83/87/88/920 | False |
+| `allow_star_market` | 科创板 688/689.SH | False |
+| `allow_chinext` | 创业板 300/301.SZ | False |
+| `allow_risk_warning` | ST / *ST | False（需 dim_security 字段配合）|
+| `allow_delisting` | 退市股 | False（同上）|
+| `allow_convertible_bonds` | 可转债 | False |
+| `allow_hk_stock_connect` | 港股通 .HK | False |
+| `allow_neeq` | 新三板 .NEEQ | False |
+
+策略 `MLMultiHorizonStrategy(..., trading_permissions={...})` 也接受同样的字典。
+
+### 只训卖出模型 / 只训买入模型（单组模式）
 
 ```bash
 python -m strategy.ml_multi_horizon_picker.train --config ... --skip-buy

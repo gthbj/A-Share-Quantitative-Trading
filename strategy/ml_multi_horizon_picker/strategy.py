@@ -32,6 +32,7 @@ from strategy.ml_multi_horizon_picker.features import (
     deterministic_score,
     deterministic_sell_score,
 )
+from strategy.ml_multi_horizon_picker.model_registry import ModelRegistry
 from strategy.ml_multi_horizon_picker.model_storage import (
     BUY_HORIZONS,
     SELL_MODEL_NAME,
@@ -43,6 +44,7 @@ from strategy.ml_multi_horizon_picker.regime import (
     regime_position_multiplier,
     regime_stop_loss,
 )
+from strategy.ml_multi_horizon_picker.tradable import filter_codes
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -76,7 +78,9 @@ class MLMultiHorizonStrategy(BaseStrategy):
     def __init__(
         self,
         model_dir: str = "models/ml_multi_horizon",
+        model_registry_path: Optional[str] = None,    # 走步模式：模型注册表 JSON 路径
         universe: Optional[List[str]] = None,
+        trading_permissions: Optional[Dict[str, bool]] = None,  # 可交易过滤（PRD_20260524_06）
         target_position_count: int = 10,
         min_buy_prob: float = 0.50,
         min_prob_floor: float = 0.30,
@@ -93,7 +97,18 @@ class MLMultiHorizonStrategy(BaseStrategy):
     ) -> None:
         super().__init__()
         self.model_dir = model_dir
+        self.model_registry_path = model_registry_path
+        self.trading_permissions = trading_permissions
         self._init_universe = list(universe) if universe else list(self.DEFAULT_UNIVERSE)
+        # 用 trading_permissions 过滤 universe（PRD_20260524_06）
+        if trading_permissions is not None:
+            filtered = filter_codes(self._init_universe, trading_permissions)
+            if len(filtered) < len(self._init_universe):
+                blocked = set(self._init_universe) - set(filtered)
+                logger.info(
+                    f"trading_permissions 过滤掉 {len(blocked)} 只: {sorted(blocked)[:10]}…"
+                )
+            self._init_universe = filtered
         self.target_position_count = target_position_count
         self.min_buy_prob = min_buy_prob
         self.min_prob_floor = min_prob_floor
@@ -115,6 +130,9 @@ class MLMultiHorizonStrategy(BaseStrategy):
         )
         self._models: Dict[str, Optional[Any]] = {}
         self._position_state: Dict[str, PositionState] = {}
+        # 走步模式专用
+        self._model_registry: Optional[ModelRegistry] = None
+        self._current_model_dir: Optional[str] = None
 
     # ──────────────────────────────────────────────────────────────
     # 初始化
@@ -125,7 +143,19 @@ class MLMultiHorizonStrategy(BaseStrategy):
         self.set_universe(self._init_universe)
         self.set_benchmark(self.BENCHMARK_CODE)
 
+        # ── 走步模式：加载注册表，模型按日动态切换 ──
+        if self.model_registry_path:
+            self._model_registry = ModelRegistry.from_json(self.model_registry_path)
+            logger.info(
+                f"走步模式启用，注册表含 {len(self._model_registry)} 个时点"
+                f"（{self.model_registry_path}）"
+            )
+            # 不在 initialize 时预加载，等 handle_data 第一次按当日切换
+            return
+
+        # ── 传统模式：一次性加载单组模型 ──
         self._models = load_bundle(self.model_dir, horizons=BUY_HORIZONS)
+        self._current_model_dir = self.model_dir
         all_missing = all(v is None for v in self._models.values())
         if all_missing:
             if self.use_deterministic_fallback:
@@ -142,6 +172,19 @@ class MLMultiHorizonStrategy(BaseStrategy):
             f"target_n={self.target_position_count}, model_dir={self.model_dir}"
         )
 
+    def _maybe_switch_model(self, current_date: str) -> bool:
+        """走步模式下检查并切换模型。返回 False 表示当前日无可用模型，调用方应跳过。"""
+        if self._model_registry is None:
+            return True  # 传统模式直接放行
+        target_dir = self._model_registry.find_for_date(current_date)
+        if target_dir is None:
+            return False  # 当前日早于注册表第一个时点
+        if target_dir != self._current_model_dir:
+            self._models = load_bundle(target_dir, horizons=BUY_HORIZONS)
+            self._current_model_dir = target_dir
+            logger.info(f"{current_date} 切换到模型 {target_dir}")
+        return True
+
     # ──────────────────────────────────────────────────────────────
     # 主回调
     # ──────────────────────────────────────────────────────────────
@@ -149,6 +192,13 @@ class MLMultiHorizonStrategy(BaseStrategy):
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
         current_date = context.current_date
         portfolio = context.portfolio
+
+        # 0. 走步模式：按当前日期切换模型（首次进入也走这条）
+        if not self._maybe_switch_model(current_date):
+            logger.warning(
+                f"{current_date} 早于走步注册表起点，无可用模型，跳过"
+            )
+            return
 
         # 1. Regime 检测
         regime = self._detect_regime(context)
