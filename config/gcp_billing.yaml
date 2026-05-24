@@ -1,0 +1,27 @@
+# GCP 账单导出 BigQuery 配置
+#
+# 配套 PRD：PRD/PRD_20260524_04_GCP账单导出至BigQuery成本监控.md
+# 使用前需在 GCP Console 完成 Billing Export 配置，详见
+# analytics/cost/README.md §配置步骤。
+
+project_id: "data-aquarium"
+billing_dataset: "gcp_billing"
+
+# Billing Account ID 形如 "01ABCD-23EFGH-45IJKL"。
+# 在 GCP Console → Billing → 选定账号 → "Account management" 页面顶部可见。
+# 留空时 CLI 会启动失败并提示填写。
+billing_account_id: "010FC8-A9BC70-BF03C9"
+
+# BigQuery 区域。必须与业务 dataset `ashare` 同区域，否则跨区查询触发网络费。
+location: "asia-east2"
+
+# 表名模板。${billing_account_id} 占位符会在加载时被替换，
+# 且 ID 中的 "-" 会被替换为 "_"（BigQuery 表名规则）。
+tables:
+  standard:  "gcp_billing_export_v1_${billing_account_id}"
+  detailed:  "gcp_billing_export_resource_v1_${billing_account_id}"
+  pricing:   "cloud_pricing_export"
+
+defaults:
+  lookback_days: 30
+  currency: "USD"       # GCP 账单原币种；CNY 换算在查询层做，本期不实现
