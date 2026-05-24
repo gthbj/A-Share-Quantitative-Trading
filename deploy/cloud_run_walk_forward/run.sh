@@ -62,15 +62,10 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 else
     echo "[2/5] 提交 Cloud Build 构建镜像（约 3-5 分钟）..."
     gcloud builds submit \
-        --tag "$IMAGE" \
-        --region "$REGION" \
-        --project "$PROJECT_ID" \
-        --config=/dev/stdin <<EOF
-steps:
-  - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', '$IMAGE', '-f', 'deploy/cloud_run_walk_forward/Dockerfile', '.']
-images: ['$IMAGE']
-EOF
+        --config=deploy/cloud_run_walk_forward/cloudbuild.yaml \
+        --substitutions=_IMAGE="$IMAGE" \
+        --region="$REGION" \
+        --project="$PROJECT_ID"
 fi
 
 # ── 3. 创建 / 更新 Cloud Run Job ────────────────────────────────
@@ -85,8 +80,9 @@ gcloud run jobs create "$JOB_NAME" \
     --memory="$TASK_MEMORY" \
     --cpu="$TASK_CPU" \
     --max-retries=1 \
-    --set-env-vars="CLOUD_RUN_TASK_COUNT=$TASK_COUNT" \
     --args="--config-gcs=$CONFIG_GCS_PATH,--skip-registry"
+# 注：CLOUD_RUN_TASK_INDEX / CLOUD_RUN_TASK_COUNT / CLOUD_RUN_TASK_ATTEMPT
+# 由 Cloud Run Job 自动注入，不能手动 --set-env-vars 设置
 
 # ── 4. 执行并等待 ─────────────────────────────────────────────────
 echo "[4/5] 执行 Cloud Run Job（--wait 阻塞到完成）..."
@@ -97,7 +93,14 @@ gcloud run jobs execute "$JOB_NAME" \
 
 # ── 5. 合并 registry ──────────────────────────────────────────────
 echo "[5/5] 扫描 GCS 模型目录，合并 registry.json"
-python -m strategy.ml_multi_horizon_picker.build_registry \
+# Mac 系统 python 命令可能是 python3；用 PYTHON 环境变量允许覆盖
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
+if [ -z "$PYTHON_BIN" ]; then
+    echo "⚠️ 找不到 python/python3。请手动执行："
+    echo "  python -m strategy.ml_multi_horizon_picker.build_registry --model-root $MODEL_ROOT"
+    exit 1
+fi
+"$PYTHON_BIN" -m strategy.ml_multi_horizon_picker.build_registry \
     --model-root "$MODEL_ROOT"
 
 echo "✅ 完成！"

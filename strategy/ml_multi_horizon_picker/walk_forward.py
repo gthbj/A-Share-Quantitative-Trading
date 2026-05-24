@@ -315,7 +315,16 @@ def _select_universe_at_date(
         return filter_codes(cfg.fixed_codes, cfg.trading_permissions)
 
     # 候选：features_df 里 as_of_date 当天有数据的所有股票
+    # 如果 as_of_date 是非交易日（如春节假期、月末周末），向前找最近一个有数据的交易日
     snap = features_df[features_df["date"] == as_of_date]
+    if snap.empty:
+        prior = features_df[features_df["date"] <= as_of_date]
+        if not prior.empty:
+            last_trading_day = prior["date"].max()
+            logger.info(
+                f"[{as_of_date}] 非交易日，snap 到最近交易日 {last_trading_day}"
+            )
+            snap = features_df[features_df["date"] == last_trading_day]
     candidates = snap["equity_code"].unique().tolist()
     candidates = filter_codes(candidates, cfg.trading_permissions)
 

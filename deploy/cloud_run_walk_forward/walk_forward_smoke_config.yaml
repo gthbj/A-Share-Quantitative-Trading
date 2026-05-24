@@ -1,0 +1,49 @@
+# 小规模 smoke test 配置（用于验证 Cloud Run 管道）
+logging:
+  level: "INFO"
+
+walk_forward:
+  initial_train_start: "20180101"
+  initial_train_end:   "20191231"
+  final_retrain_date:  "20200430"   # 5 个时点（12/31, 1/31, 2/29, 3/31, 4/30）
+  retrain_freq: "month_end"
+  rolling_window_years: 2
+  model_root: "gs://data-aquarium/models/walk_forward_smoke"
+
+trading_permissions:
+  allow_bse: false
+  allow_star_market: false
+  allow_chinext: false
+
+universe:
+  liquidity_top_n: 50
+  liquidity_lookback_days: 60
+  fixed_codes: []
+
+labels:
+  buy_horizons: [5, 10]
+  buy_top_quantile: 0.35
+  buy_bottom_quantile: 0.35
+  sell_lookforward: 5
+  sell_drawdown_threshold: -0.05
+
+lightgbm:
+  num_boost_round: 50
+  early_stopping_rounds: 10
+  num_leaves: 31
+  random_state: 42
+  verbose: -1
+
+data:
+  source: "bigquery"
+  bigquery:
+    project_id: "data-aquarium"
+    dataset: "ashare"
+    location: "asia-east2"
+    table_daily: "dws_equity_daily_features"
+    table_kline: "dwd_fact_equity_kline_1d"
+    table_dim: "dwd_dim_security"
+  adjust_type: "qfq"
+
+validation:
+  valid_days: 60

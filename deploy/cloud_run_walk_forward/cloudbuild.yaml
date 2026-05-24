@@ -1,0 +1,21 @@
+# Cloud Build 配置：构建 ml-multi-horizon 走步训练镜像
+# 配套 PRD_20260524_14。
+# 镜像 tag 通过 substitution _IMAGE 传入。
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_IMAGE}'
+      - '-f'
+      - 'deploy/cloud_run_walk_forward/Dockerfile'
+      - '.'
+
+images:
+  - '${_IMAGE}'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s

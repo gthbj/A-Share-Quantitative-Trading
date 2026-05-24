@@ -60,12 +60,10 @@ def _scan_local(model_root: str) -> List[Tuple[str, str]]:
     return result
 
 
-def _scan_gcs(model_root: str) -> List[Tuple[str, str]]:
-    """扫描 gs:// 路径，返回 [(YYYYMMDD, gs://.../{date}), ...]。"""
+def _scan_gcs_via_storage_api(model_root: str) -> List[Tuple[str, str]]:
+    """用 google.cloud.storage SDK 扫描（需 ADC）。"""
     from google.cloud import storage  # type: ignore
 
-    if not model_root.startswith("gs://"):
-        raise ValueError(f"非 gs:// 路径: {model_root}")
     parts = model_root[5:].split("/", 1)
     bucket_name = parts[0]
     prefix = parts[1].rstrip("/") + "/" if len(parts) > 1 and parts[1] else ""
@@ -73,26 +71,77 @@ def _scan_gcs(model_root: str) -> List[Tuple[str, str]]:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
 
-    # 用 delimiter='/' 列举"目录"
     iterator = bucket.list_blobs(prefix=prefix, delimiter="/")
-    # 把生成器消费完才能拿 prefixes
     _ = list(iterator)
     prefixes = list(iterator.prefixes)
 
     result: List[Tuple[str, str]] = []
     for full_prefix in sorted(prefixes):
-        # full_prefix 类似 "models/walk_forward/20191231/"
         leaf = full_prefix[len(prefix):].rstrip("/")
         if not _DATE_DIR_RE.match(leaf):
             continue
-        # 验证子目录里至少有一个 .pkl
         sub_blobs = list(bucket.list_blobs(prefix=full_prefix, max_results=10))
-        has_pkl = any(b.name.endswith(".pkl") for b in sub_blobs)
-        if not has_pkl:
+        if not any(b.name.endswith(".pkl") for b in sub_blobs):
             logger.warning(f"跳过 gs://{bucket_name}/{full_prefix}：无 .pkl 文件")
             continue
         result.append((leaf, f"gs://{bucket_name}/{full_prefix.rstrip('/')}"))
     return result
+
+
+def _scan_gcs_via_gsutil(model_root: str) -> List[Tuple[str, str]]:
+    """用 gsutil 子进程扫描（不需要 ADC，依赖 gcloud SDK on PATH）。"""
+    import subprocess
+    root = model_root.rstrip("/")
+    try:
+        out = subprocess.run(
+            ["gsutil", "ls", f"{root}/"],
+            check=True, capture_output=True, text=True, timeout=60,
+        ).stdout
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "gsutil 不在 PATH 且 ADC 不可用。安装 Google Cloud SDK 或运行 "
+            "`gcloud auth application-default login` 配置 ADC。"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"gsutil ls 失败: {exc.stderr}") from exc
+
+    result: List[Tuple[str, str]] = []
+    for line in sorted(out.strip().splitlines()):
+        line = line.strip().rstrip("/")
+        if not line.startswith("gs://"):
+            continue
+        leaf = line.split("/")[-1]
+        if not _DATE_DIR_RE.match(leaf):
+            continue
+        try:
+            sub_out = subprocess.run(
+                ["gsutil", "ls", f"{line}/"],
+                check=True, capture_output=True, text=True, timeout=30,
+            ).stdout
+        except subprocess.CalledProcessError:
+            sub_out = ""
+        if ".pkl" not in sub_out:
+            logger.warning(f"跳过 {line}：无 .pkl 文件")
+            continue
+        result.append((leaf, line))
+    return result
+
+
+def _scan_gcs(model_root: str) -> List[Tuple[str, str]]:
+    """扫描 gs:// 路径，返回 [(YYYYMMDD, gs://.../{date}), ...]。
+
+    优先 google.cloud.storage（需 ADC）；ADC 不可用时降级到 gsutil 子进程
+    （仅需 gcloud SDK 安装，无需配置 ADC）。
+    """
+    if not model_root.startswith("gs://"):
+        raise ValueError(f"非 gs:// 路径: {model_root}")
+    try:
+        return _scan_gcs_via_storage_api(model_root)
+    except Exception as exc:
+        logger.info(
+            f"storage SDK 不可用（{exc.__class__.__name__}: {exc}），降级到 gsutil"
+        )
+        return _scan_gcs_via_gsutil(model_root)
 
 
 def scan_model_root(model_root: str) -> List[Tuple[str, str]]:
@@ -110,6 +159,18 @@ def build_registry_from_disk(model_root: str) -> ModelRegistry:
         for d, path in entries_raw
     ]
     return ModelRegistry(entries=entries, model_root=model_root.rstrip("/"))
+
+
+def _upload_via_gsutil(local_path: str, gcs_path: str) -> None:
+    """用 gsutil cp 把本地文件上传到 gs://，规避 ADC 依赖。"""
+    import subprocess
+    try:
+        subprocess.run(
+            ["gsutil", "-q", "cp", local_path, gcs_path],
+            check=True, capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"gsutil cp 失败: {exc.stderr}") from exc
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -140,7 +201,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     output = args.output or (args.model_root.rstrip("/") + "/registry.json")
-    registry.to_json(output)
+
+    if output.startswith("gs://"):
+        # 走本地写 + gsutil cp 上传，避免依赖 ADC
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            registry.to_json(Path(f.name))  # 这里走本地路径
+            tmp_path = f.name
+        try:
+            _upload_via_gsutil(tmp_path, output)
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    else:
+        registry.to_json(output)
     logger.info(f"registry.json 已写入 {output}")
     return 0
 
