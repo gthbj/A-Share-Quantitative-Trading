@@ -474,8 +474,14 @@ class BigQueryDataSource(BaseDataSource):
         df = df.rename(columns={code_col: "code"})
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
         df = df.dropna(subset=["date"])
-        # BigQuery NUMERIC 列返回 decimal.Decimal，下游 numpy 计算（如 np.log）会失败；
-        # 在此处统一转 float，避免每个策略各自处理。
+        # ── 历史 bug 修复（由 PRD_20260524_05 / commit a5eecdd 引入）──
+        # BigQuery 表中 OHLC 等数值列在 BQ 端为 NUMERIC 类型，
+        # google-cloud-bigquery 反序列化为 Python `decimal.Decimal`。
+        # 而下游所有 numpy / pandas 数值计算（如 np.log、Series.diff、rolling.mean）
+        # 在遇到 Decimal 时会抛 TypeError 或回退到 object dtype，
+        # 导致任何 BQ-backed 的日频回测 / ML 策略都跑不通。
+        # 统一在数据源出口把这几列强转 float，避免每个策略各自处理。
+        # 关联：strategy/ml_multi_horizon_picker/, strategy/ml_stock_picker/ 同样受益。
         for col in ("open", "high", "low", "close", "volume", "amount"):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
