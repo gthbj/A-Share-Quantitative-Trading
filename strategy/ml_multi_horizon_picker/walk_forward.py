@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -95,8 +97,50 @@ class WalkForwardConfig:
     valid_days: int
 
 
+def _read_text_local_or_gcs(path: str | Path) -> str:
+    """读取本地或 GCS 路径的文本内容。"""
+    p = str(path)
+    if p.startswith("gs://"):
+        from google.cloud import storage  # type: ignore
+        # gs://bucket/blob
+        parts = p[5:].split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else ""
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_name)
+        return blob.download_as_text()
+    return Path(p).read_text(encoding="utf-8")
+
+
+def _write_text_local_or_gcs(path: str | Path, content: str) -> None:
+    """写入本地或 GCS 路径。"""
+    p = str(path)
+    if p.startswith("gs://"):
+        from google.cloud import storage  # type: ignore
+        parts = p[5:].split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else ""
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_name)
+        blob.upload_from_string(content, content_type="application/json")
+    else:
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(p).write_text(content, encoding="utf-8")
+
+
+def _is_gcs_path(path: str | Path) -> bool:
+    return str(path).startswith("gs://")
+
+
+def _join_path(root: str, *parts: str) -> str:
+    """对本地路径和 gs:// 路径都正确的 join。"""
+    if root.startswith("gs://"):
+        return root.rstrip("/") + "/" + "/".join(parts)
+    return str(Path(root).joinpath(*parts))
+
+
 def load_walk_forward_config(path: str | Path) -> WalkForwardConfig:
-    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    raw = yaml.safe_load(_read_text_local_or_gcs(path))
     wf = raw["walk_forward"]
     perms = merge_permissions(raw.get("trading_permissions", {}))
     univ = raw.get("universe", {})
@@ -442,9 +486,31 @@ def _train_one_retrain_point(
 # 主入口
 # ──────────────────────────────────────────────────────────────────────
 
+def shard_retrain_dates(
+    retrain_dates: List[str],
+    task_index: Optional[int],
+    task_count: Optional[int],
+) -> List[str]:
+    """striding 分片：本任务处理 retrain_dates[task_index::task_count]。
+
+    用 striding 而不是 chunking，因为靠后的 retrain 点训练样本更多（rolling 窗口
+    覆盖更多数据），striding 让每个任务的负载更均匀。
+
+    None 或 0 视为不分片，返回原列表。
+    """
+    if task_index is None or task_count is None or task_count <= 1:
+        return retrain_dates
+    return retrain_dates[task_index::task_count]
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="walk_forward")
-    parser.add_argument("--config", required=True, help="walk_forward_config.yaml 路径")
+    cfg_group = parser.add_mutually_exclusive_group(required=True)
+    cfg_group.add_argument("--config", help="本地 walk_forward_config.yaml 路径")
+    cfg_group.add_argument(
+        "--config-gcs",
+        help="GCS 上的 config 路径（gs://...），适合 Cloud Run Job 场景",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -456,17 +522,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=0,
         help="只跑前 N 个重训点（调试用，0 表示全部）",
     )
+    parser.add_argument(
+        "--skip-registry",
+        action="store_true",
+        help="不在本地写 registry.json（分片任务推荐开启；最后由 build_registry 统一合并）",
+    )
     args = parser.parse_args(argv)
 
-    cfg = load_walk_forward_config(args.config)
+    config_path = args.config or args.config_gcs
+    cfg = load_walk_forward_config(config_path)
 
-    # 1. 列重训日
-    retrain_dates = list_month_end_dates(
+    # ── 任务分片：从环境变量读取（Cloud Run Job 注入 CLOUD_RUN_TASK_INDEX）──
+    task_index_env = os.environ.get("CLOUD_RUN_TASK_INDEX")
+    task_count_env = os.environ.get("CLOUD_RUN_TASK_COUNT")
+    task_index = int(task_index_env) if task_index_env is not None else None
+    task_count = int(task_count_env) if task_count_env is not None else None
+
+    # 1. 列重训日 + 按需分片
+    all_retrain_dates = list_month_end_dates(
         cfg.initial_train_end, cfg.final_retrain_date
     )
     if args.limit > 0:
-        retrain_dates = retrain_dates[: args.limit]
-    logger.info(f"共 {len(retrain_dates)} 个重训点: {retrain_dates[0]} ~ {retrain_dates[-1]}")
+        all_retrain_dates = all_retrain_dates[: args.limit]
+
+    retrain_dates = shard_retrain_dates(all_retrain_dates, task_index, task_count)
+    if task_index is not None and task_count is not None:
+        logger.info(
+            f"分片模式：CLOUD_RUN_TASK_INDEX={task_index}/{task_count}，"
+            f"本任务处理 {len(retrain_dates)}/{len(all_retrain_dates)} 个时点"
+        )
+    if not retrain_dates:
+        logger.warning("本任务无重训点需要处理，直接退出")
+        return 0
+    logger.info(f"本任务重训点: {retrain_dates[0]} ~ {retrain_dates[-1]} (共 {len(retrain_dates)})")
 
     # 2. 数据范围 = max 训练窗口
     max_train_start = (
@@ -496,8 +584,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(f"sell-side 特征完成，最终 {len(features_df):,} 行")
 
     # 5. 对每个重训点：选 universe + 训模型 + 保存
-    model_root = Path(cfg.model_root)
-    model_root.mkdir(parents=True, exist_ok=True)
+    model_root = cfg.model_root
+    if not _is_gcs_path(model_root):
+        Path(model_root).mkdir(parents=True, exist_ok=True)
     successful_dates: List[str] = []
     all_metadata: Dict[str, Dict[str, Any]] = {}
 
@@ -516,30 +605,50 @@ def main(argv: Optional[List[str]] = None) -> int:
             logger.warning(f"[{retrain_date}] 全部模型训练失败，跳过保存")
             continue
 
-        # 保存
-        target_dir = str(model_root / retrain_date)
+        # 保存（save_bundle 已支持 gs:// 路径）
+        target_dir = _join_path(model_root, retrain_date)
         save_bundle(target_dir, buy_models, sell_model)
-        # 单独写当时点 metadata
-        meta_path = Path(target_dir) / "metadata.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(
-            json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+        # 单独写当时点 metadata（支持 GCS）
+        meta_path = _join_path(target_dir, "metadata.json")
+        _write_text_local_or_gcs(
+            meta_path, json.dumps(meta, indent=2, ensure_ascii=False)
         )
         all_metadata[retrain_date] = meta
         successful_dates.append(retrain_date)
 
-    # 6. 写注册表
-    registry = build_registry(str(model_root), successful_dates)
-    registry_path = model_root / "registry.json"
-    registry.to_json(registry_path)
-    logger.info(
-        f"注册表已写入 {registry_path}，共 {len(successful_dates)}/{len(retrain_dates)} 个成功时点"
-    )
+    # 6. 写注册表（分片任务模式下跳过——由 build_registry 统一合并）
+    is_sharded = task_index is not None and task_count is not None and task_count > 1
+    if args.skip_registry or is_sharded:
+        logger.info("分片任务模式：跳过 registry.json 写入（由 build_registry 合并）")
+    else:
+        registry = build_registry(str(model_root), successful_dates)
+        registry_path = _join_path(model_root, "registry.json")
+        _write_text_local_or_gcs(
+            registry_path,
+            json.dumps(
+                {
+                    "model_root": str(model_root),
+                    "entries": [
+                        {"train_end_date": d, "model_dir": _join_path(model_root, d)}
+                        for d in successful_dates
+                    ],
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        logger.info(
+            f"注册表已写入 {registry_path}，共 {len(successful_dates)}/{len(retrain_dates)} 个成功时点"
+        )
 
-    # 7. 写汇总 metadata
-    summary_path = model_root / "metadata_summary.json"
-    summary_path.write_text(
-        json.dumps(all_metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+    # 7. 写汇总 metadata（分片模式下每个任务写各自的 metadata_summary_{TASK_INDEX}.json）
+    if is_sharded:
+        summary_name = f"metadata_summary_task{task_index}.json"
+    else:
+        summary_name = "metadata_summary.json"
+    summary_path = _join_path(model_root, summary_name)
+    _write_text_local_or_gcs(
+        summary_path, json.dumps(all_metadata, indent=2, ensure_ascii=False)
     )
 
     logger.info("✅ 走步训练完成。")

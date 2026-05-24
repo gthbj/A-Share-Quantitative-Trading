@@ -1,6 +1,6 @@
 """走步重训模型注册表：date → model_dir 映射。
 
-配套 PRD_20260524_13。
+配套 PRD_20260524_13（基础）和 PRD_20260524_14（GCS 支持）。
 
 格式（JSON）::
 
@@ -15,6 +15,8 @@
 
 查询语义：给定 current_date，返回 train_end_date <= current_date 中最大那个对应的
 model_dir。这是防止 lookahead bias 的关键——只能用今天前已经训练完成的模型。
+
+支持本地路径和 ``gs://...`` 路径（PRD_20260524_14 引入）。
 """
 
 from __future__ import annotations
@@ -23,6 +25,36 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+
+def _read_text_local_or_gcs(path) -> str:
+    """读本地或 gs:// 路径文本。"""
+    p = str(path)
+    if p.startswith("gs://"):
+        from google.cloud import storage  # type: ignore
+        parts = p[5:].split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else ""
+        client = storage.Client()
+        return client.bucket(bucket_name).blob(blob_name).download_as_text()
+    return Path(p).read_text(encoding="utf-8")
+
+
+def _write_text_local_or_gcs(path, content: str) -> None:
+    """写本地或 gs:// 路径。"""
+    p = str(path)
+    if p.startswith("gs://"):
+        from google.cloud import storage  # type: ignore
+        parts = p[5:].split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else ""
+        client = storage.Client()
+        client.bucket(bucket_name).blob(blob_name).upload_from_string(
+            content, content_type="application/json"
+        )
+    else:
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(p).write_text(content, encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -47,8 +79,9 @@ class ModelRegistry:
 
     @classmethod
     def from_json(cls, path: str | Path) -> "ModelRegistry":
-        """从 JSON 文件加载。"""
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        """从 JSON 文件加载（支持本地路径或 ``gs://...``）。"""
+        text = _read_text_local_or_gcs(path)
+        data = json.loads(text)
         entries = [
             RegistryEntry(
                 train_end_date=str(e["train_end_date"]),
@@ -59,9 +92,7 @@ class ModelRegistry:
         return cls(entries=entries, model_root=str(data.get("model_root", "")))
 
     def to_json(self, path: str | Path) -> None:
-        """保存到 JSON 文件。"""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
+        """保存到 JSON 文件（支持本地路径或 ``gs://...``）。"""
         data = {
             "model_root": self.model_root,
             "entries": [
@@ -69,8 +100,8 @@ class ModelRegistry:
                 for e in self._entries
             ],
         }
-        p.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        _write_text_local_or_gcs(
+            path, json.dumps(data, indent=2, ensure_ascii=False)
         )
 
     # ── 查询 ───────────────────────────────────────────────────────

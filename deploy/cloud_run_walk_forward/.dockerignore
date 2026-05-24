@@ -1,0 +1,41 @@
+# 不进镜像
+.claude/
+.git/
+.github/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 大数据目录
+data/
+output/
+models/
+logs/
+*.log
+
+# 文档（运行时不需要）
+docs/
+PRD/
+WORK_SUMMARY*.md
+TODO.md
+ARCHITECTURE.md
+README.md
+*.html
+
+# 测试
+tests/
+
+# data_transfer 与 gcs_to_bigquery 太大、本镜像不依赖
+data_transfer/
+gcs_to_bigquery/
+scripts/
+
+# 备份
+*.bak
+*.orig
