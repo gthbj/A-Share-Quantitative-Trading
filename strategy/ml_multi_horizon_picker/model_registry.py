@@ -28,22 +28,47 @@ from typing import List, Optional
 
 
 def _read_text_local_or_gcs(path) -> str:
-    """读本地或 gs:// 路径文本。"""
+    """读本地或 gs:// 路径文本。
+
+    gs:// 优先 google.cloud.storage（需 ADC），失败降级到 gsutil cat
+    （依赖 gcloud SDK，无需 ADC）。
+    """
     p = str(path)
-    if p.startswith("gs://"):
+    if not p.startswith("gs://"):
+        return Path(p).read_text(encoding="utf-8")
+
+    try:
         from google.cloud import storage  # type: ignore
         parts = p[5:].split("/", 1)
         bucket_name = parts[0]
         blob_name = parts[1] if len(parts) > 1 else ""
         client = storage.Client()
         return client.bucket(bucket_name).blob(blob_name).download_as_text()
-    return Path(p).read_text(encoding="utf-8")
+    except Exception:
+        import subprocess
+        try:
+            return subprocess.run(
+                ["gsutil", "cat", p],
+                check=True, capture_output=True, text=True, timeout=60,
+            ).stdout
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"读取 {p} 失败：google.cloud.storage 不可用且 gsutil 不在 PATH"
+            ) from exc
 
 
 def _write_text_local_or_gcs(path, content: str) -> None:
-    """写本地或 gs:// 路径。"""
+    """写本地或 gs:// 路径。
+
+    gs:// 优先 google.cloud.storage，失败降级到 tempfile + gsutil cp。
+    """
     p = str(path)
-    if p.startswith("gs://"):
+    if not p.startswith("gs://"):
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(p).write_text(content, encoding="utf-8")
+        return
+
+    try:
         from google.cloud import storage  # type: ignore
         parts = p[5:].split("/", 1)
         bucket_name = parts[0]
@@ -52,9 +77,23 @@ def _write_text_local_or_gcs(path, content: str) -> None:
         client.bucket(bucket_name).blob(blob_name).upload_from_string(
             content, content_type="application/json"
         )
-    else:
-        Path(p).parent.mkdir(parents=True, exist_ok=True)
-        Path(p).write_text(content, encoding="utf-8")
+    except Exception:
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write(content)
+            tmp_path = f.name
+        try:
+            subprocess.run(
+                ["gsutil", "-q", "cp", tmp_path, p],
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"写入 {p} 失败：google.cloud.storage 不可用且 gsutil 不在 PATH"
+            ) from exc
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)

@@ -210,8 +210,19 @@ def _make_bq_client(cfg: WalkForwardConfig):
     return bigquery.Client(**kwargs)
 
 
-def _load_features_from_bq(cfg: WalkForwardConfig, start_date: str, end_date: str) -> pd.DataFrame:
+def _load_features_from_bq(
+    cfg: WalkForwardConfig,
+    start_date: str,
+    end_date: str,
+    code_filter: Optional[List[str]] = None,
+) -> pd.DataFrame:
     """从 dws_equity_daily_features 拉取宽表数据。
+
+    Args:
+        cfg: 配置
+        start_date / end_date: ``YYYYMMDD``
+        code_filter: 如提供，SQL 层过滤 equity_code IN (...)。**强烈推荐**——
+            否则会拉全市场 ~3500 股的数据进内存，对 Cloud Run 8GiB 任务直接 OOM。
 
     返回字段：equity_code, date, close, high, ma_60, + 17 维 BUY_FEATURE_COLUMNS
     """
@@ -225,26 +236,32 @@ def _load_features_from_bq(cfg: WalkForwardConfig, start_date: str, end_date: st
     select_cols = ", ".join(
         ["equity_code", "date", "close", "high", "ma_60"] + BUY_FEATURE_COLUMNS
     )
+    code_clause = ""
+    params = [
+        bigquery.ScalarQueryParameter("start_date", "STRING",
+                                       f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"),
+        bigquery.ScalarQueryParameter("end_date", "STRING",
+                                       f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"),
+        bigquery.ScalarQueryParameter("adjust", "STRING", cfg.adjust_type),
+    ]
+    if code_filter:
+        code_clause = "AND equity_code IN UNNEST(@codes)"
+        params.append(
+            bigquery.ArrayQueryParameter("codes", "STRING", list(code_filter))
+        )
+
     sql = f"""
         SELECT {select_cols}
         FROM {fq}
         WHERE date BETWEEN DATE(@start_date) AND DATE(@end_date)
           AND adjust_type = @adjust
+          {code_clause}
     """
     client = _make_bq_client(cfg)
-    # date 列在 BQ 端是 DATE 类型，传入需带连字符
-    sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
-    ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("start_date", "STRING", sd),
-            bigquery.ScalarQueryParameter("end_date", "STRING", ed),
-            bigquery.ScalarQueryParameter("adjust", "STRING", cfg.adjust_type),
-        ]
-    )
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
     logger.info(
         f"从 BigQuery 读取 {cfg.bq_table_daily} ({start_date} ~ {end_date}, "
-        f"adjust={cfg.adjust_type})"
+        f"adjust={cfg.adjust_type}, codes={len(code_filter) if code_filter else 'ALL'})"
     )
     df = client.query(sql, job_config=job_config, location=cfg.bq_location).result().to_dataframe()
     logger.info(f"读取完成: {len(df):,} 行 × {len(df.columns)} 列")
@@ -582,13 +599,64 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"trading_permissions: {cfg.trading_permissions}")
         return 0
 
-    # 3. 一次性拉数据
+    # 3a. 先拉 volume（小）算每个重训点的 universe，然后求并集
+    #     这样后续 features SQL 可以加 equity_code IN (...) 过滤
+    #     避免拉全市场 ~3500 股进内存（Cloud Run 8GiB 会 OOM）
     logger.info(f"数据范围: {max_train_start} ~ {data_end}")
-    features_df = _load_features_from_bq(cfg, max_train_start, data_end)
+    logger.info("Phase 1: 拉 volume 数据，预选 universe 并集…")
     volume_df = _load_volume_from_bq(cfg, max_train_start, data_end)
 
+    universe_union: set = set()
+    if cfg.fixed_codes:
+        # 固定 universe 模式
+        from strategy.ml_multi_horizon_picker.tradable import filter_codes as _fc
+        universe_union = set(_fc(cfg.fixed_codes, cfg.trading_permissions))
+    else:
+        # 用 volume_df 单独算每个重训点的 universe，求并集
+        # 这里需要 features_df 风格的"date snapshot"，但只用 equity_code，所以
+        # 用 volume_df + tradable filter 即可
+        from strategy.ml_multi_horizon_picker.tradable import filter_codes as _fc
+        for retrain_date in retrain_dates:
+            # snap 到 ≤ retrain_date 的最近交易日
+            snap = volume_df[volume_df["date"] == retrain_date]
+            if snap.empty:
+                prior = volume_df[volume_df["date"] <= retrain_date]
+                if not prior.empty:
+                    last_day = prior["date"].max()
+                    snap = volume_df[volume_df["date"] == last_day]
+            if snap.empty:
+                continue
+            cands = _fc(snap["equity_code"].unique().tolist(), cfg.trading_permissions)
+            # 近 lookback 天平均成交额
+            lookback_start_d = (
+                pd.to_datetime(retrain_date) - timedelta(days=cfg.liquidity_lookback_days * 2)
+            ).strftime("%Y%m%d")
+            recent = volume_df[
+                (volume_df["date"] >= lookback_start_d)
+                & (volume_df["date"] <= retrain_date)
+                & (volume_df["equity_code"].isin(cands))
+            ]
+            avg_amt = recent.groupby("equity_code")["amount"].mean().sort_values(ascending=False)
+            top_n = avg_amt.head(cfg.liquidity_top_n).index.tolist()
+            universe_union.update(top_n)
+
+    universe_codes = sorted(universe_union)
+    logger.info(
+        f"Phase 1 完成: universe 并集大小 = {len(universe_codes)}（"
+        f"liquidity_top_n={cfg.liquidity_top_n}, 重训点数={len(retrain_dates)}）"
+    )
+    if not universe_codes:
+        logger.error("universe 并集为空，无可训练数据，退出")
+        return 1
+
+    # 3b. 用 universe 过滤拉 features
+    logger.info("Phase 2: 按 universe 过滤拉 features…")
+    features_df = _load_features_from_bq(
+        cfg, max_train_start, data_end, code_filter=universe_codes
+    )
+
     # 4. 算 sell-side 风险特征（一次性算完整段，避免每次重训重算）
-    logger.info("计算 sell-side 5 维风险特征…")
+    logger.info("Phase 3: 计算 sell-side 5 维风险特征…")
     features_df = _enrich_sell_features_grouped(features_df)
     logger.info(f"sell-side 特征完成，最终 {len(features_df):,} 行")
 
