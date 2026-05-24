@@ -650,10 +650,32 @@ handle_data → Context.limit_order / stop_order
 | `utils/calendar.py` | 工具 | A 股交易日历（chinese_calendar 接入） |
 | `utils/code.py` | 工具 | 股票代码归一化与双向映射 |
 | `utils/logger.py` | 工具 | 日志配置 |
-| `tests/` | 测试 | 64 个单元用例 |
+| `analytics/cost/` | 工具 | GCP 账单导出 BigQuery 成本分析（PRD_20260524_04）；CLI `python -m analytics.cost`；SQL 模板独立、仅查询 `gcp_billing` dataset，**不进 BigQueryDataSource 路径** |
+| `config/gcp_billing.yaml` | 配置 | 账单 dataset / 表名模板 / 默认查询参数；`billing_account_id` 可用环境变量 `GCP_BILLING_ACCOUNT_ID` 覆盖 |
+| `tests/` | 测试 | 单元用例（含 `test_cost_queries.py` 10 用例） |
 | `requirements.txt` | 依赖 | 运行依赖 |
 | `requirements-dev.txt` | 依赖 | 开发依赖（pytest） |
 | `pytest.ini` | 配置 | pytest 配置 |
+
+---
+
+## 7. 运维与成本监控
+
+GCP 账单数据通过 Google 官方 **Cloud Billing Export to BigQuery** 流入独立 dataset，与业务数据严格分层：
+
+| Dataset | 区域 | 用途 | 谁可以读 |
+|---|---|---|---|
+| `ashare` | `asia-east2` | ODS / DWD / DWS / ADS 业务数据 | `data_layer.BigQueryDataSource` + `bigquery_pipeline` |
+| `gcp_billing` | `asia-east2` | 账单 standard / detailed / pricing 三张导出表 | 仅 `analytics/cost/` CLI 与 ad-hoc Notebook |
+
+设计原则：
+
+- **运维数据与业务数据隔离**：`BigQueryDataSource` 不读 `gcp_billing`；账单分析不写入业务 dataset
+- **跨区域成本规避**：`gcp_billing` dataset 必须与 `ashare` 同区域（`asia-east2`），否则跨区查询触发出口网络费且 BQ 不允许跨区 JOIN
+- **净成本计算口径**：所有查询模板使用 `SUM(cost) + SUM(UNNEST(credits).amount)`，绝不裸用 `cost`
+- **必须分区过滤**：所有 `gcp_billing` 查询必须带 `WHERE DATE(_PARTITIONTIME) >= ...`，避免全表扫描
+
+详见 [`analytics/cost/README.md`](analytics/cost/README.md) 与 PRD_20260524_04。
 
 ---
 
