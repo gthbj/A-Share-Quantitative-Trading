@@ -667,6 +667,8 @@ handle_data → Context.limit_order / stop_order
 | `strategy/momentum.py` | 单文件 | 月度动量策略示例 |
 | `strategy/multi_factor.py` | 单文件 | 多因子选股策略示例 |
 | `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
+| `strategy/ml_stock_picker/` | 实验包 | 单模型 LightGBM 选股（5 日固定调仓 + Top-K，无止损/regime）|
+| `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/06）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + regime 三态调制 + 6 卖出触发；支持走步重训（walk_forward.py / model_registry.py）和可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）|
 | `analytics/metrics.py` | 工具 | 绩效指标（含 FIFO 配对胜率/盈亏比） |
 | `analytics/plotter.py` | 工具 | 可视化（自动探测中文字体） |
 | `analytics/report.py` | 工具 | HTML 报告（对齐 summary.md） |
