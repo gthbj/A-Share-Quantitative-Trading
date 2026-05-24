@@ -18,7 +18,7 @@ pip install -r requirements-dev.txt
 
 ### 2. 配置 BigQuery 凭据（首次运行必做）
 
-数据源默认使用 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare_core`）。
+数据源默认使用 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`）。
 将凭据放入 `config/secrets.yaml`（已在 .gitignore 中，不会入库）：
 
 ```yaml
@@ -201,7 +201,7 @@ python run_backtest.py --strategy strategy.my_module.MyStrategy --universe 51030
 - **三种订单类型**：MARKET / LIMIT / STOP
 - **撮合规则**：默认 next_open（信号 T → 成交 T+1 开盘），避免 Lookahead Bias
 - **全局止损**：可在 `backtest.yaml` 配置，与策略订单并轨执行
-- **BigQuery 数据源**：默认接入 Google Cloud `data-aquarium` 项目 `ashare_core` dataset，本地 Parquet 缓存
+- **BigQuery 数据源**：默认接入 Google Cloud `data-aquarium` 项目 `ashare` dataset（含 ODS/DWD/DWS/ADS 分层），本地 Parquet 缓存
 - **复权**：日K线表内置 `adjust_type`（none/qfq/hfq），直接查询对应复权数据
 - **绩效指标**：累计/年化收益、最大回撤、夏普/索提诺、Beta/Alpha/IR、胜率、盈亏比（FIFO 配对）
 - **可视化**：累计收益、回撤、月度热力图；自动探测系统中文字体

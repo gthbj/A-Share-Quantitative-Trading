@@ -67,7 +67,7 @@ PRD_20260520_08 实现了板块细分（主板 10%、科创板/创业板 20%、E
 `MultiFactorStrategy` 仅用动量作为 PE/PB/ROE 的代理；指数成分股表 `index_constituent` 未配置；股票列表派生自 5min 表，`list_date / industry` 为空。
 
 **修复方向**  
-- BigQuery 已上线财务表、行业表、指数成分股表（`ashare_core` dataset），待引擎接入
+- BigQuery 已上线财务表、行业表、指数成分股表（`ashare` dataset 内 DWD/DWS 层），待引擎接入
 - `MultiFactorStrategy` 接入真实因子数据
 
 ---
@@ -253,7 +253,7 @@ DataFrame 布尔索引为 O(n) 操作，且在每个交易日/每根 bar、每�
 ### TBD-20: 多因子Alpha策略——分析师预期修正因子缺失
 
 **现象**
-价值/质量/动量/低波/流动性因子全部可由当前 `ashare_core` 财务表和日K线构造，但**分析师预期修正因子**缺失（无一致预期/盈利预测修正数据）。
+价值/质量/动量/低波/流动性因子全部可由当前 `ashare` dataset 财务表和日K线构造，但**分析师预期修正因子**缺失（无一致预期/盈利预测修正数据）。
 
 **修复方向**
 - 接入外部分析师预期数据源（如 Wind、朝阳永续）
