@@ -1,6 +1,6 @@
 # ML Multi-Horizon Picker — 多 Horizon 择时择股策略
 
-基于 4 个 LightGBM 买入模型（1/5/10/20 天 horizon）+ 1 个独立卖出风险模型 + regime 调制的日频策略。配套 PRD：`PRD/PRD_20260524_05_*`。
+基于 4 个 LightGBM 买入模型（1/5/10/20 天 horizon）+ 1 个独立卖出风险模型 + regime 调制的日频策略。配套 PRD：`PRD/PRD_20260524_12_*`。
 
 与 `ml_stock_picker/` 的关键区别：
 
@@ -38,7 +38,7 @@
 
 策略有**两种训练模式**：
 
-### A. 单组模型模式（PRD_05，一次训练）
+### A. 单组模型模式（PRD_12，一次训练）
 
 适合：固定测试期、快速迭代。
 
@@ -56,7 +56,7 @@ python run_backtest.py --preset ml_multi_horizon_picker \
 
 输出：`models/ml_multi_horizon/{buy_h1,buy_h5,buy_h10,buy_h20,sell_v1}.pkl`
 
-### B. 走步重训模式（PRD_06，定期重训）⭐ 推荐用于长回测
+### B. 走步重训模式（PRD_13，定期重训）⭐ 推荐用于长回测
 
 适合：5 年长回测、产品级评估。
 

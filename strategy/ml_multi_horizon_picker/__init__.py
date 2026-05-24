@@ -1,6 +1,7 @@
 """多 Horizon 机器学习择时择股策略。
 
-详见 `PRD/PRD_20260524_05_*` 和本目录 `README.md`。
+详见 `PRD/PRD_20260524_12_*`（核心策略，原 _05）和 `PRD/PRD_20260524_13_*`
+（走步重训 + 可交易过滤，原 _06）以及本目录 `README.md`。
 """
 
 from strategy.ml_multi_horizon_picker.model_registry import ModelRegistry, RegistryEntry, build_registry

@@ -1,4 +1,4 @@
-"""ml_multi_horizon_picker 走步回测相关单元测试（PRD_20260524_06）。
+"""ml_multi_horizon_picker 走步回测相关单元测试（PRD_20260524_13）。
 
 覆盖：
 - tradable：过滤北交所/科创板/创业板/可转债、merge_permissions、classify_board
@@ -194,7 +194,7 @@ def test_strategy_no_filter_when_permissions_none():
 
 
 def test_strategy_traditional_mode_unchanged():
-    """没有 model_registry_path 时走传统模式，行为同 PRD_05。"""
+    """没有 model_registry_path 时走传统模式，行为同 PRD_12。"""
     strat = MLMultiHorizonStrategy(model_dir="some/dir")
     assert strat.model_registry_path is None
     assert strat._model_registry is None

@@ -1,6 +1,6 @@
 """可交易股票过滤 helper。
 
-配套 PRD_20260524_06。
+配套 PRD_20260524_13。
 
 设计原则：
     - schema 与主分支 ``data_layer/bigquery_source.py`` 的 ``trading_permissions``

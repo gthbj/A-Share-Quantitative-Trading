@@ -1,6 +1,6 @@
 """多 Horizon 机器学习择时择股策略。
 
-设计要点（详见 PRD_20260524_05）：
+设计要点（详见 PRD_20260524_12）：
 - 4 个独立 LightGBM 买入模型（horizon 1/5/10/20 天）
 - 1 个独立 LightGBM 卖出风险模型
 - 6 个卖出触发（任一命中即卖）：
@@ -80,7 +80,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
         model_dir: str = "models/ml_multi_horizon",
         model_registry_path: Optional[str] = None,    # 走步模式：模型注册表 JSON 路径
         universe: Optional[List[str]] = None,
-        trading_permissions: Optional[Dict[str, bool]] = None,  # 可交易过滤（PRD_20260524_06）
+        trading_permissions: Optional[Dict[str, bool]] = None,  # 可交易过滤（PRD_20260524_13）
         target_position_count: int = 10,
         min_buy_prob: float = 0.50,
         min_prob_floor: float = 0.30,
@@ -100,7 +100,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
         self.model_registry_path = model_registry_path
         self.trading_permissions = trading_permissions
         self._init_universe = list(universe) if universe else list(self.DEFAULT_UNIVERSE)
-        # 用 trading_permissions 过滤 universe（PRD_20260524_06）
+        # 用 trading_permissions 过滤 universe（PRD_20260524_13）
         if trading_permissions is not None:
             filtered = filter_codes(self._init_universe, trading_permissions)
             if len(filtered) < len(self._init_universe):
