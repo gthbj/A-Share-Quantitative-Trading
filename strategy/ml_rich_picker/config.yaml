@@ -12,11 +12,20 @@ params:
   # 走步模型注册表（训完后路径）
   model_dir: "models/walk_forward_rich"
   model_registry_path: "gs://data-aquarium/models/walk_forward_rich/registry.json"
-  # BigQuery（用于策略 initialize 预加载特征）
+  # BigQuery（用于策略 before_trading_start 懒加载富特征）
   bq_project: "data-aquarium"
   bq_dataset: "ashare"
   bq_location: "asia-east2"
   adjust_type: "qfq"
+  # 严格 rich 模式：预加载失败直接 raise，避免悄无声息退回 v1 17 维路径
+  # 让用户拿到看似 v2 实为 v1 的回测结果（误导）。
+  # 调试场景需降级时显式设 false。
+  require_rich_features: true
+  # 未显式传 universe 时，用回测首日前近 60 日成交额 Top 500 初始化股票池
+  # （与 walk_forward_config.yaml 保持一致，避免训练/推理 universe 错配）。
+  universe_source: "liquidity_top"
+  liquidity_top_n: 500
+  liquidity_lookback_days: 60
   # Trading permissions
   trading_permissions:
     allow_bse: false
