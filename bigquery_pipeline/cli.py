@@ -7,6 +7,12 @@ from .ads import audit_ads, transform_ads
 from .client import DEFAULT_CONFIG_PATH, load_config
 from .dwd import audit_dwd, transform_dwd
 from .dws import audit_dws, transform_dws
+from .fundamental import (
+    audit_equity_fundamental_features,
+    audit_fundamental_inputs,
+    repair_fundamental_inputs,
+    transform_equity_fundamental_features,
+)
 from .financial import (
     audit_equity_valuation_features,
     audit_financial_indicator,
@@ -24,6 +30,10 @@ def main() -> int:
         "audit-financial-indicator",
         "transform-equity-valuation-features",
         "audit-equity-valuation-features",
+        "repair-fundamental-inputs",
+        "audit-fundamental-inputs",
+        "transform-equity-fundamental-features",
+        "audit-equity-fundamental-features",
         "transform-dwd",
         "audit-dwd",
         "transform-dws",
@@ -55,6 +65,18 @@ def main() -> int:
         return 0
     if args.command == "audit-equity-valuation-features":
         audit_equity_valuation_features(config)
+        return 0
+    if args.command == "repair-fundamental-inputs":
+        repair_fundamental_inputs(config)
+        return 0
+    if args.command == "audit-fundamental-inputs":
+        audit_fundamental_inputs(config)
+        return 0
+    if args.command == "transform-equity-fundamental-features":
+        transform_equity_fundamental_features(config)
+        return 0
+    if args.command == "audit-equity-fundamental-features":
+        audit_equity_fundamental_features(config)
         return 0
     if args.command == "transform-dwd":
         transform_dwd(config, target_table=args.table)

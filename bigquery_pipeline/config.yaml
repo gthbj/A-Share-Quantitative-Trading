@@ -22,6 +22,11 @@ financial_indicator:
   parallel_read_workers: 16
   max_files: null
 
+fundamental:
+  batch_files: 400
+  parallel_read_workers: 16
+  max_files: null
+
 defaults:
   ads:
     ml_stock_picker_top_n: 50

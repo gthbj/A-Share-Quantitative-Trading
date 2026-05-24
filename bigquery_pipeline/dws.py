@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from .client import bq_client, dws_table_name, table_id
+from .fundamental import audit_equity_fundamental_features, transform_equity_fundamental_features
 from .financial import audit_equity_valuation_features, transform_equity_valuation_features
 
 
 DWS_TRANSFORMS = {
     "equity_valuation_features": transform_equity_valuation_features,
+    "equity_fundamental_features": transform_equity_fundamental_features,
 }
 
 DWS_AUDITS = {
     "equity_valuation_features": audit_equity_valuation_features,
+    "equity_fundamental_features": audit_equity_fundamental_features,
 }
 
 
@@ -42,4 +45,3 @@ def table_exists(config: dict, target_table: str) -> bool:
         return True
     except Exception:
         return False
-
