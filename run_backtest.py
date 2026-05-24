@@ -20,6 +20,7 @@ from analytics.plotter import Plotter
 from analytics.report import generate_html_report
 from analytics.summary import generate_markdown_summary
 from analytics.gcs_archive import apply_gcs_archive_uri, archive_backtest_output
+from analytics.daily_diagnostics import write_daily_diagnostics
 from data_layer.bigquery_source import BigQueryDataSource
 from engine.backtest import BacktestEngine
 from engine.backtest import DailyRecord
@@ -169,6 +170,17 @@ def main() -> int:
     )
     parser.add_argument("--frequency", default=None, help="回测频率：daily / 1min / 5min / 15min / 30min / 60min")
     parser.add_argument(
+        "--daily-diagnostics",
+        action="store_true",
+        help="启用逐日结构化日志与 daily_log/daily_positions/daily_candidates CSV 输出。",
+    )
+    parser.add_argument(
+        "--daily-candidate-top-n",
+        type=int,
+        default=10,
+        help="逐日诊断中每日候选股 Top N 数量。",
+    )
+    parser.add_argument(
         "--universe",
         default="",
         help="回测标的代码（多个用逗号分隔，如 510300.SH,510500.SH）；"
@@ -296,6 +308,15 @@ def main() -> int:
         stop_loss_enabled=stop_loss_cfg.get("enabled", False),
         stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
         strategy_kwargs=strategy_kwargs,
+        daily_log_enabled=args.daily_diagnostics,
+        daily_candidate_top_n=args.daily_candidate_top_n,
+        comparison_benchmarks={
+            "hs300": "000300.SH",
+            "sz50": "000016.SH",
+            "zz500": "000905.SH",
+            "zz1000": "000852.SH",
+            "chinext": "399006.SZ",
+        },
     )
     nav_df = engine.run()
 
@@ -393,6 +414,10 @@ def main() -> int:
         trades_df.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
 
     nav_df.to_csv(out / "nav.csv", index=True, index_label="date", encoding="utf-8-sig")
+    if args.daily_diagnostics:
+        diag_paths = write_daily_diagnostics(out, engine.records)
+        for name, path in diag_paths.items():
+            print(f"  - {name}: {path}")
 
     benchmark_loaded = (
         engine.benchmark_df is not None and not engine.benchmark_df.empty

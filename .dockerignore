@@ -1,0 +1,40 @@
+.claude/
+.git/
+.github/
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本地数据与产物
+data/
+output/
+models/
+logs/
+strategy/*/runs/
+*.log
+
+# 本地密钥
+config/secrets.yaml
+config/*.json
+*service-account*.json
+
+# 文档和测试不进入运行镜像
+PRD/
+WORK_SUMMARY*.md
+TODO.md
+README.md
+tests/
+
+# 大型/无关工具目录
+data_transfer/
+gcs_to_bigquery/
+scripts/
+
+*.bak
+*.orig

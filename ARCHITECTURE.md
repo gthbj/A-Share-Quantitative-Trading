@@ -50,7 +50,7 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。当前依赖 `ashare.dwd_*` 标准字段表；ODS external table、DWD native table、DWS 特征层与 ADS 信号层均已生成并通过 audit，财务指标 DWD、估值特征和基本面特征已完成专项修复/生成，BigQuery ML baseline 已生成 ADS 候选信号。另提供可选 DWS 股票特征快照/训练集查询 helper、BQML ADS 候选信号读取 helper，以及日线股票批量行情预加载能力，供 ML / BQML 策略使用。数据源会读取 `account.trading_permissions`，默认过滤当前账户无专项权限的北交所、科创板、创业板、ST/退市整理等标的，不改变 `BaseDataSource` 抽象接口。详见 §4.6 / §4.7 / §4.8 / §4.16。 |
+| `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。当前依赖 `ashare.dwd_*` 标准字段表；ODS external table、DWD native table、DWS 特征层与 ADS 信号层均已生成并通过 audit，财务指标 DWD、估值特征和基本面特征已完成专项修复/生成，BigQuery ML baseline 已生成 ADS 候选信号。另提供可选 DWS 股票特征快照/训练集查询 helper、BQML ADS 候选信号读取 helper、日线股票批量行情预加载能力，以及按回测首日前历史成交额选取流动性 Top-N 股票池的 helper，供 ML / BQML 策略使用。数据源会读取 `account.trading_permissions`，默认过滤当前账户无专项权限的北交所、科创板、创业板、ST/退市整理等标的，不改变 `BaseDataSource` 抽象接口。详见 §4.6 / §4.7 / §4.8 / §4.16。 |
 | `maxcompute_source.py` | 阿里云 MaxCompute 数据源实现（保留为备选）。通过 pyodps 连接。历史支持：5min K 线、15min ETF K 线。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引；读取缓存时统一将 `open/high/low/close/volume/amount` 转为数值，避免 BigQuery Decimal 缓存命中后进入撮合计算。 |
@@ -82,7 +82,7 @@
 | 文件 | 职责 |
 |------|------|
 | `trade_engine.py` | **交易撮合引擎**。职责：① 验证订单合法性（资金、T+1、涨跌停、成交量限制）；② 按 `order_type` 路由撮合（MARKET / LIMIT / STOP）；③ 计算并扣除交易费用（佣金、印花税、过户费）；④ 调用 Portfolio 更新持仓；⑤ 维护**挂单池**（`pending_orders`）——LIMIT/STOP 当根 Bar 未触发时入池，由 `sweep_pending` 在后续每根 Bar 继续检查直至成交或过期（PRD_20260520_10）。 |
-| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。每根 Bar 开始时调用 `trade_engine.sweep_pending()` 扫描并尝试撮合前期挂单。 |
+| `backtest.py` | **回测主引擎**。支持日线/分钟线双频回测。按交易日历逐日（daily）或逐 Bar（1min/5min/15min/30min/60min）推进，调用策略生命周期，收集订单并交由 `TradeEngine` 撮合，记录 NAV。预加载行情时会按策略实例的 `lookback_days` 向起始日前扩展 warmup 数据，但回测记录、订单执行和净值曲线仍从用户指定起始日开始。可选逐日诊断模式会在每日收盘后生成 `DAY_SUMMARY` / `DAY_POSITION` / `DAY_CANDIDATE` 结构化日志，并把对应明细写入 `DailyRecord` 供 CSV 输出。分钟级回测中 `before_trading_start` / `after_trading_end` 仍按交易日边界调用。内置**全局止损模块**：策略 `handle_data` 执行完毕后，自动扫描持仓，当浮亏超过阈值时生成 MARKET 卖出单，与策略订单一并交由 `TradeEngine` 执行。止损对策略完全透明，无需修改任何策略代码。每根 Bar 开始时调用 `trade_engine.sweep_pending()` 扫描并尝试撮合前期挂单。 |
 | `paper_trader.py` | **虚拟盘**（PRD_20260520_09）。状态持久化到 `data/paper_state.json`（含 portfolio / 策略类与构造参数 / user_data / 待执行订单 / 待止损队列），支持断点续跑。`run_once(date=T)` 完整复用回测策略循环：预加载 `[T - lookback_days, T]` 历史行情 → 用 T 日开盘价撮合上次留存订单（**next_open 语义**，与回测一致）→ 调 `before_trading_start` / `handle_data` / `after_trading_end` → 收盘后止损检查 → 持久化新订单与止损队列。重复运行同一天会被拦截。该类已在 `engine/__init__.py` 中导出。 |
 
 **设计要点**：
@@ -129,12 +129,14 @@ strategy/<name>/
 |---|---|---|
 | `double_ma` | `strategy.double_ma.DoubleMAStrategy` | 双均线（MA5/MA20）金叉买入、死叉卖出，默认 510300.SH × 15min |
 | `ml_stock_picker` | `strategy.ml_stock_picker.MLStockPickerStrategy` | LightGBM/XGBoost 日线选股，优先读取 BigQuery DWS 技术 + 估值/基本面 + 事件/资金流增强特征；模型缺失时使用确定性 fallback score |
-| `bqml_signal_picker` | `strategy.bqml_signal_picker.BQMLSignalPickerStrategy` | 直接读取 BigQuery ML ADS 候选信号，动态 universe，按真实撮合引擎执行；默认 10 万资金、最多 3 只持仓、5 个交易日固定持有期 |
+| `ml_multi_horizon_picker` | `strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy` | 多 Horizon 走步 ML 策略，读取 GCS 月度模型 registry，最多 3~5 只持仓；regime 是风险预算开关：bull 最多 5 只/85% 资金，neutral 最多 3 只/45% 资金，bear 目标 0 只/0% 资金并清掉可卖持仓 |
+| `bqml_signal_picker` | `strategy.bqml_signal_picker.BQMLSignalPickerStrategy` | 直接读取 BigQuery ML ADS 候选信号，动态 universe，按真实撮合引擎执行；默认 10 万资金、最多 5 只持仓、5 个交易日固定持有期 |
 
 **preset 加载机制**：
 
 - `python run_backtest.py --preset double_ma` → 加载 `strategy/double_ma/config.yaml`
 - `python run_backtest.py --preset ml_stock_picker` → 加载 `strategy/ml_stock_picker/config.yaml`
+- `python run_backtest.py --preset ml_multi_horizon_picker` → 加载 `strategy/ml_multi_horizon_picker/config.yaml`，按 `gs://data-aquarium/models/walk_forward/registry.json` 逐月切换模型
 - `python run_backtest.py --preset bqml_signal_picker` → 从 `ashare.ads_signal_ml_stock_picker_bqml_1d` 读取候选信号并真实撮合回测
 - 参数优先级（高到低）：**CLI 参数 > preset config > 全局 `config/backtest.yaml` > 内置默认**
 - 输出目录优先级：`--output` > `strategy/<preset>/runs/`（preset 模式）> `output/`（兜底）
@@ -157,6 +159,7 @@ strategy/<name>/
 | `report.py` | HTML 报告生成器。**完整对齐 `summary.md` 内容**（PRD_20260520_04）：策略元信息、数据来源、回测参数、交易规则、12 项绩效指标卡片、图表、交易统计、费用汇总、完整交易明细（折叠展示）。 |
 | `summary.py` | Markdown 报告生成器。9 节结构：策略 / 数据 / 参数 / 规则 / 绩效 / 交易统计（含胜率盈亏比）/ 费用 / 交易明细 / 产物清单。基准未加载时显示 "n/a（基准数据未加载）"。 |
 | `gcs_archive.py` | 回测产物 GCS 归档工具。成功回测后递归上传本地输出目录，并生成 `gcs_archive_manifest.json`；支持 ADC 与 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1`。 |
+| `daily_diagnostics.py` | 逐日诊断 CSV 输出工具。写出 `daily_log.csv`、`daily_positions.csv`、`daily_candidates.csv`，每个 CSV 第一行中文表头、第二行英文字段名。 |
 
 ---
 
@@ -663,18 +666,21 @@ handle_data → Context.limit_order / stop_order
 | `strategy/base_strategy.py` | 抽象 | 策略基类与 Context |
 | `strategy/double_ma/` | 实验包 | 双均线策略（strategy.py + config.yaml + README.md + runs/） |
 | `strategy/ml_stock_picker/` | 实验包 | 机器学习选股策略；训练脚本支持 BigQuery DWS 增强特征，回测调仓日优先读取 DWS 快照，模型缺失时使用确定性 fallback score |
-| `strategy/bqml_signal_picker/` | 实验包 | BigQuery ML ADS 信号真实撮合策略；动态读取 ADS 候选池，默认 10 万资金、最多 3 只持仓、5 个交易日持有期 |
+| `strategy/bqml_signal_picker/` | 实验包 | BigQuery ML ADS 信号真实撮合策略；动态读取 ADS 候选池，默认 10 万资金、最多 5 只持仓、5 个交易日持有期 |
 | `strategy/momentum.py` | 单文件 | 月度动量策略示例 |
 | `strategy/multi_factor.py` | 单文件 | 多因子选股策略示例 |
 | `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
 | `strategy/ml_stock_picker/` | 实验包 | 单模型 LightGBM 选股（5 日固定调仓 + Top-K，无止损/regime）|
-| `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/13/14）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + regime 三态调制 + 6 卖出触发；支持走步重训（walk_forward.py / model_registry.py）、可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）、**Cloud Run 并行训练**（build_registry.py + deploy/cloud_run_walk_forward/）|
+| `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/13/14/15/16、PRD_20260525_01）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + 6 卖出触发；regime 由沪深300趋势/动量/回撤/波动 + 股票池市场广度共同判定，并直接约束风险预算，默认 bull 最多 5 只/85% 资金、neutral 最多 3 只/45% 资金、bear 0 只/0% 资金且清掉可卖持仓；支持走步重训（walk_forward.py / model_registry.py）、可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）、**Cloud Run 并行训练**（build_registry.py + deploy/cloud_run_walk_forward/），并可在回测 preset 中直接读取 `gs://data-aquarium/models/walk_forward/registry.json`；模型按 `train_end_date < current_date` 生效，月末训练模型从下一交易日开始使用；未显式指定 universe 时按回测首日前近 60 日成交额初始化 Top 500 股票池 |
 | `deploy/cloud_run_walk_forward/` | 部署 | Cloud Run Job 并行走步训练（PRD_20260524_14）：Dockerfile + run.sh + walk_forward_cloud_config.yaml；8 并发 ~15 分钟跑完 5 年走步训练，~HK$1 |
+| `deploy/cloud_run_backtest/` | 部署 | Cloud Run Job 完整回测（PRD_20260524_16）：Dockerfile + cloudbuild.yaml + run.sh；复用 GCS walk-forward registry，在 GCP 上运行 2020-01-02 至 2026-04-30 月度重训真实撮合回测，并归档产物到 GCS |
 | `analytics/metrics.py` | 工具 | 绩效指标（含 FIFO 配对胜率/盈亏比） |
 | `analytics/plotter.py` | 工具 | 可视化（自动探测中文字体） |
 | `analytics/report.py` | 工具 | HTML 报告（对齐 summary.md） |
 | `analytics/summary.py` | 工具 | Markdown 报告 |
 | `analytics/gcs_archive.py` | 工具 | 回测输出目录上传到 GCS，并生成归档 manifest |
+| `analytics/daily_diagnostics.py` | 工具 | 逐日诊断 CSV 输出（两行表头：中文 + 英文） |
+| `scripts/sync_cloud_run_daily_logs.py` | 工具 | 从 Cloud Run `DAY_*` 日志同步本地 live CSV 到 `/Users/luna/Desktop/output/<run>/`，用于长回测实时观察 |
 | `utils/calendar.py` | 工具 | A 股交易日历（chinese_calendar 接入） |
 | `utils/code.py` | 工具 | 股票代码归一化与双向映射 |
 | `utils/logger.py` | 工具 | 日志配置 |

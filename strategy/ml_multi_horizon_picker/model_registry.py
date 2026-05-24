@@ -13,8 +13,9 @@
       ]
     }
 
-查询语义：给定 current_date，返回 train_end_date <= current_date 中最大那个对应的
-model_dir。这是防止 lookahead bias 的关键——只能用今天前已经训练完成的模型。
+查询语义：给定 current_date，返回 train_end_date < current_date 中最大那个对应的
+model_dir。这是防止 lookahead bias 的关键——月末收盘后训练出的模型只能从
+下一个交易日开始使用。
 
 支持本地路径和 ``gs://...`` 路径（PRD_20260524_14 引入）。
 """
@@ -22,9 +23,21 @@ model_dir。这是防止 lookahead bias 的关键——只能用今天前已经�
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
+
+
+def _find_gsutil() -> Optional[str]:
+    found = shutil.which("gsutil")
+    if found:
+        return found
+    bundled = Path("/Users/luna/.local/google-cloud-sdk/bin/gsutil")
+    if bundled.exists():
+        return str(bundled)
+    return None
 
 
 def _read_text_local_or_gcs(path) -> str:
@@ -44,17 +57,19 @@ def _read_text_local_or_gcs(path) -> str:
         blob_name = parts[1] if len(parts) > 1 else ""
         client = storage.Client()
         return client.bucket(bucket_name).blob(blob_name).download_as_text()
-    except Exception:
-        import subprocess
-        try:
-            return subprocess.run(
-                ["gsutil", "cat", p],
-                check=True, capture_output=True, text=True, timeout=60,
-            ).stdout
-        except FileNotFoundError as exc:
+    except Exception as exc:
+        gsutil = _find_gsutil()
+        if not gsutil:
             raise RuntimeError(
                 f"读取 {p} 失败：google.cloud.storage 不可用且 gsutil 不在 PATH"
             ) from exc
+        try:
+            return subprocess.run(
+                [gsutil, "cat", p],
+                check=True, capture_output=True, text=True, timeout=60,
+            ).stdout
+        except subprocess.CalledProcessError as gsutil_exc:
+            raise RuntimeError(f"读取 {p} 失败：gsutil cat 执行失败") from gsutil_exc
 
 
 def _write_text_local_or_gcs(path, content: str) -> None:
@@ -78,20 +93,22 @@ def _write_text_local_or_gcs(path, content: str) -> None:
             content, content_type="application/json"
         )
     except Exception:
-        import subprocess
         import tempfile
+        gsutil = _find_gsutil()
+        if not gsutil:
+            raise RuntimeError(
+                f"写入 {p} 失败：google.cloud.storage 不可用且 gsutil 不在 PATH"
+            )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             f.write(content)
             tmp_path = f.name
         try:
             subprocess.run(
-                ["gsutil", "-q", "cp", tmp_path, p],
+                [gsutil, "-q", "cp", tmp_path, p],
                 check=True, capture_output=True, text=True, timeout=60,
             )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"写入 {p} 失败：google.cloud.storage 不可用且 gsutil 不在 PATH"
-            ) from exc
+        except subprocess.CalledProcessError as gsutil_exc:
+            raise RuntimeError(f"写入 {p} 失败：gsutil cp 执行失败") from gsutil_exc
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -146,19 +163,19 @@ class ModelRegistry:
     # ── 查询 ───────────────────────────────────────────────────────
 
     def find_for_date(self, current_date: str) -> Optional[str]:
-        """返回 train_end_date <= current_date 的最大项的 model_dir。
+        """返回 train_end_date < current_date 的最大项的 model_dir。
 
         Args:
             current_date: ``YYYYMMDD`` 或 ``YYYY-MM-DD``
 
         Returns:
-            ``model_dir`` 路径字符串；如果没有可用条目（当前日早于所有训练终点）
+            ``model_dir`` 路径字符串；如果没有可用条目（当前日不晚于所有训练终点）
             则返回 None
         """
         normalized = self._normalize_date(current_date)
         best: Optional[RegistryEntry] = None
         for e in self._entries:
-            if e.train_end_date <= normalized:
+            if e.train_end_date < normalized:
                 best = e
             else:
                 break

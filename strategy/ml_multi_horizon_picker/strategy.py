@@ -40,8 +40,9 @@ from strategy.ml_multi_horizon_picker.model_storage import (
 )
 from strategy.ml_multi_horizon_picker.regime import (
     Regime,
+    combine_regime_with_market_breadth,
     latest_regime,
-    regime_position_multiplier,
+    market_breadth_metrics,
     regime_stop_loss,
 )
 from strategy.ml_multi_horizon_picker.tradable import filter_codes
@@ -63,6 +64,7 @@ class PositionState:
 class MLMultiHorizonStrategy(BaseStrategy):
     """多 Horizon ML 择时择股策略。"""
 
+    DYNAMIC_UNIVERSE = True
     DEFAULT_UNIVERSE = [
         "000001.SZ", "000002.SZ", "000063.SZ", "000100.SZ", "000333.SZ",
         "000568.SZ", "000651.SZ", "000725.SZ", "000768.SZ", "000858.SZ",
@@ -80,8 +82,11 @@ class MLMultiHorizonStrategy(BaseStrategy):
         model_dir: str = "models/ml_multi_horizon",
         model_registry_path: Optional[str] = None,    # 走步模式：模型注册表 JSON 路径
         universe: Optional[List[str]] = None,
+        universe_source: str = "static",
+        liquidity_top_n: int = 500,
+        liquidity_lookback_days: int = 60,
         trading_permissions: Optional[Dict[str, bool]] = None,  # 可交易过滤（PRD_20260524_13）
-        target_position_count: int = 10,
+        target_position_count: int = 5,
         min_buy_prob: float = 0.50,
         min_prob_floor: float = 0.30,
         sell_threshold: float = 0.70,
@@ -93,13 +98,27 @@ class MLMultiHorizonStrategy(BaseStrategy):
         rank_buffer_multiplier: int = 2,
         use_deterministic_fallback: bool = True,
         position_pct: float = 0.95,
+        regime_target_position_counts: Optional[Dict[str, int]] = None,
+        regime_position_pcts: Optional[Dict[str, float]] = None,
+        bear_clear_existing: bool = True,
+        breadth_bear_threshold: float = 0.35,
+        breadth_recovery_threshold: float = 0.55,
         feature_window: int = 20,    # 与 BaseFeatureEngineer 默认一致；sell-side 60d 特征用 min_periods=1 降级
     ) -> None:
         super().__init__()
         self.model_dir = model_dir
         self.model_registry_path = model_registry_path
         self.trading_permissions = trading_permissions
-        self._init_universe = list(universe) if universe else list(self.DEFAULT_UNIVERSE)
+        self.universe_source = str(universe_source or "static")
+        self.liquidity_top_n = int(liquidity_top_n)
+        self.liquidity_lookback_days = int(liquidity_lookback_days)
+        self._explicit_universe = universe is not None and len(universe) > 0
+        if self._explicit_universe:
+            self._init_universe = list(universe or [])
+        elif self.universe_source == "liquidity_top":
+            self._init_universe = []
+        else:
+            self._init_universe = list(self.DEFAULT_UNIVERSE)
         # 用 trading_permissions 过滤 universe（PRD_20260524_13）
         if trading_permissions is not None:
             filtered = filter_codes(self._init_universe, trading_permissions)
@@ -121,6 +140,15 @@ class MLMultiHorizonStrategy(BaseStrategy):
         self.rank_buffer_multiplier = rank_buffer_multiplier
         self.use_deterministic_fallback = use_deterministic_fallback
         self.position_pct = position_pct
+        self.regime_target_position_counts = self._normalize_regime_counts(
+            regime_target_position_counts
+        )
+        self.regime_position_pcts = self._normalize_regime_position_pcts(
+            regime_position_pcts
+        )
+        self.bear_clear_existing = bool(bear_clear_existing)
+        self.breadth_bear_threshold = float(breadth_bear_threshold)
+        self.breadth_recovery_threshold = float(breadth_recovery_threshold)
         self.feature_window = feature_window
         # 回测时引擎会预加载 feature_window 天的 warmup
         self.lookback_days = feature_window + 5
@@ -133,6 +161,64 @@ class MLMultiHorizonStrategy(BaseStrategy):
         # 走步模式专用
         self._model_registry: Optional[ModelRegistry] = None
         self._current_model_dir: Optional[str] = None
+        # 回测诊断输出专用：不参与交易决策，仅供 BacktestEngine 记录日志/CSV。
+        self._last_score_df: Optional[pd.DataFrame] = None
+        self._last_regime: str = ""
+        self._last_target_n: int = 0
+        self._last_stop_loss_pct: float = 0.0
+        self._last_position_pct: float = 0.0
+
+    def _normalize_regime_counts(
+        self,
+        configured: Optional[Dict[str, int]],
+    ) -> Dict[str, int]:
+        """标准化 regime → 目标持仓数配置。"""
+        max_count = max(1, int(self.target_position_count))
+        counts = {
+            Regime.BULL.value: max_count,
+            Regime.NEUTRAL.value: min(3, max_count),
+            Regime.BEAR.value: 0,
+        }
+        if configured:
+            for key, value in configured.items():
+                if key in counts:
+                    counts[key] = max(0, min(max_count, int(value)))
+        return counts
+
+    def _normalize_regime_position_pcts(
+        self,
+        configured: Optional[Dict[str, float]],
+    ) -> Dict[str, float]:
+        """标准化 regime → 最大资金使用比例配置。"""
+        base = max(0.0, min(1.0, float(self.position_pct)))
+        pcts = {
+            Regime.BULL.value: min(base, 0.85),
+            Regime.NEUTRAL.value: min(base, 0.45),
+            Regime.BEAR.value: 0.0,
+        }
+        if configured:
+            for key, value in configured.items():
+                if key in pcts:
+                    pcts[key] = max(0.0, min(1.0, float(value)))
+        return pcts
+
+    def _target_count_for_regime(self, regime: str) -> int:
+        """返回当前 regime 的目标持仓数。"""
+        return int(
+            self.regime_target_position_counts.get(
+                regime,
+                self.regime_target_position_counts[Regime.NEUTRAL.value],
+            )
+        )
+
+    def _position_pct_for_regime(self, regime: str) -> float:
+        """返回当前 regime 的资金预算上限。"""
+        return float(
+            self.regime_position_pcts.get(
+                regime,
+                self.regime_position_pcts[Regime.NEUTRAL.value],
+            )
+        )
 
     # ──────────────────────────────────────────────────────────────
     # 初始化
@@ -140,6 +226,8 @@ class MLMultiHorizonStrategy(BaseStrategy):
 
     def initialize(self, context: Context) -> None:
         super().initialize(context)
+        if not self._init_universe and self.universe_source == "liquidity_top":
+            self._init_universe = self._load_liquidity_universe(context)
         self.set_universe(self._init_universe)
         self.set_benchmark(self.BENCHMARK_CODE)
 
@@ -172,6 +260,33 @@ class MLMultiHorizonStrategy(BaseStrategy):
             f"target_n={self.target_position_count}, model_dir={self.model_dir}"
         )
 
+    def _load_liquidity_universe(self, context: Context) -> List[str]:
+        """从数据源按回测首日前历史成交额初始化股票池。"""
+        loader = getattr(context.data_source, "get_liquidity_top_equities", None)
+        if not callable(loader):
+            raise RuntimeError(
+                "universe_source=liquidity_top 需要数据源实现 "
+                "get_liquidity_top_equities(as_of_date, top_n, lookback_days)"
+            )
+        codes = loader(
+            context.current_date,
+            top_n=self.liquidity_top_n,
+            lookback_days=self.liquidity_lookback_days,
+            adjust="qfq",
+        )
+        if self.trading_permissions is not None:
+            codes = filter_codes(codes, self.trading_permissions)
+        if not codes:
+            raise RuntimeError(
+                f"{context.current_date} 未能初始化流动性股票池："
+                f"top_n={self.liquidity_top_n}, lookback_days={self.liquidity_lookback_days}"
+            )
+        logger.info(
+            f"流动性 universe 已初始化: {len(codes)} 只 "
+            f"(top_n={self.liquidity_top_n}, lookback_days={self.liquidity_lookback_days})"
+        )
+        return codes
+
     def _maybe_switch_model(self, current_date: str) -> bool:
         """走步模式下检查并切换模型。返回 False 表示当前日无可用模型，调用方应跳过。"""
         if self._model_registry is None:
@@ -192,6 +307,11 @@ class MLMultiHorizonStrategy(BaseStrategy):
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
         current_date = context.current_date
         portfolio = context.portfolio
+        self._last_score_df = None
+        self._last_regime = ""
+        self._last_target_n = 0
+        self._last_stop_loss_pct = 0.0
+        self._last_position_pct = 0.0
 
         # 0. 走步模式：按当前日期切换模型（首次进入也走这条）
         if not self._maybe_switch_model(current_date):
@@ -200,29 +320,33 @@ class MLMultiHorizonStrategy(BaseStrategy):
             )
             return
 
-        # 1. Regime 检测
-        regime = self._detect_regime(context)
-        target_n = max(
-            1, int(round(self.target_position_count * regime_position_multiplier(regime)))
-        )
-        stop_loss_pct = regime_stop_loss(
-            regime, self.stop_loss_pct_bull, self.stop_loss_pct_bear
-        )
-
-        # 2. 全宇宙打分（buy 4 horizons + sell）
+        # 1. 全宇宙打分（buy 4 horizons + sell）。Regime 广度修正也依赖当日截面特征。
         score_df = self._score_universe(context)
         if score_df is None or score_df.empty:
             logger.warning(f"{current_date} 无有效特征，跳过本日")
             return
+        self._last_score_df = score_df.copy()
+
+        # 2. Regime 检测 + 市场广度修正，并转成可执行风险预算
+        regime = self._detect_regime(context, score_df)
+        target_n = self._target_count_for_regime(regime)
+        position_pct = self._position_pct_for_regime(regime)
+        stop_loss_pct = regime_stop_loss(
+            regime, self.stop_loss_pct_bull, self.stop_loss_pct_bear
+        )
+        self._last_regime = regime
+        self._last_target_n = target_n
+        self._last_stop_loss_pct = stop_loss_pct
+        self._last_position_pct = position_pct
 
         # 3. 更新所有持仓的 peak_price / state
         self._update_position_states(context, score_df, data)
 
-        # 4. 计算 Top-N 与 Top-2N 名单
+        # 4. 计算 Top-N 与 Top-2N 名单。target_n=0 时不产生候选买入名单。
         score_sorted = score_df.sort_values("score", ascending=False).reset_index(drop=True)
-        top_n_codes = score_sorted.head(target_n)["code"].tolist()
+        top_n_codes = score_sorted.head(max(target_n, 0))["code"].tolist()
         top_2n_codes = set(
-            score_sorted.head(target_n * self.rank_buffer_multiplier)["code"].tolist()
+            score_sorted.head(max(target_n, 1) * self.rank_buffer_multiplier)["code"].tolist()
         )
 
         # 5. 遍历现有持仓，检查 6 个 sell trigger
@@ -233,6 +357,16 @@ class MLMultiHorizonStrategy(BaseStrategy):
             stop_loss_pct=stop_loss_pct,
             data=data,
         )
+        risk_budget_sells = self._risk_budget_sells(
+            context=context,
+            score_df=score_df,
+            regime=regime,
+            target_n=target_n,
+            position_pct=position_pct,
+            data=data,
+            existing_sells=set(sells),
+        )
+        sells.update(risk_budget_sells)
 
         for code, reason in sells.items():
             pos = portfolio.get_position(code)
@@ -243,9 +377,19 @@ class MLMultiHorizonStrategy(BaseStrategy):
                 )
                 self._position_state.pop(code, None)
 
+        if risk_budget_sells:
+            logger.info(
+                f"{current_date} regime={regime} 触发风险预算降仓，"
+                f"target_n={target_n}, position_pct={position_pct:.0%}，当天不补仓"
+            )
+            return
+
         # 6. Bear regime 不开新仓
         if regime == Regime.BEAR.value:
-            logger.info(f"{current_date} regime=bear，不开新仓 (target_n={target_n})")
+            logger.info(
+                f"{current_date} regime=bear，不开新仓 "
+                f"(target_n={target_n}, position_pct={position_pct:.0%})"
+            )
             return
 
         # 7. 补仓到 target_n
@@ -277,7 +421,9 @@ class MLMultiHorizonStrategy(BaseStrategy):
         total_value = portfolio.total_value(
             {c: float(data[c]["close"]) for c in held_codes if c in data}
         )
-        target_value_per_stock = total_value * self.position_pct / target_n
+        if target_n <= 0 or position_pct <= 0:
+            return
+        target_value_per_stock = total_value * position_pct / target_n
 
         for code in to_buy:
             if code not in data:
@@ -312,13 +458,32 @@ class MLMultiHorizonStrategy(BaseStrategy):
     # Helpers: regime
     # ──────────────────────────────────────────────────────────────
 
-    def _detect_regime(self, context: Context) -> str:
+    def _detect_regime(
+        self,
+        context: Context,
+        score_df: Optional[pd.DataFrame] = None,
+    ) -> str:
         try:
             hist = context.get_price(self.BENCHMARK_CODE, count=260)
             if hist is None or hist.empty or "close" not in hist.columns:
                 return Regime.NEUTRAL.value
             close = pd.to_numeric(hist["close"], errors="coerce").astype(float)
-            return latest_regime(close)
+            base_regime = latest_regime(close)
+            if score_df is None or score_df.empty:
+                return base_regime
+            regime = combine_regime_with_market_breadth(
+                base_regime,
+                score_df,
+                breadth_bear_threshold=self.breadth_bear_threshold,
+                breadth_recovery_threshold=self.breadth_recovery_threshold,
+            )
+            if regime != base_regime:
+                metrics = market_breadth_metrics(score_df)
+                logger.info(
+                    f"{context.current_date} regime 由 {base_regime} 修正为 {regime} "
+                    f"(breadth={metrics})"
+                )
+            return regime
         except Exception as exc:
             logger.warning(f"regime 检测失败，默认 neutral: {exc}")
             return Regime.NEUTRAL.value
@@ -559,6 +724,89 @@ class MLMultiHorizonStrategy(BaseStrategy):
                 if prob_sell > self.sell_threshold:
                     sells[code] = f"sell_model(prob_sell={prob_sell:.3f})"
                     continue
+
+        return sells
+
+    def _risk_budget_sells(
+        self,
+        context: Context,
+        score_df: pd.DataFrame,
+        regime: str,
+        target_n: int,
+        position_pct: float,
+        data: Dict[str, pd.Series],
+        existing_sells: set,
+    ) -> Dict[str, str]:
+        """根据 regime 风险预算生成额外降仓卖单。
+
+        风险预算不绕过 T+1：只卖 `sellable_qty > 0` 的持仓。
+        """
+        portfolio = context.portfolio
+        score_lookup = score_df.set_index("code")["score"] if "score" in score_df else pd.Series(dtype=float)
+
+        def score_for(code: str) -> float:
+            try:
+                return float(score_lookup.loc[code])
+            except Exception:
+                return float("-inf")
+
+        sells: Dict[str, str] = {}
+        held_codes = [
+            code
+            for code, pos in portfolio.positions.items()
+            if pos.total_qty > 0 and code not in existing_sells
+        ]
+
+        if regime == Regime.BEAR.value and self.bear_clear_existing:
+            for code in held_codes:
+                pos = portfolio.get_position(code)
+                if pos and pos.sellable_qty > 0:
+                    sells[code] = "bear_risk_budget_clear"
+            return sells
+
+        remaining = [code for code in held_codes if code not in sells]
+        if target_n <= 0:
+            for code in remaining:
+                pos = portfolio.get_position(code)
+                if pos and pos.sellable_qty > 0:
+                    sells[code] = f"risk_budget_target_zero(regime={regime})"
+            return sells
+
+        if len(remaining) > target_n:
+            excess = len(remaining) - target_n
+            for code in sorted(remaining, key=score_for)[:excess]:
+                pos = portfolio.get_position(code)
+                if pos and pos.sellable_qty > 0:
+                    sells[code] = f"risk_budget_count(regime={regime},target_n={target_n})"
+
+        price_map = {
+            code: float(row["close"])
+            for code, row in data.items()
+            if code in portfolio.positions and "close" in row
+        }
+        total_value = portfolio.total_value(price_map)
+        allowed_value = total_value * max(0.0, min(1.0, position_pct))
+        remaining_value = 0.0
+        for code in remaining:
+            if code in sells or code not in price_map:
+                continue
+            pos = portfolio.get_position(code)
+            if pos:
+                remaining_value += pos.total_qty * price_map[code]
+
+        if remaining_value > allowed_value:
+            for code in sorted(remaining, key=score_for):
+                if code in sells or code not in price_map:
+                    continue
+                pos = portfolio.get_position(code)
+                if not pos or pos.sellable_qty <= 0:
+                    continue
+                sells[code] = (
+                    f"risk_budget_value(regime={regime},budget={position_pct:.0%})"
+                )
+                remaining_value -= pos.total_qty * price_map[code]
+                if remaining_value <= allowed_value:
+                    break
 
         return sells
 

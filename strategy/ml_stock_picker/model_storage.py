@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import pickle
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+_GCS_STORAGE_SDK_DISABLED = False
 
 
 def save_model(model: Any, path: str) -> None:
@@ -81,22 +84,65 @@ def _save_to_gcs(model: Any, path: str) -> None:
 
 
 def _load_from_gcs(path: str) -> Optional[Any]:
+    global _GCS_STORAGE_SDK_DISABLED
+    if _GCS_STORAGE_SDK_DISABLED:
+        return _load_from_gcs_via_gsutil(
+            path, RuntimeError("storage SDK disabled after previous failure")
+        )
     try:
         from google.cloud import storage
-    except ImportError as exc:
-        raise ImportError(
-            "未安装 google-cloud-storage，无法从 GCS 加载模型。"
-        ) from exc
-    parts = path.replace("gs://", "").split("/", 1)
-    bucket_name = parts[0]
-    blob_name = parts[1] if len(parts) > 1 else "model.pkl"
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    if not blob.exists():
-        logger.warning(f"GCS 模型对象不存在: {path}")
-        return None
-    data = blob.download_as_bytes()
-    model = pickle.loads(data)
-    logger.info(f"模型已从 GCS 加载: {path}")
+        parts = path.replace("gs://", "").split("/", 1)
+        bucket_name = parts[0]
+        blob_name = parts[1] if len(parts) > 1 else "model.pkl"
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            logger.warning(f"GCS 模型对象不存在: {path}")
+            return None
+        data = blob.download_as_bytes()
+        model = pickle.loads(data)
+        logger.info(f"模型已从 GCS 加载: {path}")
+        return model
+    except Exception as exc:
+        _GCS_STORAGE_SDK_DISABLED = True
+        logger.warning(
+            f"storage SDK 加载 GCS 模型失败，尝试 gsutil 降级读取: {path} ({exc})"
+        )
+        return _load_from_gcs_via_gsutil(path, exc)
+
+
+def _find_gsutil() -> Optional[str]:
+    """定位 gsutil，兼容本机 Google Cloud SDK 未加入 PATH 的情况。"""
+    found = shutil.which("gsutil")
+    if found:
+        return found
+    bundled = Path("/Users/luna/.local/google-cloud-sdk/bin/gsutil")
+    if bundled.exists():
+        return str(bundled)
+    return None
+
+
+def _load_from_gcs_via_gsutil(path: str, reason: Exception) -> Optional[Any]:
+    gsutil = _find_gsutil()
+    if not gsutil:
+        raise RuntimeError(
+            f"读取 {path} 失败：storage SDK 不可用，且 gsutil 不在 PATH"
+        ) from reason
+
+    result = subprocess.run(
+        [gsutil, "cat", path],
+        check=False,
+        capture_output=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        if "No URLs matched" in stderr or "NotFound" in stderr:
+            logger.warning(f"GCS 模型对象不存在: {path}")
+            return None
+        raise RuntimeError(f"gsutil cat 读取模型失败: {path}: {stderr}") from reason
+
+    model = pickle.loads(result.stdout)
+    logger.info(f"模型已通过 gsutil 从 GCS 加载: {path}")
     return model

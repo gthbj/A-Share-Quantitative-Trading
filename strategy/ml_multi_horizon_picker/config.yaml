@@ -1,19 +1,34 @@
-# MLMultiHorizon 回测 preset
+# MLMultiHorizon 走步模型真实约束回测 preset
 #
 # 用法：
-#   python run_backtest.py --strategy strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy \
-#     --params strategy/ml_multi_horizon_picker/config.yaml \
-#     --start 20240101 --end 20240630
+#   ASHARE_USE_GCLOUD_ACCESS_TOKEN=1 python run_backtest.py --preset ml_multi_horizon_picker
 
 name: "ml_multi_horizon_picker"
 class: "strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy"
-description: "多 Horizon ML 策略：4 buy 模型 + 1 sell 模型 + regime 调制 + 6 卖出触发"
+description: "多 Horizon ML 走步策略：GCS 月度模型 + regime 调制 + 真实账户权限过滤"
 
 params:
-  # 模型目录
+  # 模型目录：model_registry_path 存在时走月度 walk-forward 模型；model_dir 仅作传统模式兜底。
   model_dir: "models/ml_multi_horizon"
+  model_registry_path: "gs://data-aquarium/models/walk_forward/registry.json"
+  # 未显式传 universe 时，用回测首日前近 60 日成交额 Top 500 初始化股票池。
+  universe_source: "liquidity_top"
+  liquidity_top_n: 500
+  liquidity_lookback_days: 60
   # 持仓
-  target_position_count: 10
+  target_position_count: 5
+  # Regime 风险预算：3~5 只持仓根据市场风险缩放；bear 直接清仓/零预算。
+  regime_target_position_counts:
+    bull: 5
+    neutral: 3
+    bear: 0
+  regime_position_pcts:
+    bull: 0.85
+    neutral: 0.45
+    bear: 0.0
+  bear_clear_existing: true
+  breadth_bear_threshold: 0.35
+  breadth_recovery_threshold: 0.55
   # 选股阈值
   min_buy_prob: 0.50
   min_prob_floor: 0.30
@@ -27,14 +42,28 @@ params:
   rank_buffer_multiplier: 2
   # 资金使用比例
   position_pct: 0.95
-  # 模型缺失走 deterministic fallback
-  use_deterministic_fallback: true
+  # 真实回测不允许模型缺失时静默退回 deterministic fallback。
+  use_deterministic_fallback: false
   # 特征窗口（17 维基础特征要求 20，sell-side 60d 自动降级）
   feature_window: 20
+  # 账户专项权限：当前全部 false，与全局 config/backtest.yaml 保持一致。
+  trading_permissions:
+    allow_bse: false
+    allow_star_market: false
+    allow_chinext: false
+    allow_hk_stock_connect: false
+    allow_neeq: false
+    allow_risk_warning: false
+    allow_delisting: false
+    allow_margin_trading: false
+    allow_stock_options: false
+    allow_convertible_bonds: false
+    allow_cdr: false
+    allow_unknown_security: false
 
 backtest:
-  start_date: "20240101"
-  end_date: "20240630"
+  start_date: "20200102"
+  end_date: "20250430"
   frequency: "daily"
-  initial_capital: 1000000
+  initial_capital: 100000
   benchmark: "000300.SH"

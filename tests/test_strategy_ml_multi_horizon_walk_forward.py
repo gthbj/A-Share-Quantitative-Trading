@@ -27,6 +27,8 @@ from strategy.ml_multi_horizon_picker.tradable import (
     is_tradable_code,
     merge_permissions,
 )
+from account.portfolio import Portfolio
+from strategy.base_strategy import Context
 
 
 # ───────────────────────────── tradable.py ─────────────────────────────
@@ -102,13 +104,14 @@ def test_classify_board():
 
 
 def test_registry_find_returns_latest_before():
-    """PRD §8 用例 2：返回 train_end ≤ current 中最大那个。"""
+    """PRD §8 用例 2：返回 train_end < current 中最大那个。"""
     reg = build_registry(
         "models/walk_forward",
         ["20191231", "20200131", "20200229"],
     )
     assert reg.find_for_date("20200215") == "models/walk_forward/20200131"
-    assert reg.find_for_date("20200229") == "models/walk_forward/20200229"
+    # 月末当天收盘后才训练完成，因此当天仍只能使用上一个模型。
+    assert reg.find_for_date("20200229") == "models/walk_forward/20200131"
     assert reg.find_for_date("20200301") == "models/walk_forward/20200229"
 
 
@@ -117,8 +120,9 @@ def test_registry_find_returns_none_when_before_all():
     reg = build_registry("models/walk_forward", ["20191231"])
     assert reg.find_for_date("20190630") is None
     assert reg.find_for_date("20191230") is None
-    # 边界：等于第一个时点应该可用
-    assert reg.find_for_date("20191231") == "models/walk_forward/20191231"
+    # 边界：等于第一个训练时点当天不可用，下一天才可用。
+    assert reg.find_for_date("20191231") is None
+    assert reg.find_for_date("20200101") == "models/walk_forward/20191231"
 
 
 def test_registry_handles_date_format_variants():
@@ -198,3 +202,34 @@ def test_strategy_traditional_mode_unchanged():
     strat = MLMultiHorizonStrategy(model_dir="some/dir")
     assert strat.model_registry_path is None
     assert strat._model_registry is None
+
+
+class _LiquidityDataSource:
+    def __init__(self):
+        self.calls = []
+
+    def get_liquidity_top_equities(self, as_of_date, top_n, lookback_days, adjust):
+        self.calls.append((as_of_date, top_n, lookback_days, adjust))
+        return ["600000.SH", "300001.SZ", "000001.SZ"]
+
+
+def test_strategy_initializes_liquidity_universe():
+    """未显式传 universe 时，可从数据源按流动性初始化股票池并继续应用权限过滤。"""
+    data_source = _LiquidityDataSource()
+    ctx = Context(
+        portfolio=Portfolio(initial_capital=100_000),
+        data_source=data_source,
+        current_date="20200102",
+        frequency="daily",
+    )
+    strat = MLMultiHorizonStrategy(
+        universe_source="liquidity_top",
+        liquidity_top_n=500,
+        liquidity_lookback_days=60,
+        trading_permissions={"allow_chinext": False},
+    )
+
+    strat.initialize(ctx)
+
+    assert data_source.calls == [("20200102", 500, 60, "qfq")]
+    assert strat.get_universe() == ["600000.SH", "000001.SZ"]

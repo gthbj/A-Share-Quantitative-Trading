@@ -553,6 +553,77 @@ class BigQueryDataSource(BaseDataSource):
             self.storage.save_stock_list(df)
         return df
 
+    def get_liquidity_top_equities(
+        self,
+        as_of_date: str,
+        top_n: int = 500,
+        lookback_days: int = 60,
+        adjust: str = "qfq",
+    ) -> List[str]:
+        """按回测时点之前的近 N 日平均成交额选股票池。
+
+        该 helper 只使用 ``date < as_of_date`` 的历史行情，避免在回测首日
+        用到当天收盘后才知道的成交额。账户专项权限过滤与 ``get_stock_list`` 保持一致。
+        """
+        top_n = int(top_n)
+        lookback_days = int(lookback_days)
+        if top_n <= 0:
+            return []
+        if lookback_days <= 0:
+            raise ValueError("lookback_days 必须为正数")
+
+        table = self._require_table("kline_1d_equity")
+        dim_table = self._require_table("dim_security")
+        as_of = datetime.strptime(str(as_of_date)[:8], "%Y%m%d")
+        end = as_of - timedelta(days=1)
+        start = as_of - timedelta(days=max(lookback_days * 2, lookback_days + 7))
+        partition_months = self._partition_months_in_range(
+            start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+        )
+        if not partition_months:
+            return []
+
+        pm_list = ", ".join(str(pm) for pm in partition_months)
+        permission_sql = self._security_permission_filter_sql("s")
+        adjust_type = adjust if adjust in ("qfq", "hfq") else "none"
+        min_observations = min(5, lookback_days)
+        sql = f"""
+WITH liquidity AS (
+  SELECT
+    k.equity_code,
+    AVG(COALESCE(k.amount, 0)) AS avg_amount,
+    COUNT(*) AS observation_count
+  FROM `{self.project_id}.{self.dataset}.{table}` AS k
+  JOIN `{self.project_id}.{self.dataset}.{dim_table}` AS s
+    ON k.equity_code = s.security_code
+  WHERE k.adjust_type = '{adjust_type}'
+    AND k.partition_month IN ({pm_list})
+    AND k.date >= DATE '{start.strftime("%Y-%m-%d")}'
+    AND k.date < DATE '{as_of.strftime("%Y-%m-%d")}'
+    AND s.security_type = 'stock'
+    AND s.is_active = TRUE
+    AND {permission_sql}
+  GROUP BY k.equity_code
+  HAVING observation_count >= {min_observations}
+)
+SELECT equity_code
+FROM liquidity
+ORDER BY avg_amount DESC, equity_code
+LIMIT {top_n}
+"""
+        df = self._execute_sql(sql)
+        if df.empty or "equity_code" not in df.columns:
+            logger.warning(
+                f"get_liquidity_top_equities: {as_of_date} 未返回可交易股票池"
+            )
+            return []
+        codes = df["equity_code"].astype(str).tolist()
+        logger.info(
+            f"流动性股票池初始化: as_of={as_of_date}, top_n={top_n}, "
+            f"lookback_days={lookback_days}, selected={len(codes)}"
+        )
+        return codes
+
     def get_index_constituents(self, index_code: str) -> List[str]:
         """从 fact_board_component_1d 获取指数/板块成分股。
 

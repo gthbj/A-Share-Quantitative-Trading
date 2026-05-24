@@ -122,7 +122,8 @@ def test_build_registry_from_disk(tmp_path: Path):
     reg = build_registry_from_disk(str(tmp_path))
     assert len(reg) == 2
     assert reg.find_for_date("20200115") == str(tmp_path / "20191231")
-    assert reg.find_for_date("20200131") == str(tmp_path / "20200131")
+    assert reg.find_for_date("20200131") == str(tmp_path / "20191231")
+    assert reg.find_for_date("20200201") == str(tmp_path / "20200131")
 
 
 def test_build_registry_to_json_roundtrip(tmp_path: Path):

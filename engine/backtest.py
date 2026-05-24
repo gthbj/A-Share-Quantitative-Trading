@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
@@ -30,6 +32,9 @@ class DailyRecord:
     cash: float
     positions: Dict[str, int]  # code -> qty
     fills: List[Fill] = field(default_factory=list)
+    summary: Dict[str, Any] = field(default_factory=dict)
+    position_details: List[Dict[str, Any]] = field(default_factory=list)
+    candidate_details: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class BacktestEngine:
@@ -51,6 +56,9 @@ class BacktestEngine:
         stop_loss_enabled: bool = False,
         stop_loss_threshold: float = 0.05,
         strategy_kwargs: Optional[Dict[str, Any]] = None,
+        daily_log_enabled: bool = False,
+        comparison_benchmarks: Optional[Dict[str, str]] = None,
+        daily_candidate_top_n: int = 10,
     ) -> None:
         self.strategy_cls = strategy_cls
         self.data_source = data_source
@@ -64,6 +72,9 @@ class BacktestEngine:
         self.stop_loss_threshold = stop_loss_threshold
         # 策略构造函数参数（如 universe / short_window / long_window 等）
         self.strategy_kwargs: Dict[str, Any] = strategy_kwargs or {}
+        self.daily_log_enabled = daily_log_enabled
+        self.comparison_benchmarks: Dict[str, str] = comparison_benchmarks or {}
+        self.daily_candidate_top_n = max(int(daily_candidate_top_n), 0)
 
         # 校验止损阈值
         if self.stop_loss_enabled and self.stop_loss_threshold <= 0:
@@ -72,10 +83,12 @@ class BacktestEngine:
         self.calendar = TradingCalendar()
         self.records: List[DailyRecord] = []
         self.benchmark_df: Optional[pd.DataFrame] = None
+        self.comparison_benchmark_dfs: Dict[str, pd.DataFrame] = {}
         # 待执行的止损队列：code -> qty，由前一日收盘后检查写入
         self._stop_loss_pending: Dict[str, int] = {}
         # 暴露给外层报告/总结使用：策略实例（含 universe、docstring）
         self.strategy_instance: Optional[BaseStrategy] = None
+        self._run_started_at: float = 0.0
 
     def _is_intraday(self) -> bool:
         """判断当前是否为分钟级回测。"""
@@ -109,10 +122,17 @@ class BacktestEngine:
         )
 
         # 预加载所有行情数据，并注入到 Context（get_price 优先查内存）
-        all_bars = self._preload_bars(universe, trading_days)
+        all_bars = self._preload_bars(
+            universe, trading_days, lookback_days=getattr(strategy, "lookback_days", 0)
+        )
         context.all_bars = all_bars
         self.benchmark_df = self._load_benchmark(trading_days)
+        if self.daily_log_enabled:
+            self.comparison_benchmark_dfs = self._load_comparison_benchmarks(
+                trading_days
+            )
 
+        self._run_started_at = time.monotonic()
         if self._is_intraday():
             self._run_intraday(trading_days, strategy, context, portfolio, all_bars)
         else:
@@ -201,17 +221,268 @@ class BacktestEngine:
             # 8. 记录净值
             price_map = {code: bar["close"] for code, bar in today_bars.items()}
             nav = portfolio.total_value(price_map)
-            self.records.append(
-                DailyRecord(
-                    date=date_str,
-                    nav=nav,
-                    cash=portfolio.available_cash + portfolio.frozen_cash,
-                    positions={
-                        code: pos.total_qty for code, pos in portfolio.positions.items()
-                    },
-                    fills=fills,
-                )
+            record = self._build_daily_record(
+                date_str=date_str,
+                day_index=i + 1,
+                total_days=len(trading_days),
+                nav=nav,
+                portfolio=portfolio,
+                price_map=price_map,
+                fills=fills,
+                strategy=strategy,
             )
+            self.records.append(record)
+            if self.daily_log_enabled:
+                self._log_daily_record(record)
+
+    def _build_daily_record(
+        self,
+        date_str: str,
+        day_index: int,
+        total_days: int,
+        nav: float,
+        portfolio: Portfolio,
+        price_map: Dict[str, float],
+        fills: List[Fill],
+        strategy: BaseStrategy,
+    ) -> DailyRecord:
+        """构造每日记录，并在启用诊断时附带 summary/position/candidate 明细。"""
+        cash = portfolio.available_cash + portfolio.frozen_cash
+        positions = {
+            code: pos.total_qty for code, pos in portfolio.positions.items()
+        }
+        record = DailyRecord(
+            date=date_str,
+            nav=nav,
+            cash=cash,
+            positions=positions,
+            fills=fills,
+        )
+        if not self.daily_log_enabled:
+            return record
+
+        summary = self._build_daily_summary(
+            date_str=date_str,
+            day_index=day_index,
+            total_days=total_days,
+            nav=nav,
+            portfolio=portfolio,
+            price_map=price_map,
+            fills=fills,
+            strategy=strategy,
+        )
+        record.summary = summary
+        record.position_details = self._build_daily_position_details(
+            date_str=date_str,
+            portfolio=portfolio,
+            price_map=price_map,
+            strategy=strategy,
+            summary=summary,
+        )
+        record.candidate_details = self._build_daily_candidate_details(
+            date_str=date_str,
+            portfolio=portfolio,
+            strategy=strategy,
+            summary=summary,
+        )
+        return record
+
+    def _build_daily_summary(
+        self,
+        date_str: str,
+        day_index: int,
+        total_days: int,
+        nav: float,
+        portfolio: Portfolio,
+        price_map: Dict[str, float],
+        fills: List[Fill],
+        strategy: BaseStrategy,
+    ) -> Dict[str, Any]:
+        """构造单日诊断摘要。数值字段用原始小数，CSV/日志再格式化。"""
+        prev_nav = self.records[-1].nav if self.records else self.initial_capital
+        daily_return = nav / prev_nav - 1 if prev_nav else 0.0
+        total_return = nav / self.initial_capital - 1 if self.initial_capital else 0.0
+        navs = [r.nav for r in self.records] + [nav]
+        peak = navs[0] if navs else nav
+        max_drawdown = 0.0
+        for v in navs:
+            if v > peak:
+                peak = v
+            if peak:
+                max_drawdown = min(max_drawdown, v / peak - 1)
+
+        buy_count = sum(1 for f in fills if f.side == OrderSide.BUY)
+        sell_count = sum(1 for f in fills if f.side == OrderSide.SELL)
+        fee_total = sum(float(f.total_cost) for f in fills)
+        position_value = portfolio.total_position_value(price_map)
+        cash = portfolio.available_cash + portfolio.frozen_cash
+        elapsed_seconds = max(time.monotonic() - self._run_started_at, 0.0)
+        eta_seconds = (
+            elapsed_seconds / day_index * max(total_days - day_index, 0)
+            if day_index > 0
+            else 0.0
+        )
+        model_dir = str(getattr(strategy, "_current_model_dir", "") or "")
+        model_train_end = model_dir.rstrip("/").rsplit("/", 1)[-1] if model_dir else ""
+        regime = str(getattr(strategy, "_last_regime", "") or "")
+        target_position_count = getattr(strategy, "_last_target_n", "")
+
+        summary: Dict[str, Any] = {
+            "date": date_str,
+            "day_index": day_index,
+            "total_days": total_days,
+            "progress_pct": day_index / total_days if total_days else 0.0,
+            "elapsed_seconds": elapsed_seconds,
+            "eta_seconds": eta_seconds,
+            "nav": nav,
+            "initial_capital": self.initial_capital,
+            "daily_return_pct": daily_return,
+            "total_return_pct": total_return,
+            "max_drawdown_pct": max_drawdown,
+            "cash": cash,
+            "position_value": position_value,
+            "cash_ratio_pct": cash / nav if nav else 0.0,
+            "position_count": sum(1 for p in portfolio.positions.values() if p.total_qty > 0),
+            "buy_count": buy_count,
+            "sell_count": sell_count,
+            "fee_total": fee_total,
+            "model_train_end": model_train_end,
+            "model_dir": model_dir,
+            "regime": regime,
+            "target_position_count": target_position_count,
+            "benchmark_code": self.benchmark,
+        }
+
+        for key in self.comparison_benchmarks:
+            stats = self._benchmark_stats_for_date(key, date_str)
+            summary[f"{key}_return_pct"] = stats.get("return_pct", "")
+            summary[f"{key}_max_drawdown_pct"] = stats.get("max_drawdown_pct", "")
+        hs300_ret = summary.get("hs300_return_pct")
+        summary["excess_vs_hs300_pct"] = (
+            total_return - float(hs300_ret)
+            if isinstance(hs300_ret, (int, float))
+            else ""
+        )
+        return summary
+
+    def _build_daily_position_details(
+        self,
+        date_str: str,
+        portfolio: Portfolio,
+        price_map: Dict[str, float],
+        strategy: BaseStrategy,
+        summary: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        states = getattr(strategy, "_position_state", {}) or {}
+        date_diff = getattr(strategy, "_date_diff", None)
+        for code, pos in sorted(portfolio.positions.items()):
+            if pos.total_qty <= 0:
+                continue
+            close_price = float(price_map.get(code, 0.0) or 0.0)
+            market_value = pos.market_value(close_price)
+            unrealized_pnl = (close_price - pos.cost_price) * pos.total_qty
+            unrealized_pnl_pct = pos.profit_ratio(close_price) if close_price else 0.0
+            state = states.get(code)
+            entered_date = getattr(state, "entered_date", "")
+            holding_days = (
+                date_diff(entered_date, date_str)
+                if callable(date_diff) and entered_date
+                else ""
+            )
+            peak_price = float(getattr(state, "peak_price", 0.0) or 0.0)
+            drawdown_from_peak = (
+                close_price / peak_price - 1 if close_price > 0 and peak_price > 0 else ""
+            )
+            rows.append({
+                "date": date_str,
+                "code": code,
+                "qty": pos.total_qty,
+                "sellable_qty": pos.sellable_qty,
+                "cost_price": pos.cost_price,
+                "close_price": close_price,
+                "market_value": market_value,
+                "unrealized_pnl": unrealized_pnl,
+                "unrealized_pnl_pct": unrealized_pnl_pct,
+                "holding_days": holding_days,
+                "peak_price": peak_price,
+                "drawdown_from_peak_pct": drawdown_from_peak,
+                "is_sellable": pos.sellable_qty > 0,
+                "model_train_end": summary.get("model_train_end", ""),
+                "regime": summary.get("regime", ""),
+            })
+        return rows
+
+    def _build_daily_candidate_details(
+        self,
+        date_str: str,
+        portfolio: Portfolio,
+        strategy: BaseStrategy,
+        summary: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        score_df = getattr(strategy, "_last_score_df", None)
+        if score_df is None or getattr(score_df, "empty", True):
+            return []
+        try:
+            sorted_df = score_df.sort_values("score", ascending=False).head(
+                self.daily_candidate_top_n
+            )
+        except Exception:
+            return []
+
+        held_codes = {
+            code for code, pos in portfolio.positions.items() if pos.total_qty > 0
+        }
+        target_n = summary.get("target_position_count") or 0
+        rows: List[Dict[str, Any]] = []
+        for rank, (_, row) in enumerate(sorted_df.iterrows(), start=1):
+            code = str(row.get("code", ""))
+            rows.append({
+                "date": date_str,
+                "rank": rank,
+                "code": code,
+                "score": float(row.get("score", 0.0) or 0.0),
+                "prob_up_h1": float(row.get("prob_up_h1", 0.0) or 0.0),
+                "prob_up_h5": float(row.get("prob_up_h5", 0.0) or 0.0),
+                "prob_up_h10": float(row.get("prob_up_h10", 0.0) or 0.0),
+                "prob_up_h20": float(row.get("prob_up_h20", 0.0) or 0.0),
+                "prob_sell": float(row.get("prob_sell", 0.0) or 0.0),
+                "is_held": code in held_codes,
+                "in_top_target": rank <= int(target_n or 0),
+                "model_train_end": summary.get("model_train_end", ""),
+                "regime": summary.get("regime", ""),
+            })
+        return rows
+
+    def _log_daily_record(self, record: DailyRecord) -> None:
+        summary = record.summary
+        if not summary:
+            return
+        logger.info("DAY_SUMMARY " + self._as_kv(summary))
+
+        if record.position_details:
+            for row in record.position_details:
+                logger.info("DAY_POSITION " + self._as_kv(row))
+
+        if record.candidate_details:
+            for row in record.candidate_details:
+                logger.info("DAY_CANDIDATE " + self._as_kv(row))
+
+    @staticmethod
+    def _as_kv(row: Dict[str, Any]) -> str:
+        parts = []
+        for key, value in row.items():
+            if value is None:
+                rendered = ""
+            elif isinstance(value, bool):
+                rendered = "true" if value else "false"
+            elif isinstance(value, float):
+                rendered = f"{value:.10g}"
+            else:
+                rendered = str(value)
+            rendered = rendered.replace(" ", "_")
+            parts.append(f"{key}={rendered}")
+        return " ".join(parts)
 
     def _run_intraday(
         self,
@@ -346,13 +617,76 @@ class BacktestEngine:
                 )
 
     def _preload_bars(
-        self, codes: List[str], trading_days: List[Any]
+        self,
+        codes: List[str],
+        trading_days: List[Any],
+        lookback_days: int = 0,
     ) -> Dict[str, pd.DataFrame]:
         """预加载回测区间内的全部行情数据。"""
+        start_date = trading_days[0]
+        if lookback_days and lookback_days > 0:
+            calendar_days = max(int(lookback_days * 1.6), lookback_days + 5)
+            start_date = start_date - timedelta(days=calendar_days)
+        start = start_date.strftime("%Y%m%d")
+        end = trading_days[-1].strftime("%Y%m%d")
+        logger.info(
+            f"预加载行情数据: {start} ~ {end}, period={self.frequency}, "
+            f"lookback_days={lookback_days}"
+        )
+        return self.data_source.get_multi_bars(codes, start, end, period=self.frequency)
+
+    def _load_comparison_benchmarks(
+        self,
+        trading_days: List[Any],
+    ) -> Dict[str, pd.DataFrame]:
+        """加载逐日诊断使用的指数对比行情。"""
         start = trading_days[0].strftime("%Y%m%d")
         end = trading_days[-1].strftime("%Y%m%d")
-        logger.info(f"预加载行情数据: {start} ~ {end}, period={self.frequency}")
-        return self.data_source.get_multi_bars(codes, start, end, period=self.frequency)
+        result: Dict[str, pd.DataFrame] = {}
+        for key, code in self.comparison_benchmarks.items():
+            try:
+                df = self.data_source.get_bars(
+                    code, start, end, period="daily", adjust=None
+                )
+            except Exception as exc:
+                logger.warning(f"诊断基准 {key}({code}) 加载失败: {exc}")
+                continue
+            prepared = self._prepare_benchmark_df(df)
+            if prepared.empty:
+                logger.warning(f"诊断基准 {key}({code}) 无可用日线数据")
+                continue
+            result[key] = prepared
+        return result
+
+    @staticmethod
+    def _prepare_benchmark_df(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "date" not in df.columns or "close" not in df.columns:
+            return pd.DataFrame()
+        out = df[["date", "close"]].copy()
+        out["date_key"] = out["date"].astype(str).str.replace("-", "", regex=False).str[:8]
+        out["close"] = pd.to_numeric(out["close"], errors="coerce").astype(float)
+        out = out.dropna(subset=["close"])
+        out = out[out["close"] > 0].sort_values("date_key").reset_index(drop=True)
+        return out[["date_key", "close"]]
+
+    def _benchmark_stats_for_date(self, key: str, date_str: str) -> Dict[str, float]:
+        df = self.comparison_benchmark_dfs.get(key)
+        if df is None or df.empty:
+            return {}
+        upto = df[df["date_key"] <= date_str]
+        if upto.empty:
+            return {}
+        first_close = float(df.iloc[0]["close"])
+        current_close = float(upto.iloc[-1]["close"])
+        if first_close <= 0:
+            return {}
+        closes = upto["close"].astype(float)
+        peaks = closes.cummax()
+        drawdowns = closes / peaks - 1
+        return {
+            "return_pct": current_close / first_close - 1,
+            "max_drawdown_pct": float(drawdowns.min()) if not drawdowns.empty else 0.0,
+        }
 
     def _load_benchmark(self, trading_days: List[Any]) -> pd.DataFrame:
         """加载基准指数行情。
