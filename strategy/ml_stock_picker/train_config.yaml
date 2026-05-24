@@ -12,14 +12,18 @@ logging:
   level: "INFO"
 
 # ── 数据源 ──
-data_source: "bigquery"  # bigquery | local
+data_source: "bigquery_dws"  # bigquery_dws | bigquery | local
 
 bigquery:
   project_id: "data-aquarium"
-  dataset: "ashare_core"
+  dataset: "ashare"
   location: "asia-east2"
   # 凭据优先级：GOOGLE_APPLICATION_CREDENTIALS 环境变量 > 此处配置
   credentials_path: ""
+  tables:
+    dws_equity_daily_features: "dws_equity_daily_features"
+    dws_equity_fundamental_features: "dws_equity_fundamental_features"
+    dws_equity_event_money_flow_features_1d: "dws_equity_event_money_flow_features_1d"
 
 local:
   local_dir: "data/raw"
@@ -91,8 +95,10 @@ train:
   # 特征与标签
   feature_window: 20
   label_horizon: 5
+  feature_set: "enhanced"  # technical | enhanced
   top_pct: 0.30       # top 30% 标记为正样本
   bottom_pct: 0.30    # bottom 30% 标记为负样本
+  validation_ratio: 0.20  # 按时间尾部切分验证集，避免未来泄漏
 
   # 模型输出路径（本地或 gs://）
   model_output_path: "strategy/ml_stock_picker/models/lgbm_model.pkl"

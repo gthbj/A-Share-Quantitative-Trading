@@ -50,10 +50,10 @@
 | 文件 | 职责 |
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
-| `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。当前依赖 `ashare.dwd_*` 标准字段表；ODS external table、DWD native table、DWS 特征层与 ADS 信号层均已生成并通过 audit，财务指标 DWD、估值特征和基本面特征已完成专项修复/生成。详见 §4.6 / §4.7 / §4.8 / §4.16。 |
+| `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。当前依赖 `ashare.dwd_*` 标准字段表；ODS external table、DWD native table、DWS 特征层与 ADS 信号层均已生成并通过 audit，财务指标 DWD、估值特征和基本面特征已完成专项修复/生成，BigQuery ML baseline 已生成 ADS 候选信号。另提供可选 DWS 股票特征快照/训练集查询 helper、BQML ADS 候选信号读取 helper，以及日线股票批量行情预加载能力，供 ML / BQML 策略使用。数据源会读取 `account.trading_permissions`，默认过滤当前账户无专项权限的北交所、科创板、创业板、ST/退市整理等标的，不改变 `BaseDataSource` 抽象接口。详见 §4.6 / §4.7 / §4.8 / §4.16。 |
 | `maxcompute_source.py` | 阿里云 MaxCompute 数据源实现（保留为备选）。通过 pyodps 连接。历史支持：5min K 线、15min ETF K 线。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
-| `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引。 |
+| `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引；读取缓存时统一将 `open/high/low/close/volume/amount` 转为数值，避免 BigQuery Decimal 缓存命中后进入撮合计算。 |
 
 **设计要点**：
 - 抽象接口隔离具体数据源，便于后续接入 Wind、Tushare Pro 等付费源。
@@ -128,12 +128,17 @@ strategy/<name>/
 | preset | 类 | 说明 |
 |---|---|---|
 | `double_ma` | `strategy.double_ma.DoubleMAStrategy` | 双均线（MA5/MA20）金叉买入、死叉卖出，默认 510300.SH × 15min |
+| `ml_stock_picker` | `strategy.ml_stock_picker.MLStockPickerStrategy` | LightGBM/XGBoost 日线选股，优先读取 BigQuery DWS 技术 + 估值/基本面 + 事件/资金流增强特征；模型缺失时使用确定性 fallback score |
+| `bqml_signal_picker` | `strategy.bqml_signal_picker.BQMLSignalPickerStrategy` | 直接读取 BigQuery ML ADS 候选信号，动态 universe，按真实撮合引擎执行；默认 10 万资金、最多 3 只持仓、5 个交易日固定持有期 |
 
 **preset 加载机制**：
 
 - `python run_backtest.py --preset double_ma` → 加载 `strategy/double_ma/config.yaml`
+- `python run_backtest.py --preset ml_stock_picker` → 加载 `strategy/ml_stock_picker/config.yaml`
+- `python run_backtest.py --preset bqml_signal_picker` → 从 `ashare.ads_signal_ml_stock_picker_bqml_1d` 读取候选信号并真实撮合回测
 - 参数优先级（高到低）：**CLI 参数 > preset config > 全局 `config/backtest.yaml` > 内置默认**
 - 输出目录优先级：`--output` > `strategy/<preset>/runs/`（preset 模式）> `output/`（兜底）
+- 回测成功后默认将输出目录完整归档到 `gs://data-aquarium/a-share/backtest_runs/{strategy_key}/{run_label}/`；可用 `--no-gcs-archive` 临时跳过，或用 `--gcs-archive-uri` 覆盖目标前缀。
 
 **设计要点**：
 - 策略与引擎完全解耦：策略只知道 `Context` 接口，不感知回测循环细节。
@@ -151,6 +156,7 @@ strategy/<name>/
 | `plotter.py` | 可视化绘图。使用 Matplotlib 生成累计收益对比图、回撤曲线、月度收益热力图。**模块加载时自动探测系统中文字体**（PingFang SC / Noto Sans CJK / Microsoft YaHei 等），避免中文渲染为方框。 |
 | `report.py` | HTML 报告生成器。**完整对齐 `summary.md` 内容**（PRD_20260520_04）：策略元信息、数据来源、回测参数、交易规则、12 项绩效指标卡片、图表、交易统计、费用汇总、完整交易明细（折叠展示）。 |
 | `summary.py` | Markdown 报告生成器。9 节结构：策略 / 数据 / 参数 / 规则 / 绩效 / 交易统计（含胜率盈亏比）/ 费用 / 交易明细 / 产物清单。基准未加载时显示 "n/a（基准数据未加载）"。 |
+| `gcs_archive.py` | 回测产物 GCS 归档工具。成功回测后递归上传本地输出目录，并生成 `gcs_archive_manifest.json`；支持 ADC 与 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1`。 |
 
 ---
 
@@ -248,32 +254,37 @@ context.order(code, target_qty - current_qty)
 
 历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，单 dataset `ashare`，通过表前缀 `ods_` / `dwd_` / `dws_` / `ads_` 表达数据分层）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
 
-截至 PRD_20260524_03，数据迁移处于 **单 dataset 已确认、当前 GCS Parquet 作为唯一正式输入源、ODS/DWD/DWS/ADS 第一版均已生成并通过审计，财务指标和基本面特征专项修复完成** 的状态：
+截至 PRD_20260524_06，数据迁移处于 **单 dataset 已确认、当前 GCS Parquet 作为唯一正式输入源、ODS/DWD/DWS/ADS 已覆盖旧表和新增 raw 标准化表并通过审计，财务指标和基本面特征专项修复完成，新增事件/资金流 DWS/ADS 已生成** 的状态：
 
 - GCS Parquet 已完成：`gs://data-aquarium/a-share/standardized_parquet/`。
-- BigQuery ODS：基于当前 GCS prefix 创建 `ashare.ods_*` external table，覆盖 manifest 中 36 张源表；不复制 ODS 业务数据。
+- 新增 GCS raw 目录已通过 VM 标准化并写入当前正式 GCS prefix，新增表包括 `fact_kpl_board_1d`、`fact_dragon_tiger_seat_1d`、`fact_money_flow_1d`、`dim_index_profile`、`fact_index_component_1d`、中信/申万行业维表、行业成分、行业行情和指数市场指标表。
+- BigQuery ODS：基于当前 GCS prefix 创建 `ashare.ods_*` external table，覆盖 manifest 中 48 张源表、17,697 个对象；不复制 ODS 业务数据。
 - ODS external manifest：`ashare.ods_external_manifest` 已同步当前 GCS 对象清单。
-- BigQuery DWD：`ashare.dwd_*` native table 已以 full 模式生成 36 张源表对应表；其中 `ashare.dwd_fact_financial_indicator` 已从 GCS 原始 Parquet 直接修复重建，341,977 行，`equity_code` 341,977 行非空，`eps_basic` 309,236 行非空，`bps` 328,544 行非空，`roe` 335,752 行非空。
+- BigQuery DWD：`ashare.dwd_*` native table 已覆盖 48 张源表并通过 `audit-dwd`；其中 `ashare.dwd_fact_financial_indicator` 已从 GCS 原始 Parquet 直接修复重建，341,977 行，`equity_code` 341,977 行非空，`eps_basic` 309,236 行非空，`bps` 328,544 行非空，`roe` 335,752 行非空。新增表中 `dwd_fact_money_flow_1d` 13,602,167 行、`dwd_fact_dragon_tiger_seat_1d` 1,811,517 行、`dwd_fact_kpl_board_1d` 235,147 行。
 - BigQuery DWD core：新增 `ashare.dwd_fact_income_statement_core`（317,841 行）和 `ashare.dwd_fact_balance_sheet_core`（311,277 行），从当前 GCS Parquet 真实中文字段抽取利润表/资产负债表关键指标，不覆盖原泛化 DWD 表。
-- BigQuery DWS：`ashare.dws_*` 第一版策略特征层已生成 6 张表，并新增 `ashare.dws_equity_valuation_features` 估值特征表（16,275,314 行）和 `ashare.dws_equity_fundamental_features` 基本面特征表（16,275,470 行），含 PE/PB/ROE、利润表、资产负债表和行情衍生特征。
-- BigQuery ADS：`ashare.ads_*` 第一版策略信号层已生成 5 张表，并通过 `audit-ads`。
+- BigQuery DWS：`ashare.dws_*` 第一版策略特征层已生成 6 张表，并新增 `ashare.dws_equity_valuation_features` 估值特征表（16,275,314 行）、`ashare.dws_equity_fundamental_features` 基本面特征表（16,275,470 行）和 `ashare.dws_equity_event_money_flow_features_1d` 事件/资金流特征表（13,612,139 行）。
+- BigQuery ADS：`ashare.ads_*` 第一版策略信号层已生成 5 张表，并新增 `ashare.ads_signal_event_money_flow_1d`（13,612,139 行，每日最多 100 个候选）与 `ashare.ads_signal_ml_stock_picker_bqml_1d`（BigQuery ML baseline 候选信号），通过对应 audit。
 
-因此，`BigQueryDataSource` 是当前默认数据源实现，日线回测可直接读取 `ashare.dwd_*` 标准表。DWS/ADS 目前作为特征与信号候选表存在，尚未直接接入策略下单逻辑。
+因此，`BigQueryDataSource` 是当前默认数据源实现，日线回测可直接读取 `ashare.dwd_*` 标准表。DWS/ADS 主要作为特征与信号候选表存在；其中 `ml_stock_picker` 已通过 `BigQueryDataSource.get_equity_feature_snapshot()` / `get_equity_feature_history()` 可选读取 `ashare.dws_*` 增强特征并在策略内排序下单；`bqml_signal_picker` 已通过 `BigQueryDataSource.get_bqml_signal_candidates()` 直接读取 `ashare.ads_signal_ml_stock_picker_bqml_1d` 候选信号，并交由真实撮合引擎执行。
 
 **实现要点**：
 - `BigQueryDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
+- `BigQueryDataSource` 额外提供可选 DWS/ADS helper：`get_equity_feature_snapshot(codes, date, feature_set)` 供回测调仓日读取截面特征；`get_equity_feature_history(codes, start, end, feature_set, label_horizon)` 供 ML 训练脚本读取增强特征并生成训练标签；`get_bqml_signal_candidates(start_date, end_date, table_name, candidate_pool_size)` 供 BQML ADS 信号策略读取候选池。这些方法不属于 `BaseDataSource` 抽象接口。
+- `BigQueryDataSource` 接收 `trading_permissions` 配置；`get_stock_list()` 和 `get_bqml_signal_candidates()` 会 join / 查询 `dwd_dim_security` 并过滤当前账户无权限标的，`get_bars()` / `get_multi_bars()` 也会用代码前缀拦截直接传入的北交所、科创板、创业板股票。
+- `BigQueryDataSource.get_multi_bars(codes, start, end, period="daily")` 对股票日线走 BigQuery 批量查询，减少 ADS 候选池回测时的串行 per-code 查询开销；其他周期或资产类型仍回退到逐标的 `get_bars()`。
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入；本地开发可设置 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1` 临时复用 `gcloud auth print-access-token`。
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
 - GCS 到 BigQuery 的 ODS 接入由 `gcs_to_bigquery/pipeline.py` 负责，包括 manifest、ODS external table 创建、ODS audit 和历史 staging/load 兼容命令。
-- BigQuery 内部 DWD/DWS/ADS 加工由 `bigquery_pipeline/` 负责。当前新入口已承接 `fact_financial_indicator` 专项修复、利润表/资产负债表 core 抽取、财务 DWD 审计、`dws_equity_valuation_features` 和 `dws_equity_fundamental_features` 生成/审计；后续新的 BigQuery 内部加工不得继续放入 `gcs_to_bigquery`。
+- 新增 raw 到标准化 Parquet 的 VM 处理仍由 `data_transfer/prepare_parquet_to_gcs.py` 负责。`sync-raw` 命令只读 GCS raw，并按 per-prefix suffix 规则同步到 `/mnt/localssd/raw_incremental/...`，随后复用 `build` / `upload` / `audit` 命令生成并上传 month-partitioned Parquet；普通指数日/周/月 K 线全量和普通指数日线增量已从新增 raw 任务中排除，避免与现有 `fact_index_kline_*` 重复。
+- BigQuery 内部 DWD/DWS/ADS 加工由 `bigquery_pipeline/` 负责。当前入口已承接完整 DWD transform/audit、DWS/ADS 策略特征与信号层、BigQuery ML baseline、`fact_financial_indicator` 专项修复、利润表/资产负债表 core 抽取、估值/基本面特征和事件/资金流特征/信号生成；后续新的 BigQuery 内部加工不得继续放入 `gcs_to_bigquery`。
 - `gcs_to_bigquery` 默认使用 Google Application Default Credentials；`auth.use_gcloud_access_token` 或环境变量 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1` 可作为 fallback，且 gcloud token 支持超时与刷新。
 - `gcs_to_bigquery` 本地 manifest 默认写入 `${HOME}/.local/state/ashare/ods_pipeline_manifest.jsonl`，不再写入 `/tmp`。
 - `bigquery_pipeline` 同样支持 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1`，配置文件为 `bigquery_pipeline/config.yaml`。
 
 ### 4.7 BigQuery 表结构与接入进度
 
-> **当前状态**（截至 PRD_20260524_03）：`ashare.ods_*` external table 覆盖 36 张源表，`ashare.dwd_*` native table 覆盖 36 张源表并通过审计；`ashare.dwd_fact_financial_indicator` 已绕过坏 external schema 直接由 GCS Parquet 修复重建；利润表/资产负债表已新增窄 DWD core 表；`ashare.dws_*` / `ashare.ads_*` 第一版已生成，`ashare.dws_equity_valuation_features` 与 `ashare.dws_equity_fundamental_features` 已新增，作为策略特征和信号候选层。
+> **当前状态**（截至 PRD_20260524_06）：`ashare.ods_*` external table 覆盖 48 张源表，`ashare.dwd_*` native table 覆盖 48 张源表并通过审计；`ashare.dwd_fact_financial_indicator` 已绕过坏 external schema 直接由 GCS Parquet 修复重建；利润表/资产负债表已新增窄 DWD core 表；`ashare.dws_*` / `ashare.ads_*` 第一版已生成，估值、基本面和事件/资金流特征与候选信号均已进入 BigQuery。
 
 | 用途 | 配置键（`config/backtest.yaml`） | 状态 | 备注 |
 |------|----------------------------------|------|------|
@@ -283,8 +294,16 @@ context.order(code, target_qty - current_qty)
 | 股票列表 | `data.bigquery.tables.dim_security` | ✅ **可用** | `ashare.dwd_dim_security`，多资产维表保留 `security_code` |
 | 指数成分股 | `data.bigquery.tables.board_component` | ✅ **可用** | `ashare.dwd_fact_board_component_1d`，成分股字段为 `equity_code` |
 | 财务指标 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_financial_indicator`，股票字段为 `equity_code`，财报可见日期为 `announcement_date` |
-| 估值特征 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dws_equity_valuation_features`，含 `pe_basic` / `pb` / `roe` 等，按 `announcement_date <= date` 生效 |
-| 基本面特征 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dws_equity_fundamental_features`，合并财务指标、利润表、资产负债表和日行情，按各来源 `announcement_date <= date` 生效 |
+| 估值特征 | `data.bigquery.tables.dws_equity_fundamental_features` | ✅ **可用** | ML 选股从 `ashare.dws_equity_fundamental_features` 读取 `pe_basic` / `pb` / `roe` 等增强特征；独立轻量表 `dws_equity_valuation_features` 仍保留 |
+| 基本面特征 | `data.bigquery.tables.dws_equity_fundamental_features` | ✅ **可用** | `ashare.dws_equity_fundamental_features`，合并财务指标、利润表、资产负债表和日行情，按各来源 `announcement_date <= date` 生效 |
+| 开盘啦榜单 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_kpl_board_1d`，并汇入 `dws_equity_event_money_flow_features_1d` |
+| 龙虎榜席位 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_dragon_tiger_seat_1d`，并汇入事件/资金流 DWS/ADS |
+| 资金流向 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_money_flow_1d`，并汇入事件/资金流 DWS/ADS |
+| 指数成分 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_index_component_1d`；不复用 `fact_board_component_1d` |
+| 中信/申万行业分类与行情 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_dim_citic_industry`、`ashare.dwd_dim_sw_industry`、`ashare.dwd_fact_citic_industry_kline_1d`、`ashare.dwd_fact_sw_industry_kline_1d`、`ashare.dwd_fact_sw_industry_component_1d` |
+| 大盘指数每日指标 | 暂未接入默认 datasource 配置 | ✅ **可用** | `ashare.dwd_fact_index_market_indicator_1d`；普通指数 K 线仍沿用现有 `fact_index_kline_*` |
+| 事件/资金流特征 | `data.bigquery.tables.dws_equity_event_money_flow_features_1d` | ✅ **可用** | ML 选股可读取 `ashare.dws_equity_event_money_flow_features_1d`；`ashare.ads_signal_event_money_flow_1d` 仍为候选信号层 |
+| BQML 选股候选信号 | `data.bigquery.tables.ads_signal_ml_stock_picker_bqml_1d` | ✅ **可用** | `ashare.bqml_ml_stock_picker_baseline` 基于 DWS 增强特征训练，`ashare.ads_signal_ml_stock_picker_bqml_1d` 每日最多 50 个候选；`bqml_signal_picker` 可直接读取 ADS 信号并交由真实撮合引擎下单 |
 | 复权因子 | `data.bigquery.tables.adjust_factor` | 🟡 接口预留 | 日K表已内置复权，单独复权因子表待按需启用 |
 | 1min K | `data.bigquery.tables.kline_1min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
 | 5min K | `data.bigquery.tables.kline_5min_equity` | ❌ 待建表 | 调用时抛 `NotImplementedError` |
@@ -318,8 +337,9 @@ context.order(code, target_qty - current_qty)
    - ETF/LOF（51/56/58/11.SH, 15/16.SZ）→ `fact_fund_kline_1d`
    - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
    - 其他 → `fact_equity_kline_1d`
-5. **数据时间覆盖**：日K线数据覆盖范围由数据迁移 PRD 决定，超出范围的请求返回空 DataFrame，不报错。
-6. **ods 到 dwd 的红线**：`ashare.ods_*` 中的中文源字段不能直接进入回测读取路径；必须经显式字段映射、类型转换、主键去重和 `audit-dwd` 验收后，才允许写入 `ashare.dwd_*`。
+5. **账户权限过滤**：`config/backtest.yaml` 的 `account.trading_permissions` 默认将北交所、科创板、创业板、港股通、新三板、ST/退市整理、融资融券、期权、可转债、CDR、未知证券信息权限均设为 `false`。当前实际影响股票策略的是北交所、科创板、创业板、ST/退市整理和未知证券过滤；融资融券、期权、可转债等先作为账户能力声明，后续接入对应资产或下单能力时复用。
+6. **数据时间覆盖**：日K线数据覆盖范围由数据迁移 PRD 决定，超出范围的请求返回空 DataFrame，不报错。
+7. **ods 到 dwd 的红线**：`ashare.ods_*` 中的中文源字段不能直接进入回测读取路径；必须经显式字段映射、类型转换、主键去重和 `audit-dwd` 验收后，才允许写入 `ashare.dwd_*`。
 
 ### 4.10 订单类型撮合规则（PRD_20260520_06）
 
@@ -522,8 +542,8 @@ handle_data → Context.limit_order / stop_order
 |------|------|------|
 | ODS | `ods_` | 贴源 external table，保留 GCS Parquet 原始 schema 和中文字段，不重复存储业务数据 |
 | DWD | `dwd_` | 标准字段层，英文字段名、严格类型、主键去重、分区聚簇 |
-| DWS | `dws_` | 汇总/特征层，当前已生成股票/基金/指数日线特征、组合收益基础表、板块最新成分、配对候选统计、股票估值特征和股票基本面特征 |
-| ADS | `ads_` | 应用/信号层，当前已生成双均线、ML 选股 proxy、波动率择时、市场状态 proxy 和组合风险快照 |
+| DWS | `dws_` | 汇总/特征层，当前已生成股票/基金/指数日线特征、组合收益基础表、板块最新成分、配对候选统计、股票估值特征、股票基本面特征和事件/资金流特征 |
+| ADS | `ads_` | 应用/信号层，当前已生成双均线、ML 选股 proxy、波动率择时、市场状态 proxy、组合风险快照、事件/资金流候选信号和 BigQuery ML 候选信号 |
 
 **字段映射配置**：
 
@@ -571,7 +591,8 @@ handle_data → Context.limit_order / stop_order
 - `bigquery_pipeline/fundamental.py`：直接读取 GCS Parquet 的真实中文字段，生成 `dwd_fact_income_statement_core`、`dwd_fact_balance_sheet_core`，并生成 `dws_equity_fundamental_features`。
 - `bigquery_pipeline/dwd.py`：DWD 层审计入口，财务指标审计必须校验 `equity_code`、`announcement_date`、`report_period` 及核心指标非空。
 - `bigquery_pipeline/dws.py`：DWS 层转换/审计入口，目前包含 `equity_valuation_features` 与 `equity_fundamental_features`。
-- `bigquery_pipeline/ads.py`：ADS 层拆分占位；本次财务修复不重建 ADS。
+- `bigquery_pipeline/ads.py`：ADS 层候选信号生成与 audit。
+- `bigquery_pipeline/bqml.py`：BigQuery ML baseline 训练、预测和 audit。训练使用 DWS 增强特征，模型表为 `ashare.bqml_ml_stock_picker_baseline`，预测写入 `ashare.ads_signal_ml_stock_picker_bqml_1d`。
 
 **BigQuery 内部管道命令**（`bigquery_pipeline/cli.py`）：
 
@@ -582,7 +603,8 @@ handle_data → Context.limit_order / stop_order
 - `transform-equity-fundamental-features` / `audit-equity-fundamental-features`：生成并验收 `ashare.dws_equity_fundamental_features`。
 - `transform-dwd` / `audit-dwd`：DWD 层入口；当前活动重建路径为 `fact_financial_indicator`。
 - `transform-dws` / `audit-dws`：DWS 层入口；当前活动新增表为 `equity_valuation_features` 和 `equity_fundamental_features`。
-- 当前 ADS 是候选信号层，不直接驱动 `strategy/*` 下单；后续若策略读取 ADS，需要单独 PRD 约束回测和虚拟盘口径。
+- `train-bqml-ml-stock-picker` / `predict-bqml-ml-stock-picker` / `audit-bqml-ml-stock-picker`：训练 BigQuery ML 选股 baseline、生成 ADS 候选信号并验收模型指标与 Top-N 约束。日常日线更新后只需要跑预测；训练按周/月滚动或在特征 schema/市场环境明显变化时触发。
+- `bqml_signal_picker` 是当前唯一直接读取 ADS 候选信号并回测下单的策略；其回测口径已由 PRD_20260524_10 约束，仍使用 `BacktestEngine` / `TradeEngine` 的 next-open、费用、滑点、涨跌停、成交量限制和 T+1 规则。
 
 ---
 
@@ -617,15 +639,15 @@ handle_data → Context.limit_order / stop_order
 
 | 文件 | 类型 | 说明 |
 |------|------|------|
-| `run_backtest.py` | 入口 | CLI 命令行入口（含 `--preset` 模式） |
-| `config/backtest.yaml` | 配置 | 回测参数与费率 |
+| `run_backtest.py` | 入口 | CLI 命令行入口（含 `--preset` 模式与 GCS 归档开关） |
+| `config/backtest.yaml` | 配置 | 回测参数、费率与 GCS 产物归档配置 |
 | `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
-| `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/` |
+| `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/`，并支持新增 raw GCS prefix 同步到 VM local SSD 后标准化 |
 | `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery ODS external table 的管道；支持 ADC/gcloud token 认证、持久 manifest、ODS external table 创建与 audit，并保留历史 staging/load 兼容命令 |
 | `gcs_to_bigquery/config.yaml` | 配置 | GCS-to-BigQuery ODS 配置，定义 project、bucket、单 dataset、ODS external table、历史字段映射和表配置 |
-| `bigquery_pipeline/` | 工具 | BigQuery 内部 DWD/DWS/ADS 加工目录；当前包含财务指标 DWD 修复、利润表/资产负债表 core 抽取、DWS 估值/基本面特征生成、层级审计和独立 CLI |
-| `bigquery_pipeline/config.yaml` | 配置 | BigQuery 内部加工配置，定义 project、bucket、dataset、当前正式 GCS prefix、财务指标和基本面输入表并行读取参数 |
+| `bigquery_pipeline/` | 工具 | BigQuery 内部 DWD/DWS/ADS 加工目录；包含完整 DWD transform/audit、策略 DWS/ADS、BigQuery ML baseline、财务指标 DWD 修复、利润表/资产负债表 core 抽取、估值/基本面特征、事件/资金流特征和独立 CLI |
+| `bigquery_pipeline/config.yaml` | 配置 | BigQuery 内部加工配置，定义 project、bucket、dataset、当前正式 GCS prefix、财务/基本面读取参数、ADS 候选数量和 BQML 训练/预测窗口 |
 | `scripts/legacy/` | 工具 | 历史 GCE VM 恢复脚本归档，包含硬编码 `/mnt/localssd/...` 路径，不属于新装载流程 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
@@ -640,6 +662,8 @@ handle_data → Context.limit_order / stop_order
 | `engine/paper_trader.py` | 核心 | 虚拟盘（已在 engine.__init__ 导出） |
 | `strategy/base_strategy.py` | 抽象 | 策略基类与 Context |
 | `strategy/double_ma/` | 实验包 | 双均线策略（strategy.py + config.yaml + README.md + runs/） |
+| `strategy/ml_stock_picker/` | 实验包 | 机器学习选股策略；训练脚本支持 BigQuery DWS 增强特征，回测调仓日优先读取 DWS 快照，模型缺失时使用确定性 fallback score |
+| `strategy/bqml_signal_picker/` | 实验包 | BigQuery ML ADS 信号真实撮合策略；动态读取 ADS 候选池，默认 10 万资金、最多 3 只持仓、5 个交易日持有期 |
 | `strategy/momentum.py` | 单文件 | 月度动量策略示例 |
 | `strategy/multi_factor.py` | 单文件 | 多因子选股策略示例 |
 | `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
@@ -647,6 +671,7 @@ handle_data → Context.limit_order / stop_order
 | `analytics/plotter.py` | 工具 | 可视化（自动探测中文字体） |
 | `analytics/report.py` | 工具 | HTML 报告（对齐 summary.md） |
 | `analytics/summary.py` | 工具 | Markdown 报告 |
+| `analytics/gcs_archive.py` | 工具 | 回测输出目录上传到 GCS，并生成归档 manifest |
 | `utils/calendar.py` | 工具 | A 股交易日历（chinese_calendar 接入） |
 | `utils/code.py` | 工具 | 股票代码归一化与双向映射 |
 | `utils/logger.py` | 工具 | 日志配置 |

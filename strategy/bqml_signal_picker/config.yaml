@@ -1,0 +1,23 @@
+# BigQuery ML ADS 信号真实撮合回测配置
+
+name: "bqml_signal_picker"
+class: "strategy.bqml_signal_picker.BQMLSignalPickerStrategy"
+description: "读取 BigQuery ML ADS 候选信号，限制 10 万资金下最多持有 3 只，按 5 个交易日固定持有期回测。"
+
+params:
+  signal_table: "ads_signal_ml_stock_picker_bqml_1d"
+  signal_start_date: "20250102"
+  signal_end_date: "20260522"
+  candidate_pool_size: 10
+  max_positions: 3
+  min_positions: 1
+  holding_period: 5
+  position_pct: 0.95
+  min_cash_reserve: 1000
+
+backtest:
+  start_date: "20250102"
+  end_date: "20260522"
+  frequency: "daily"
+  initial_capital: 100000
+  benchmark: "000300.SH"

@@ -29,6 +29,14 @@ Cloud worker paths:
 /mnt/localssd/work
 ```
 
+Incremental raw worker paths for `开盘啦榜单` / `龙虎榜席位` / `资金流向` / selected `指数数据` subsets:
+
+```text
+/mnt/localssd/raw_incremental/source_snapshot=20260523
+/mnt/localssd/parquet_incremental/source_snapshot=20260523
+/mnt/localssd/work/raw_incremental_20260523
+```
+
 ## Credentials
 
 This project uses Application Default Credentials because service account key creation is disabled by organization policy.
@@ -42,6 +50,12 @@ gcloud config set project data-aquarium
 ```
 
 The authenticated identity needs object access to `gs://data-aquarium`.
+
+If ADC is unavailable but `gcloud auth print-access-token` works, set:
+
+```bash
+export ASHARE_USE_GCLOUD_ACCESS_TOKEN=1
+```
 
 ## Raw Upload
 
@@ -94,6 +108,26 @@ python scripts/legacy/cleanup_invalid_checkpoints.py
 ```
 
 The two commands above are legacy GCE recovery utilities with hard-coded `/mnt/localssd/...` and `/home/admin/ashare_pipeline` paths. They are kept under `scripts/legacy/` for historical reference only and are not part of the new GCS to BigQuery flow.
+
+Sync incremental raw CSV and selected ZIP files from GCS to the GCE worker after the raw upload is complete:
+
+```bash
+cd /home/admin/ashare_pipeline
+PYTHONPATH=data_transfer .venv/bin/python data_transfer/prepare_parquet_to_gcs.py sync-raw \
+  --config data_transfer/cloud_new_raw_parquet_config.yaml
+```
+
+Then build only the incremental Parquet tables:
+
+```bash
+PYTHONPATH=data_transfer .venv/bin/python data_transfer/prepare_parquet_to_gcs.py build \
+  --config data_transfer/cloud_new_raw_parquet_config.yaml
+```
+
+The incremental config intentionally excludes ordinary index OHLCV history such as `指数数据/指数日线行情.zip`,
+`指数数据/指数周线行情.zip`, `指数数据/指数月线行情.zip`, and `指数数据/增量数据/指数日线行情/`
+because `gs://data-aquarium/a-share/standardized_parquet/` already contains `fact_index_kline_1d`,
+`fact_index_kline_1w`, and `fact_index_kline_1mo`.
 
 Audit local Parquet:
 

@@ -4,11 +4,11 @@
   python strategy/ml_stock_picker/train.py --config strategy/ml_stock_picker/train_config.yaml
 
 训练流程：
-  1. 从数据源拉取历史日K线（BigQuery 或本地缓存）
-  2. 逐只股票构建技术指标特征
-  3. 计算未来 horizon 天对数收益标签
+  1. 优先从 BigQuery DWS 拉取技术 + 基本面 + 事件/资金流增强特征
+  2. 兼容旧路径：从日K线逐只股票构建技术指标特征
+  3. 计算未来 horizon 天对数收益标签（仅训练使用）
   4. 截面分位数二值化标签（top30%=1, bottom30%=0）
-  5. 滚动训练（walk-forward）避免未来泄漏
+  5. 按时间切分训练/验证集，避免未来泄漏
   6. 保存模型到本地或 GCS
 """
 
@@ -39,15 +39,16 @@ def load_config(path: str) -> dict:
 def build_data_source(cfg: dict):
     """根据配置构造数据源。"""
     source_type = cfg.get("data_source", "bigquery")
-    if source_type == "bigquery":
+    if source_type in {"bigquery", "bigquery_dws"}:
         from data_layer.bigquery_source import BigQueryDataSource
         bq_cfg = cfg.get("bigquery", {})
         return BigQueryDataSource(
             project_id=bq_cfg.get("project_id", ""),
-            dataset=bq_cfg.get("dataset", "ashare_core"),
+            dataset=bq_cfg.get("dataset", "ashare"),
             location=bq_cfg.get("location", "asia-east2"),
             credentials_path=bq_cfg.get("credentials_path", ""),
             use_cache=True,
+            tables=bq_cfg.get("tables", {}),
         )
     elif source_type == "local":
         from data_layer.local_storage import LocalStorage
@@ -96,7 +97,19 @@ def build_dataset(
     full = pd.concat(records, ignore_index=True)
     full = full.sort_values(["date", "code"]).reset_index(drop=True)
 
-    # 截面分位数二值化：每天独立排序
+    return assign_cross_section_labels(full, top_pct=top_pct, bottom_pct=bottom_pct)
+
+
+def assign_cross_section_labels(
+    full: pd.DataFrame,
+    top_pct: float = 0.30,
+    bottom_pct: float = 0.30,
+) -> pd.DataFrame:
+    """按交易日截面分位数，将未来收益标签二值化。"""
+    if full.empty:
+        return full.copy()
+    full = full.dropna(subset=["label_return"]).copy()
+
     def _binarize(group: pd.DataFrame) -> pd.DataFrame:
         if len(group) < 10:
             group["label_class"] = np.nan
@@ -109,17 +122,70 @@ def build_dataset(
         return group
 
     full = full.groupby("date", group_keys=False).apply(_binarize)
-    full = full.dropna(subset=["label_class"]).reset_index(drop=True)
-    return full
+    return full.dropna(subset=["label_class"]).reset_index(drop=True)
+
+
+def fetch_dws_train_dataset(
+    data_source,
+    universe: List[str],
+    start_date: str,
+    end_date: str,
+    feature_engineer: FeatureEngineer,
+    feature_set: str,
+    label_horizon: int,
+    top_pct: float,
+    bottom_pct: float,
+) -> pd.DataFrame:
+    """从 BigQuery DWS 直接读取增强特征并构建训练集。"""
+    loader = getattr(data_source, "get_equity_feature_history", None)
+    if loader is None:
+        raise ValueError("当前数据源不支持 get_equity_feature_history")
+    logger.info(
+        f"从 BigQuery DWS 拉取训练特征: universe={len(universe)}, "
+        f"feature_set={feature_set}, {start_date}~{end_date}"
+    )
+    raw = loader(
+        universe,
+        start_date,
+        end_date,
+        feature_set=feature_set,
+        label_horizon=label_horizon,
+    )
+    if raw.empty:
+        return raw
+    raw = feature_engineer.prepare_model_frame(
+        raw, feature_set=feature_set, require_technical=True
+    )
+    return assign_cross_section_labels(raw, top_pct=top_pct, bottom_pct=bottom_pct)
+
+
+def split_train_validation(
+    df: pd.DataFrame,
+    validation_ratio: float = 0.2,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按时间切分训练集和验证集，避免随机打散导致未来泄漏。"""
+    if df.empty or validation_ratio <= 0:
+        return df.copy(), pd.DataFrame()
+    dates = sorted(df["date"].astype(str).unique())
+    if len(dates) < 5:
+        return df.copy(), pd.DataFrame()
+    cutoff_idx = max(int(len(dates) * (1 - validation_ratio)), 1)
+    cutoff_idx = min(cutoff_idx, len(dates) - 1)
+    cutoff_date = dates[cutoff_idx]
+    train_df = df[df["date"].astype(str) < cutoff_date].copy()
+    valid_df = df[df["date"].astype(str) >= cutoff_date].copy()
+    return train_df.reset_index(drop=True), valid_df.reset_index(drop=True)
 
 
 def train_model(
     df: pd.DataFrame,
     model_type: str = "lightgbm",
     model_params: Optional[dict] = None,
+    feature_set: str = "technical",
 ) -> Any:
     """训练分类模型。"""
-    feature_cols = FeatureEngineer.feature_columns()
+    feature_cols = FeatureEngineer.feature_columns(feature_set)
+    df = df.dropna(subset=["label_class"]).reset_index(drop=True)
     X = df[feature_cols].values
     y = df["label_class"].astype(int).values
 
@@ -141,7 +207,7 @@ def train_model(
             "bagging_freq": 5,
             "verbose": -1,
         }
-        train_data = lgb.Dataset(X, label=y)
+        train_data = lgb.Dataset(X, label=y, feature_name=feature_cols)
         model = lgb.train(params, train_data, num_boost_round=100)
         return model
 
@@ -166,9 +232,26 @@ def train_model(
         raise ValueError(f"不支持的模型类型: {model_type}")
 
 
-def evaluate_model(df: pd.DataFrame, model: Any, model_type: str) -> dict:
+def evaluate_model(
+    df: pd.DataFrame,
+    model: Any,
+    model_type: str,
+    feature_set: str = "technical",
+) -> dict:
     """评估模型：计算 AUC、IC、RankIC。"""
-    feature_cols = FeatureEngineer.feature_columns()
+    return evaluate_model_with_features(df, model, model_type, feature_set=feature_set)
+
+
+def evaluate_model_with_features(
+    df: pd.DataFrame,
+    model: Any,
+    model_type: str,
+    feature_set: str = "technical",
+) -> dict:
+    """评估模型：计算 AUC、IC、RankIC。"""
+    if df.empty:
+        return {"auc": np.nan, "ic": np.nan, "rank_ic": np.nan}
+    feature_cols = FeatureEngineer.feature_columns(feature_set)
     X = df[feature_cols].values
     y = df["label_class"].astype(int).values
 
@@ -220,8 +303,10 @@ def main() -> int:
     model_params = train_cfg.get("model_params", {})
     feature_window = train_cfg.get("feature_window", 20)
     label_horizon = train_cfg.get("label_horizon", 5)
+    feature_set = train_cfg.get("feature_set", "enhanced")
     top_pct = train_cfg.get("top_pct", 0.30)
     bottom_pct = train_cfg.get("bottom_pct", 0.30)
+    validation_ratio = float(train_cfg.get("validation_ratio", 0.2))
 
     universe = train_cfg.get("universe", [])
     if not universe:
@@ -234,20 +319,37 @@ def main() -> int:
         logger.error("训练配置中 start_date / end_date 为空")
         return 1
 
-    # 为特征计算预留前置数据
-    train_start_dt = datetime.strptime(start_date, "%Y%m%d")
-    buffer_days = max(feature_window, label_horizon) + 10
-    adjusted_start = (train_start_dt - timedelta(days=buffer_days)).strftime("%Y%m%d")
-
     data_source = build_data_source(cfg)
-    all_bars = fetch_train_data(data_source, universe, adjusted_start, end_date)
-
-    if not all_bars:
-        logger.error("未获取到任何训练数据")
-        return 1
-
     fe = FeatureEngineer(feature_window=feature_window, label_horizon=label_horizon)
-    dataset = build_dataset(all_bars, fe, top_pct=top_pct, bottom_pct=bottom_pct)
+    source_type = cfg.get("data_source", "bigquery")
+
+    if source_type == "bigquery_dws":
+        dataset = fetch_dws_train_dataset(
+            data_source,
+            universe,
+            start_date,
+            end_date,
+            feature_engineer=fe,
+            feature_set=feature_set,
+            label_horizon=label_horizon,
+            top_pct=top_pct,
+            bottom_pct=bottom_pct,
+        )
+    else:
+        if feature_set == "enhanced":
+            logger.warning("非 bigquery_dws 数据源不提供增强特征，feature_set 降级为 technical")
+            feature_set = "technical"
+        # 为特征计算预留前置数据
+        train_start_dt = datetime.strptime(start_date, "%Y%m%d")
+        buffer_days = max(feature_window, label_horizon) + 10
+        adjusted_start = (train_start_dt - timedelta(days=buffer_days)).strftime("%Y%m%d")
+
+        all_bars = fetch_train_data(data_source, universe, adjusted_start, end_date)
+        if not all_bars:
+            logger.error("未获取到任何训练数据")
+            return 1
+        dataset = build_dataset(all_bars, fe, top_pct=top_pct, bottom_pct=bottom_pct)
+        dataset = fe.prepare_model_frame(dataset, feature_set=feature_set, require_technical=True)
 
     if dataset.empty:
         logger.error("构建数据集后为空，请检查数据范围和特征计算")
@@ -255,8 +357,31 @@ def main() -> int:
 
     logger.info(f"数据集构建完成: {len(dataset)} 条, 列={list(dataset.columns)}")
 
-    model = train_model(dataset, model_type=model_type, model_params=model_params)
-    metrics = evaluate_model(dataset, model, model_type)
+    train_df, valid_df = split_train_validation(dataset, validation_ratio=validation_ratio)
+    if train_df.empty:
+        logger.error("训练集为空，请检查 validation_ratio 或数据范围")
+        return 1
+    logger.info(
+        f"时间切分完成: train={len(train_df)} 条, validation={len(valid_df)} 条, "
+        f"feature_set={feature_set}"
+    )
+
+    model = train_model(
+        train_df,
+        model_type=model_type,
+        model_params=model_params,
+        feature_set=feature_set,
+    )
+    eval_df = valid_df if not valid_df.empty else train_df
+    metrics = evaluate_model_with_features(eval_df, model, model_type, feature_set=feature_set)
+    metrics.update(
+        {
+            "feature_set": feature_set,
+            "train_rows": int(len(train_df)),
+            "validation_rows": int(len(valid_df)),
+            "validation_ratio": validation_ratio,
+        }
+    )
 
     output_path = args.output or train_cfg.get("model_output_path", "")
     if output_path:

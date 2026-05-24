@@ -7,10 +7,11 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -48,6 +49,7 @@ SECURITY_COLUMNS = [
 ]
 
 FACT_TABLES_WITH_REQUIRED_DATE_PREFIXES = ("fact_",)
+SOURCE_DATE_FACT_TABLES = {"fact_sw_industry_component_1d"}
 
 
 @dataclass(frozen=True)
@@ -65,12 +67,74 @@ class ParquetRecord:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class RawSyncRecord:
+    source_gcs_uri: str
+    local_path: str
+    size: int
+    updated_at: str | None
+    status: str = "pending"
+    synced_at: str | None = None
+    error: str | None = None
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def load_config(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def gcloud_token_timeout_seconds(config: dict | None = None) -> int:
+    return int((config or {}).get("auth", {}).get("gcloud_token_timeout_seconds", 30))
+
+
+def gcloud_access_token(config: dict | None = None) -> str:
+    result = subprocess.run(
+        ["gcloud", "auth", "print-access-token", "--quiet"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=gcloud_token_timeout_seconds(config),
+    )
+    token = result.stdout.strip()
+    if not token:
+        raise RuntimeError("gcloud did not return an access token")
+    return token
+
+
+def gcloud_credentials(config: dict):
+    try:
+        from google.auth.credentials import Credentials
+    except ImportError as exc:
+        raise RuntimeError("Missing dependency: google-auth") from exc
+
+    class GcloudAccessTokenCredentials(Credentials):
+        def __init__(self, credential_config: dict) -> None:
+            super().__init__()
+            self._credential_config = credential_config
+            self.refresh(None)
+
+        def refresh(self, request) -> None:
+            self.token = gcloud_access_token(self._credential_config)
+            self.expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=50)
+
+    return GcloudAccessTokenCredentials(config)
+
+
+def use_gcloud_access_token(config: dict) -> bool:
+    env_value = os.environ.get("ASHARE_USE_GCLOUD_ACCESS_TOKEN", "").strip().lower()
+    if env_value in {"1", "true", "yes", "on"}:
+        return True
+    return bool(config.get("auth", {}).get("use_gcloud_access_token", False))
+
+
+def storage_client(config: dict, project_id: str | None = None) -> storage.Client:
+    kwargs = {"project": project_id or config["gcs"].get("project_id")}
+    if use_gcloud_access_token(config):
+        kwargs["credentials"] = gcloud_credentials(config)
+    return storage.Client(**kwargs)
 
 
 def fingerprint(*parts: object) -> str:
@@ -170,6 +234,149 @@ def read_csv_header(source: Path, entry: str | None) -> list[str]:
         raise last_error
     return []
 
+
+def raw_sync_manifest_path(config: dict) -> Path:
+    raw_config = config.get("raw_gcs", {})
+    if raw_config.get("manifest_path"):
+        return norm_path(raw_config["manifest_path"])
+    work_dir = norm_path(config.get("work_dir", norm_path(config["manifest_path"]).parent))
+    return work_dir / "raw_sync_manifest.jsonl"
+
+
+def raw_sync_source_prefix(config: dict) -> str:
+    return str(config.get("raw_gcs", {}).get("source_prefix", "")).strip("/")
+
+
+def raw_sync_bucket_name(config: dict) -> str:
+    raw_config = config.get("raw_gcs", {})
+    return str(raw_config.get("bucket") or config["gcs"]["bucket"])
+
+
+def raw_sync_project_id(config: dict) -> str | None:
+    raw_config = config.get("raw_gcs", {})
+    return raw_config.get("project_id") or config["gcs"].get("project_id")
+
+
+def raw_sync_include_suffixes(config: dict) -> tuple[str, ...]:
+    suffixes = config.get("raw_gcs", {}).get("include_suffixes", [".csv"])
+    normalized = []
+    for suffix in suffixes:
+        text = str(suffix).strip().lower()
+        if text and not text.startswith("."):
+            text = f".{text}"
+        normalized.append(text)
+    return tuple(normalized)
+
+
+def raw_sync_include_specs(config: dict) -> list[tuple[str, tuple[str, ...]]]:
+    raw_config = config.get("raw_gcs", {})
+    default_suffixes = raw_sync_include_suffixes(config)
+    include_items = raw_config.get("include_items")
+    if include_items:
+        specs: list[tuple[str, tuple[str, ...]]] = []
+        for item in include_items:
+            if isinstance(item, str):
+                specs.append((item.strip("/"), default_suffixes))
+                continue
+            prefix = str(item["prefix"]).strip("/")
+            suffixes = item.get("suffixes", default_suffixes)
+            normalized_suffixes = []
+            for suffix in suffixes:
+                text = str(suffix).strip().lower()
+                if text and not text.startswith("."):
+                    text = f".{text}"
+                normalized_suffixes.append(text)
+            specs.append((prefix, tuple(normalized_suffixes)))
+        return specs
+    return [(str(prefix).strip("/"), default_suffixes) for prefix in raw_config.get("include_prefixes") or [""]]
+
+
+def iter_raw_gcs_blobs(config: dict):
+    raw_config = config.get("raw_gcs")
+    if not raw_config:
+        raise RuntimeError("Missing raw_gcs config. Add source_prefix and include_prefixes first.")
+    source_prefix = raw_sync_source_prefix(config)
+    if not source_prefix:
+        raise RuntimeError("raw_gcs.source_prefix is required")
+    include_specs = raw_sync_include_specs(config)
+    gcs_client = storage_client(config, project_id=raw_sync_project_id(config))
+    bucket = gcs_client.bucket(raw_sync_bucket_name(config))
+    seen: set[str] = set()
+    for include_prefix, suffixes in include_specs:
+        blob_prefix = "/".join(part.strip("/") for part in (source_prefix, str(include_prefix)) if part).strip("/")
+        for blob in gcs_client.list_blobs(bucket, prefix=blob_prefix):
+            if blob.name in seen:
+                continue
+            seen.add(blob.name)
+            if blob.name.endswith("/"):
+                continue
+            if suffixes and not blob.name.lower().endswith(suffixes):
+                continue
+            yield blob
+
+
+def raw_local_path_for_blob(config: dict, blob_name: str) -> Path:
+    source_prefix = raw_sync_source_prefix(config)
+    prefix = source_prefix + "/"
+    if not blob_name.startswith(prefix):
+        raise RuntimeError(f"Raw object is outside source_prefix: {blob_name}")
+    relative = blob_name.removeprefix(prefix)
+    if not relative or relative.startswith("../") or "/../" in relative:
+        raise RuntimeError(f"Unsafe raw object path: {blob_name}")
+    return norm_path(config["source_root"]) / relative
+
+
+def write_raw_sync_manifest(path: Path, records: list[RawSyncRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+    os.replace(temp_path, path)
+
+
+def sync_raw(config: dict, dry_run: bool = False, limit: int | None = None) -> list[RawSyncRecord]:
+    records: list[RawSyncRecord] = []
+    skip_size_match = bool(config.get("raw_gcs", {}).get("skip_if_local_size_matches", True))
+    manifest_path = raw_sync_manifest_path(config)
+    for idx, blob in enumerate(iter_raw_gcs_blobs(config), start=1):
+        if limit and idx > limit:
+            break
+        local_path = raw_local_path_for_blob(config, blob.name)
+        size = int(blob.size or 0)
+        source_uri = f"gs://{blob.bucket.name}/{blob.name}"
+        updated_at = blob.updated.isoformat() if blob.updated else None
+        record = RawSyncRecord(source_uri, str(local_path), size, updated_at)
+        if dry_run:
+            records.append(record)
+            continue
+        try:
+            if skip_size_match and local_path.exists() and local_path.stat().st_size == size:
+                records.append(RawSyncRecord(**{**asdict(record), "status": "skipped", "synced_at": utc_now()}))
+            else:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                blob.download_to_filename(local_path)
+                if local_path.stat().st_size != size:
+                    raise RuntimeError(f"Local size mismatch: {local_path.stat().st_size} != {size}")
+                records.append(RawSyncRecord(**{**asdict(record), "status": "synced", "synced_at": utc_now()}))
+            if idx % 100 == 0:
+                write_raw_sync_manifest(manifest_path, records)
+                print(f"[{idx}] raw synced/skipped: {source_uri}", flush=True)
+        except Exception as exc:
+            records.append(RawSyncRecord(**{**asdict(record), "status": "failed", "error": str(exc)}))
+            write_raw_sync_manifest(manifest_path, records)
+            raise
+    total_bytes = sum(record.size for record in records)
+    print(f"Raw objects: {len(records)}")
+    print(f"Raw GiB: {total_bytes / 1024**3:.3f}")
+    if dry_run:
+        for record in records[:20]:
+            print(f"{record.source_gcs_uri} -> {record.local_path}")
+    else:
+        write_raw_sync_manifest(manifest_path, records)
+        print(f"Raw manifest: {manifest_path}")
+    return records
+
 def detect_date_column(columns: list[str], table: str) -> str | None:
     for column in DATE_COLUMNS:
         if column in columns:
@@ -204,6 +411,17 @@ def normalize_date(value: object) -> str | None:
     return parsed.strftime("%Y-%m-%d")
 
 
+def date_from_source_path(source: Path, entry: str | None = None) -> str | None:
+    text = f"{source.as_posix()}/{entry or ''}"
+    latest_in_path = None
+    for match in re.finditer(r"(?<!\d)((?:19|20)\d{2})(0[1-9]|1[0-2])([0-3]\d)(?!\d)", text):
+        value = f"{match.group(1)}{match.group(2)}{match.group(3)}"
+        normalized = normalize_date(value)
+        if normalized:
+            latest_in_path = normalized
+    return latest_in_path
+
+
 def normalize_security_code(value: object) -> str | None:
     text = "" if value is None else str(value).strip().upper()
     if not text:
@@ -221,11 +439,18 @@ def normalize_security_code(value: object) -> str | None:
 def enrich_frame(frame: pd.DataFrame, table: str, source: Path, entry: str | None) -> tuple[pd.DataFrame, str | None]:
     frame = frame.copy()
     frame.columns = [str(c).strip().lstrip("\ufeff") for c in frame.columns]
-    date_col = detect_date_column(list(frame.columns), table)
-    if date_col:
+    if table in SOURCE_DATE_FACT_TABLES:
+        source_date = date_from_source_path(source, entry)
+        if not source_date:
+            return frame.iloc[0:0], None
+        date_col = "__source_file_date__"
+        frame["date"] = source_date
+    else:
+        date_col = detect_date_column(list(frame.columns), table)
+    if date_col and date_col != "__source_file_date__":
         frame["date"] = frame[date_col].map(normalize_date)
         frame = frame[frame["date"].notna() & (frame["date"] != "")]
-    elif table.startswith(FACT_TABLES_WITH_REQUIRED_DATE_PREFIXES):
+    elif not date_col and table.startswith(FACT_TABLES_WITH_REQUIRED_DATE_PREFIXES):
         return frame.iloc[0:0], None
 
     security_col = next((c for c in SECURITY_COLUMNS if c in frame.columns), None)
@@ -661,7 +886,7 @@ def upload(config: dict, dry_run: bool = False) -> None:
             print(record.gcs_uri)
         return
 
-    gcs_client = storage.Client(project=config["gcs"].get("project_id"))
+    gcs_client = storage_client(config)
     bucket = gcs_client.bucket(config["gcs"]["bucket"])
     skip_size_match = config.get("upload", {}).get("skip_if_remote_size_matches", True)
     verify_after_upload = config.get("upload", {}).get("verify_after_upload", True)
@@ -703,7 +928,7 @@ def audit(config: dict, remote: bool = False) -> None:
         if metadata.num_rows != record.rows:
             raise RuntimeError(f"Parquet row count mismatch: {record.local_path}")
     if remote:
-        gcs_client = storage.Client(project=config["gcs"].get("project_id"))
+        gcs_client = storage_client(config)
         bucket_name = config["gcs"]["bucket"]
         prefix = config["gcs"]["prefix"].strip("/") + "/"
         remote_count = 0
@@ -725,7 +950,7 @@ def audit(config: dict, remote: bool = False) -> None:
 
 def progress(config: dict) -> None:
     records = read_manifest(norm_path(config["manifest_path"]))
-    gcs_client = storage.Client(project=config["gcs"].get("project_id"))
+    gcs_client = storage_client(config)
     prefix = config["gcs"]["prefix"].strip("/") + "/"
     uploaded_files = 0
     uploaded_bytes = 0
@@ -778,14 +1003,19 @@ def checkpoint_existing(config: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare month-partitioned Parquet files and upload them to GCS.")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("build", "upload", "audit", "progress", "checkpoint-existing"):
+    for name in ("sync-raw", "build", "upload", "audit", "progress", "checkpoint-existing"):
         p = sub.add_parser(name)
         p.add_argument("--config", default="data_transfer/parquet_config.yaml")
+    sub.choices["sync-raw"].add_argument("--dry-run", action="store_true")
+    sub.choices["sync-raw"].add_argument("--limit", type=int)
     sub.choices["build"].add_argument("--limit", type=int)
     sub.choices["upload"].add_argument("--dry-run", action="store_true")
     sub.choices["audit"].add_argument("--remote", action="store_true")
     args = parser.parse_args()
     config = load_config(Path(args.config))
+    if args.command == "sync-raw":
+        sync_raw(config, dry_run=args.dry_run, limit=args.limit)
+        return 0
     if args.command == "build":
         records = build(config, limit=args.limit)
         manifest_summary(records)

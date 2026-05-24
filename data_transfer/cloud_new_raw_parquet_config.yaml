@@ -1,0 +1,80 @@
+source_root: "/mnt/localssd/raw_incremental/source_snapshot=20260523"
+work_dir: "/mnt/localssd/work/raw_incremental_20260523"
+parquet_root: "/mnt/localssd/parquet_incremental/source_snapshot=20260523"
+manifest_path: "/mnt/localssd/work/raw_incremental_20260523/parquet_manifest.jsonl"
+
+raw_gcs:
+  project_id: "data-aquarium"
+  bucket: "data-aquarium"
+  source_prefix: "a-share/raw/source_snapshot=20260523"
+  include_items:
+    - prefix: "开盘啦榜单"
+      suffixes: [".csv"]
+    - prefix: "龙虎榜席位"
+      suffixes: [".csv"]
+    - prefix: "资金流向"
+      suffixes: [".csv"]
+    - prefix: "指数数据/指数基本信息_"
+      suffixes: [".csv"]
+    - prefix: "指数数据/上交所指数成分"
+      suffixes: [".zip"]
+    - prefix: "指数数据/中证指数成分"
+      suffixes: [".zip"]
+    - prefix: "指数数据/深交所指数成分"
+      suffixes: [".zip"]
+    - prefix: "指数数据/中信行业分类"
+      suffixes: [".csv"]
+    - prefix: "指数数据/中信行业日线行情.zip"
+      suffixes: [".zip"]
+    - prefix: "指数数据/申万行业分类"
+      suffixes: [".csv"]
+    - prefix: "指数数据/申万行业日线行情.zip"
+      suffixes: [".zip"]
+    - prefix: "指数数据/申万行业成分_每日更新"
+      suffixes: [".csv"]
+    - prefix: "指数数据/大盘指数每日指标"
+      suffixes: [".csv"]
+    - prefix: "指数数据/增量数据/中信行业日线行情"
+      suffixes: [".csv"]
+    - prefix: "指数数据/增量数据/申万行业日线行情"
+      suffixes: [".csv"]
+    - prefix: "指数数据/增量数据/大盘指数每日指标"
+      suffixes: [".csv"]
+  skip_if_local_size_matches: true
+  manifest_path: "/mnt/localssd/work/raw_incremental_20260523/raw_sync_manifest.jsonl"
+
+gcs:
+  project_id: "data-aquarium"
+  bucket: "data-aquarium"
+  prefix: "a-share/standardized_parquet"
+  location: "asia-east2"
+
+upload:
+  skip_if_remote_size_matches: true
+  verify_after_upload: true
+  keep_local_files: true
+  audit_sample_files: 100
+
+build:
+  chunksize: 50000
+  flush_rows: 50000
+  max_workers: 3
+  resume_checkpoint: true
+  table_parallel_workers:
+    fact_kpl_board_1d: 2
+    fact_dragon_tiger_seat_1d: 2
+    fact_money_flow_1d: 4
+    fact_index_component_1d: 4
+    fact_sw_industry_component_1d: 2
+    fact_citic_industry_kline_1d: 2
+    fact_sw_industry_kline_1d: 2
+    fact_index_market_indicator_1d: 2
+  table_progress_interval:
+    fact_kpl_board_1d: 200
+    fact_dragon_tiger_seat_1d: 200
+    fact_money_flow_1d: 200
+    fact_index_component_1d: 1000
+    fact_sw_industry_component_1d: 100
+    fact_citic_industry_kline_1d: 100
+    fact_sw_industry_kline_1d: 100
+    fact_index_market_indicator_1d: 100

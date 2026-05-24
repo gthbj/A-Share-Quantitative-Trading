@@ -56,9 +56,14 @@ def _fmt_date(date_str: str) -> str:
 
 
 def _classify_excess(
-    actual_annual: float, bench_total: float, benchmark_loaded: bool = True
+    actual_annual: float,
+    bench_total: float,
+    benchmark_loaded: bool = True,
+    trade_count: int = 0,
 ) -> str:
     """根据策略年化 vs 基准累计给出一句话评价。"""
+    if trade_count == 0:
+        return "回测区间内没有成交，绩效没有策略含义"
     if not benchmark_loaded:
         # 基准缺失时不做相对评价
         if actual_annual > 0:
@@ -159,20 +164,36 @@ def generate_markdown_summary(
     tables_cfg = bq_cfg.get("tables", {})
 
     # 推断本次回测真正用到的表（按 frequency）
-    table_hints = {
-        "daily": tables_cfg.get("daily", ""),
-        "1min": tables_cfg.get("kline_1min", ""),
-        "5min": tables_cfg.get("kline_5min", ""),
-        "15min": tables_cfg.get("kline_etf_15min") or tables_cfg.get("kline_15min", ""),
-        "30min": tables_cfg.get("kline_30min", ""),
-        "60min": tables_cfg.get("kline_60min", ""),
-    }
-    used_table = table_hints.get(frequency, "")
+    if frequency == "daily":
+        used_table = (
+            f"equity: {tables_cfg.get('kline_1d_equity', '')}, "
+            f"fund: {tables_cfg.get('kline_1d_fund', '')}, "
+            f"index: {tables_cfg.get('kline_1d_index', '')}"
+        )
+    else:
+        used_table = tables_cfg.get(f"kline_{frequency}_equity", "")
 
     universe_str = ", ".join(universe) if universe else "(空)"
     doc_first_line = (strategy_doc or "").strip().split("\n")[0] if strategy_doc else "(无描述)"
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    assessment = _classify_excess(
+        metrics.annual_return,
+        metrics.benchmark_return,
+        benchmark_loaded,
+        fills_buy_count + fills_sell_count,
+    )
+    artifact_lines = [
+        "- `summary.md` — 本说明文件（含交易明细）",
+        "- `nav.csv` — 净值曲线明细（CSV 格式）",
+        "- `report.html` — HTML 可视化报告",
+        "- `cum_returns.png` — 策略 vs 基准累计收益曲线",
+        "- `drawdown.png` — 回撤曲线",
+        "- `monthly_returns.png` — 月度收益热力图",
+    ]
+    if trade_rows:
+        artifact_lines.insert(1, "- `trades.csv` — 完整成交流水（CSV 格式）")
+    artifact_list = "\n".join(artifact_lines)
 
     md = f"""# 回测报告 - {now_str}
 
@@ -236,7 +257,7 @@ def generate_markdown_summary(
 
 ### 一句话评价
 
-{_classify_excess(metrics.annual_return, metrics.benchmark_return, benchmark_loaded)}。
+{assessment}。
 
 ## 六、交易统计
 
@@ -255,12 +276,7 @@ def generate_markdown_summary(
 
 ## 九、产物清单
 
-- `summary.md` — 本说明文件（含交易明细）
-- `trades.csv` — 完整成交流水（CSV 格式）
-- `report.html` — HTML 可视化报告
-- `cum_returns.png` — 策略 vs 基准累计收益曲线
-- `drawdown.png` — 回撤曲线
-- `monthly_returns.png` — 月度收益热力图
+{artifact_list}
 
 ---
 

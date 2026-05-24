@@ -27,6 +27,23 @@ execution:
   volume_limit: 0.10       # 单笔订单不超过当日成交量的10%
   allow_short: false       # 不允许做空
 
+# 账户专项交易权限
+# false 表示当前账户没有该权限，回测数据源会过滤对应标的。
+account:
+  trading_permissions:
+    allow_bse: false                 # 北交所：通常需 50万资产 + 24个月交易经验
+    allow_star_market: false         # 科创板：通常需 50万资产 + 24个月交易经验
+    allow_chinext: false             # 创业板：通常需 10万资产 + 24个月交易经验
+    allow_hk_stock_connect: false    # 港股通：通常需 50万资产
+    allow_neeq: false                # 新三板/全国股转：通常需更高资产门槛，分层不同
+    allow_risk_warning: false        # ST/*ST 风险警示股票：需签署风险揭示书
+    allow_delisting: false           # 退市整理股票：需风险揭示/确认
+    allow_margin_trading: false      # 融资融券：当前策略不启用信用交易
+    allow_stock_options: false       # 股票/ETF 期权：当前策略不交易期权
+    allow_convertible_bonds: false   # 可转债：当前股票策略不交易可转债
+    allow_cdr: false                 # 存托凭证 CDR：后续接入时默认过滤
+    allow_unknown_security: false    # dim_security 无法识别的证券默认不允许买入
+
 # 数据配置
 data:
   source: "bigquery"         # 当前默认使用 BigQuery；maxcompute / akshare / tushare 保留为备选
@@ -56,6 +73,11 @@ data:
       dim_security: "dwd_dim_security"               # 股票列表、基金列表、指数列表
       # —— 指数/板块成分股（已接入）——
       board_component: "dwd_fact_board_component_1d" # 指数成分股、板块成分股
+      # —— DWS 特征层（ML 策略可选读取）——
+      dws_equity_daily_features: "dws_equity_daily_features"
+      dws_equity_fundamental_features: "dws_equity_fundamental_features"
+      dws_equity_event_money_flow_features_1d: "dws_equity_event_money_flow_features_1d"
+      ads_signal_ml_stock_picker_bqml_1d: "ads_signal_ml_stock_picker_bqml_1d"
       # —— 以下分钟级表尚未建立，调用时会抛 NotImplementedError ——
       kline_1min_equity: ""       # 1 分钟K表
       kline_5min_equity: ""       # 5 分钟K表
@@ -89,3 +111,12 @@ stop_loss:
 logging:
   level: "INFO"
   file: "logs/backtest.log"
+
+# 回测产物归档
+output:
+  gcs_archive:
+    enabled: true
+    project_id: "data-aquarium"
+    bucket: "data-aquarium"
+    prefix: "a-share/backtest_runs"
+    fail_on_error: true

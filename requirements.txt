@@ -4,6 +4,7 @@ matplotlib>=3.7.0
 akshare>=1.12.0
 pyodps>=0.11.0          # MaxCompute 备选依赖
 google-cloud-bigquery>=3.0.0  # BigQuery 主数据源
+google-cloud-storage>=2.0.0   # GCS 回测产物归档与数据传输
 pyyaml>=6.0
 fastparquet>=2023.0.0
 pyarrow>=12.0.0

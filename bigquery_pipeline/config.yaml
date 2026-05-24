@@ -27,9 +27,29 @@ fundamental:
   parallel_read_workers: 16
   max_files: null
 
+bqml:
+  ml_stock_picker:
+    model_name: "bqml_ml_stock_picker_baseline"
+    prediction_table: "ads_signal_ml_stock_picker_bqml_1d"
+    train_start_date: "20180101"
+    train_end_date: "20241231"
+    eval_start_date: "20250101"
+    eval_end_date: "20251231"
+    prediction_start_date: "20250101"
+    prediction_end_date: "20260522"
+    label_horizon: 5
+    top_pct: 0.30
+    bottom_pct: 0.30
+    top_n: 50
+    max_iterations: 30
+    learn_rate: 0.05
+    max_tree_depth: 6
+    subsample: 0.8
+
 defaults:
   ads:
     ml_stock_picker_top_n: 50
+    event_money_flow_top_n: 100
     pair_candidate_universe:
       - "000001.SZ"
       - "000002.SZ"

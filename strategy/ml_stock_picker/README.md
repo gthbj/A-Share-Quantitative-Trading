@@ -5,14 +5,14 @@
 ## 策略原理
 
 ```
-特征层：日线技术指标（动量、成交量、波动率、RSI、MACD、价格位置）
+特征层：BigQuery DWS 技术特征 + 估值/基本面 + 事件/资金流
     ↓
 模型层：预训练 LightGBM 二分类模型（上涨概率）
     ↓
 输出层：全市场股票按上涨概率排序 → 取 Top-K 等权持仓
 ```
 
-### 特征列表（17维）
+### 特征列表
 
 | 类别 | 特征 | 说明 |
 |---|---|---|
@@ -23,6 +23,12 @@
 | 技术指标 | `macd_diff` / `macd_signal` / `macd_hist` | MACD 三要素 |
 | 价格位置 | `close_to_high_20d` | 收盘价在20日高低区间的相对位置 |
 | 价格位置 | `close_to_ma5` / `close_to_ma20` | 收盘价偏离均线幅度 |
+| 估值/基本面 | `pe_basic` / `pb` / `roe` / `gross_margin` / `net_margin` / `debt_to_assets` | 来自 `dws_equity_fundamental_features` |
+| 规模 | `market_cap_log` | 市值对数 |
+| 事件/资金流 | `net_inflow_to_amount` / `main_net_inflow_to_amount` / `dragon_tiger_net_to_amount` | 资金流和龙虎榜净额相对成交额 |
+| 事件/资金流 | `limit_up_streak` / `is_kpl_event` | 开盘啦榜单事件特征 |
+
+`feature_set=technical` 时保持旧 17 维特征兼容；`feature_set=enhanced` 时使用增强特征。
 
 ### 标签构建
 
@@ -57,7 +63,9 @@ python strategy/ml_stock_picker/train.py \
 ```
 
 训练配置要点：
-- `data_source`: `bigquery`（推荐）或 `local`
+- `data_source`: `bigquery_dws`（推荐）、`bigquery` 或 `local`
+- `train.feature_set`: `enhanced`（推荐）或 `technical`
+- `train.validation_ratio`: 按时间尾部切分验证集，避免随机打散导致未来泄漏
 - `train.start_date` / `end_date`: 训练区间，建议至少 2 年
 - `train.model_type`: `lightgbm`（推荐）或 `xgboost`
 - `train.model_output_path`: 模型保存路径，支持 `gs://bucket/models/xxx.pkl`
@@ -78,6 +86,9 @@ python run_backtest.py \
 回测参数（`config.yaml` 中 `params`）：
 - `model_path`: 预训练模型路径
 - `model_type`: 与训练时一致
+- `feature_source`: `auto` / `dws` / `local`，默认优先 DWS，失败后回退本地技术特征
+- `feature_set`: `enhanced` / `technical`
+- `use_deterministic_fallback`: 模型缺失或预测失败时使用确定性增强打分
 - `top_k`: 持仓数量（默认 8）
 - `rebalance_freq`: 调仓频率，交易日（默认 5，周频）
 - `position_pct`: 资金使用比例（默认 95%）
@@ -102,19 +113,20 @@ gs://data-aquarium/models/lgbm_model.pkl
 | 周频调仓 | `rebalance_freq=5`，控制换手率，降低佣金侵蚀 |
 | 等权持仓 | Top-K 股票各买 1/K 仓位，简化执行，避免单只过度集中 |
 | 截面标签 | 每天独立排序生成正负样本，适应市场 beta 变化 |
+| DWS 优先 | 回测调仓日优先读取 `ashare.dws_*` 快照，训练与回测使用同一套字段口径 |
+| 确定性 fallback | 模型不存在时使用可解释 score，不再随机选股，保证回测可复现 |
 
 ## 性能参考
 
 | 指标 | 参考值 |
 |---|---|
-| 训练数据 | 40 只 × 3 年 ≈ 30,000 条日线 |
-| 训练时间 | LightGBM CPU 约 5-15 秒 |
+| 训练数据 | 40 只 × 3 年 ≈ 30,000 条日线；全市场训练可直接读取 DWS |
+| 训练时间 | LightGBM CPU 小样本约 5-15 秒，全市场取决于查询规模 |
 | AUC | 0.55 ~ 0.65（中频策略常见水平） |
 | RankIC | 0.03 ~ 0.08 |
 
 ## 待优化
 
-- [ ] 加入财务因子（PE、PB、ROE）需等 `ashare_core` 财务表就绪
 - [ ] 加入行业中性化约束（等权行业内选股）
 - [ ] 滚动训练（walk-forward）：每月用最新数据重新训练
 - [ ] 模型 ensemble：5-10 个 LightGBM 模型平均

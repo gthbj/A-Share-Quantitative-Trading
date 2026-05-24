@@ -11,6 +11,19 @@ from typing import Optional
 import pandas as pd
 
 
+BAR_NUMERIC_COLUMNS = ["open", "high", "low", "close", "volume", "amount"]
+
+
+def _normalize_bar_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = out["date"].astype(str)
+    for col in BAR_NUMERIC_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
 class LocalStorage:
     """本地行情数据存储器。
 
@@ -62,7 +75,7 @@ class LocalStorage:
             df = pd.read_parquet(path)
         else:
             df = pd.read_csv(path)
-        return df.reset_index(drop=True)
+        return _normalize_bar_frame(df).reset_index(drop=True)
 
     def load_bars(
         self,
@@ -81,6 +94,8 @@ class LocalStorage:
             df = pd.read_parquet(path)
         else:
             df = pd.read_csv(path)
+
+        df = _normalize_bar_frame(df)
 
         if "date" not in df.columns:
             return df

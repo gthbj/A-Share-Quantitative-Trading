@@ -10,6 +10,31 @@ import numpy as np
 import pandas as pd
 
 
+TECHNICAL_FEATURE_COLUMNS = [
+    "return_1d", "return_5d", "return_10d", "return_20d",
+    "volume_ma5_ratio", "volume_ma20_ratio", "amount_ma5_ratio",
+    "std_5d", "std_20d", "std_ratio",
+    "rsi_14",
+    "macd_diff", "macd_signal", "macd_hist",
+    "close_to_high_20d", "close_to_ma5", "close_to_ma20",
+]
+
+FUNDAMENTAL_FEATURE_COLUMNS = [
+    "pe_basic", "pb", "roe",
+    "gross_margin", "net_margin", "debt_to_assets",
+    "current_ratio", "asset_turnover", "market_cap_log",
+]
+
+EVENT_MONEY_FLOW_FEATURE_COLUMNS = [
+    "net_inflow_to_amount",
+    "main_net_inflow_to_amount",
+    "dragon_tiger_net_to_amount",
+    "dragon_tiger_department_count",
+    "limit_up_streak",
+    "is_kpl_event",
+]
+
+
 class FeatureEngineer:
     """特征工程器。
 
@@ -111,13 +136,91 @@ class FeatureEngineer:
         return out
 
     @staticmethod
-    def feature_columns() -> list[str]:
-        """返回特征列名列表（用于训练时筛选 X）。"""
-        return [
-            "return_1d", "return_5d", "return_10d", "return_20d",
-            "volume_ma5_ratio", "volume_ma20_ratio", "amount_ma5_ratio",
-            "std_5d", "std_20d", "std_ratio",
-            "rsi_14",
-            "macd_diff", "macd_signal", "macd_hist",
-            "close_to_high_20d", "close_to_ma5", "close_to_ma20",
-        ]
+    def feature_columns(feature_set: str = "technical") -> list[str]:
+        """返回特征列名列表（用于训练和预测时筛选 X）。
+
+        Args:
+            feature_set: ``technical`` 保持旧 17 维技术特征；``enhanced`` 增加
+                BigQuery DWS 中已生成的估值/基本面和事件/资金流特征。
+        """
+        if feature_set == "technical":
+            return list(TECHNICAL_FEATURE_COLUMNS)
+        if feature_set == "enhanced":
+            return (
+                list(TECHNICAL_FEATURE_COLUMNS)
+                + list(FUNDAMENTAL_FEATURE_COLUMNS)
+                + list(EVENT_MONEY_FLOW_FEATURE_COLUMNS)
+            )
+        raise ValueError("feature_set must be 'technical' or 'enhanced'")
+
+    @staticmethod
+    def optional_feature_columns(feature_set: str = "technical") -> list[str]:
+        """返回可缺失但会按中性值处理的增强特征列。"""
+        if feature_set == "technical":
+            return []
+        if feature_set == "enhanced":
+            return list(FUNDAMENTAL_FEATURE_COLUMNS) + list(EVENT_MONEY_FLOW_FEATURE_COLUMNS)
+        raise ValueError("feature_set must be 'technical' or 'enhanced'")
+
+    def prepare_model_frame(
+        self,
+        df: pd.DataFrame,
+        feature_set: str = "technical",
+        require_technical: bool = True,
+    ) -> pd.DataFrame:
+        """补齐并清理模型输入特征。
+
+        技术特征缺失通常表示该股票窗口不足，默认会被剔除；增强特征来自
+        财报或事件表，天然稀疏，缺失时保留为 NaN 供模型处理，fallback score
+        会按中性值处理。
+        """
+        out = df.copy()
+        feature_cols = self.feature_columns(feature_set)
+        for col in feature_cols:
+            if col not in out.columns:
+                out[col] = np.nan
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        out[feature_cols] = out[feature_cols].replace([np.inf, -np.inf], np.nan)
+
+        if require_technical:
+            out = out.dropna(subset=TECHNICAL_FEATURE_COLUMNS)
+        return out.reset_index(drop=True)
+
+    @staticmethod
+    def deterministic_score(df: pd.DataFrame) -> pd.Series:
+        """在模型不可用时生成可解释、可复现的截面 fallback score。
+
+        该 score 只使用当前行可见特征，不使用未来收益或 label 字段。
+        """
+        if df.empty:
+            return pd.Series(dtype=float)
+
+        frame = df.copy()
+
+        def rank_score(col: str, higher_is_better: bool = True) -> pd.Series:
+            if col not in frame.columns:
+                return pd.Series(0.5, index=frame.index, dtype=float)
+            values = pd.to_numeric(frame[col], errors="coerce")
+            if values.notna().sum() <= 1:
+                return pd.Series(0.5, index=frame.index, dtype=float)
+            ranked = values.rank(pct=True, ascending=higher_is_better)
+            return ranked.fillna(0.5).astype(float)
+
+        score = (
+            0.18 * rank_score("return_20d")
+            + 0.12 * rank_score("return_5d")
+            + 0.10 * rank_score("macd_hist")
+            + 0.08 * rank_score("volume_ma20_ratio")
+            + 0.08 * rank_score("roe")
+            + 0.06 * rank_score("gross_margin")
+            + 0.05 * rank_score("net_margin")
+            + 0.07 * rank_score("net_inflow_to_amount")
+            + 0.05 * rank_score("main_net_inflow_to_amount")
+            + 0.04 * rank_score("dragon_tiger_net_to_amount")
+            + 0.03 * rank_score("limit_up_streak")
+            + 0.02 * rank_score("is_kpl_event")
+            + 0.06 * rank_score("std_ratio", higher_is_better=False)
+            + 0.04 * rank_score("pb", higher_is_better=False)
+            + 0.02 * rank_score("debt_to_assets", higher_is_better=False)
+        )
+        return score.astype(float)

@@ -84,6 +84,28 @@ def classify(path: Path, entry: str | None = None) -> str:
     else:
         tf = None
 
+    if "指数数据" in text:
+        if "大盘指数每日指标" in text:
+            return "fact_index_market_indicator_1d"
+        if "中信行业日线行情" in text:
+            return "fact_citic_industry_kline_1d"
+        if "申万行业日线行情" in text:
+            return "fact_sw_industry_kline_1d"
+        if "上交所指数成分" in text or "中证指数成分" in text or "深交所指数成分" in text:
+            return "fact_index_component_1d"
+        if "申万行业成分_每日更新" in text:
+            return "fact_sw_industry_component_1d"
+        if "中信行业分类_成分股" in text:
+            return "fact_citic_industry_component_history"
+        if "中信行业分类_行业层级图" in text:
+            return "dim_citic_industry"
+        if "申万行业分类" in text:
+            return "dim_sw_industry"
+        if "指数基本信息_" in text:
+            return "dim_index_profile"
+        if "指数日线行情" in text or "指数周线行情" in text or "指数月线行情" in text:
+            return "unmapped"
+
     if "A股数据_zip" in text and "指数" not in text and tf:
         return f"fact_equity_kline_{tf}"
     if "基金数据" in text and tf:
@@ -130,6 +152,12 @@ def classify(path: Path, entry: str | None = None) -> str:
         return "fact_audit_opinion"
     if "财报披露计划" in text:
         return "fact_disclosure_schedule"
+    if "开盘啦榜单" in text:
+        return "fact_kpl_board_1d"
+    if "龙虎榜席位" in text:
+        return "fact_dragon_tiger_seat_1d"
+    if "资金流向" in text:
+        return "fact_money_flow_1d"
     if name == "交易日历.csv":
         return "dim_trade_calendar"
     if "股票曾用名" in text:

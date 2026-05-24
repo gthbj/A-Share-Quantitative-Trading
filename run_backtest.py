@@ -19,6 +19,7 @@ from analytics.metrics import calculate_metrics
 from analytics.plotter import Plotter
 from analytics.report import generate_html_report
 from analytics.summary import generate_markdown_summary
+from analytics.gcs_archive import apply_gcs_archive_uri, archive_backtest_output
 from data_layer.bigquery_source import BigQueryDataSource
 from engine.backtest import BacktestEngine
 from engine.backtest import DailyRecord
@@ -52,6 +53,7 @@ def build_bigquery_data_source(cfg: dict) -> BigQueryDataSource:
     data_cfg = cfg.get("data", {})
     bq_cfg = data_cfg.get("bigquery", {})
     bq_secrets = secrets.get("bigquery", {})
+    account_cfg = cfg.get("account", {}) or {}
 
     credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or bq_secrets.get("credentials_path", "")
 
@@ -64,6 +66,7 @@ def build_bigquery_data_source(cfg: dict) -> BigQueryDataSource:
         cache_retention_days=cache_cfg.get("retention_days", 7),
         cache_max_size_gb=cache_cfg.get("max_size_gb", 1.0),
         tables=bq_cfg.get("tables", {}),
+        trading_permissions=account_cfg.get("trading_permissions", {}),
     )
 
 
@@ -154,6 +157,16 @@ def main() -> int:
         default=None,
         help="可选的运行标签，加在时间戳后作为子目录后缀，例如 20260519_181500_doublema",
     )
+    parser.add_argument(
+        "--no-gcs-archive",
+        action="store_true",
+        help="跳过本次回测产物 GCS 归档（用于本地调试）。",
+    )
+    parser.add_argument(
+        "--gcs-archive-uri",
+        default=None,
+        help="覆盖本次回测产物归档位置，例如 gs://data-aquarium/a-share/backtest_runs_tmp。",
+    )
     parser.add_argument("--frequency", default=None, help="回测频率：daily / 1min / 5min / 15min / 30min / 60min")
     parser.add_argument(
         "--universe",
@@ -165,6 +178,14 @@ def main() -> int:
 
     # 加载全局配置
     cfg = load_config(args.config)
+    if args.no_gcs_archive:
+        cfg.setdefault("output", {}).setdefault("gcs_archive", {})["enabled"] = False
+    if args.gcs_archive_uri:
+        try:
+            apply_gcs_archive_uri(cfg, args.gcs_archive_uri)
+        except ValueError as e:
+            print(f"--gcs-archive-uri 解析失败: {e}")
+            return 1
     setup_logging(level=cfg.get("logging", {}).get("level", "INFO"))
 
     # ── 加载 preset（若指定）──
@@ -217,6 +238,9 @@ def main() -> int:
             print(f"preset 中 universe 解析失败: {e}")
             return 1
         print(f"使用 preset 标的: {universe}")
+    elif getattr(strategy_cls, "DYNAMIC_UNIVERSE", False):
+        universe = []
+        print("策略使用动态 universe，将由策略 initialize 阶段从数据源加载标的。")
     else:
         default_universe = ",".join(getattr(strategy_cls, "DEFAULT_UNIVERSE", ["510300.SH"]))
         try:
@@ -368,6 +392,8 @@ def main() -> int:
         trades_df = _pd.DataFrame(trade_rows)
         trades_df.to_csv(out / "trades.csv", index=False, encoding="utf-8-sig")
 
+    nav_df.to_csv(out / "nav.csv", index=True, index_label="date", encoding="utf-8-sig")
+
     benchmark_loaded = (
         engine.benchmark_df is not None and not engine.benchmark_df.empty
     )
@@ -396,6 +422,28 @@ def main() -> int:
     print(f"输出目录: {out}")
     print(f"  - HTML 报告: {report_path}")
     print(f"  - Markdown 说明: {summary_path}")
+    archive_cfg = ((cfg.get("output", {}) or {}).get("gcs_archive", {}) or {})
+    try:
+        strategy_key = args.preset or strategy_path.rsplit(".", 1)[-1]
+        archive_result = archive_backtest_output(
+            out,
+            cfg,
+            strategy_key=strategy_key,
+            strategy_class_path=strategy_path,
+            run_label=run_label,
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=float(capital),
+            frequency=frequency,
+            benchmark=benchmark,
+        )
+    except Exception as e:
+        print(f"GCS 归档失败: {e}")
+        if archive_cfg.get("fail_on_error", True):
+            return 1
+    else:
+        if archive_result:
+            print(f"  - GCS 归档: {archive_result.uri} ({len(archive_result.uploaded_files)} files)")
     return 0
 
 

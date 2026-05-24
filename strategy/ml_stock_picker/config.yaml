@@ -55,6 +55,9 @@ params:
     - "688981.SH"
   feature_window: 20
   label_horizon: 5
+  feature_source: "auto"      # auto | dws | local
+  feature_set: "enhanced"     # technical | enhanced
+  use_deterministic_fallback: true
   top_k: 8
   rebalance_freq: 5
   position_pct: 0.95
@@ -68,6 +71,6 @@ backtest:
   benchmark: "000300.SH"
 
 # ── 备注 ──
-# 1. 模型文件需先通过 train.py 训练生成，否则策略会降级为随机选股。
+# 1. 模型文件需先通过 train.py 训练生成，否则策略会使用确定性增强打分 fallback。
 # 2. 止损/滑点等市场级参数继承自全局 config/backtest.yaml。
 # 3. 如需使用 GCS 模型路径，修改 model_path 为 gs://bucket/models/xxx.pkl。

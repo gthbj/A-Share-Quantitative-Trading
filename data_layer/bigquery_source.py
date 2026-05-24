@@ -45,6 +45,22 @@ _FUND_PREFIXES_SZ = ("15", "16")
 # 指数代码前缀（用于路由到 fact_index_kline_1d）
 _INDEX_PREFIXES = ("000", "399", "930", "950", "932")
 
+# 账户专项权限默认值：false 表示当前账户没有该权限。
+_DEFAULT_TRADING_PERMISSIONS = {
+    "allow_bse": False,
+    "allow_star_market": False,
+    "allow_chinext": False,
+    "allow_hk_stock_connect": False,
+    "allow_neeq": False,
+    "allow_risk_warning": False,
+    "allow_delisting": False,
+    "allow_margin_trading": False,
+    "allow_stock_options": False,
+    "allow_convertible_bonds": False,
+    "allow_cdr": False,
+    "allow_unknown_security": False,
+}
+
 
 def _use_gcloud_access_token() -> bool:
     return os.environ.get("ASHARE_USE_GCLOUD_ACCESS_TOKEN", "").strip().lower() in {
@@ -94,6 +110,8 @@ class BigQueryDataSource(BaseDataSource):
         tables: 表名映射，键含 kline_1d_equity / kline_1d_fund / kline_1d_index /
             adjust_factor / dim_security / board_component / kline_5min / kline_1min /
             kline_15min / kline_30min / kline_60min 等。
+        trading_permissions: 账户专项交易权限。false 表示当前账户没有对应权限，
+            数据源会过滤对应板块或证券状态的买入候选。
     """
 
     def __init__(
@@ -107,6 +125,7 @@ class BigQueryDataSource(BaseDataSource):
         cache_retention_days: int = 7,
         cache_max_size_gb: float = 1.0,
         tables: Optional[Dict[str, str]] = None,
+        trading_permissions: Optional[Dict[str, bool]] = None,
     ) -> None:
         self.project_id = project_id
         self.dataset = dataset
@@ -117,6 +136,12 @@ class BigQueryDataSource(BaseDataSource):
         self.cache_retention_days = cache_retention_days
         self.cache_max_size_gb = cache_max_size_gb
         self.tables = tables or {}
+        merged_permissions = dict(_DEFAULT_TRADING_PERMISSIONS)
+        if trading_permissions:
+            merged_permissions.update(
+                {key: bool(value) for key, value in trading_permissions.items()}
+            )
+        self.trading_permissions = merged_permissions
         self._client = None
 
         if self.use_cache:
@@ -223,6 +248,34 @@ class BigQueryDataSource(BaseDataSource):
             )
         return name
 
+    def _optional_table(self, key: str, default: str) -> str:
+        """读取可选表名配置；未配置时使用当前 BigQuery 分层默认表名。"""
+        return self.tables.get(key, "").strip() or default
+
+    def get_multi_bars(
+        self,
+        codes: List[str],
+        start_date: str,
+        end_date: str,
+        period: str = "daily",
+        adjust: str = "qfq",
+    ) -> Dict[str, pd.DataFrame]:
+        """批量获取 K 线。
+
+        日线股票回测使用单次 BigQuery IN 查询，避免候选池较大时逐股查询。
+        其他资产/周期保留基类串行路径。
+        """
+        normalized = [str(code) for code in codes]
+        if period == "daily" and normalized and all(
+            not self._is_fund_code(code) and not self._is_index_code(code)
+            for code in normalized
+        ):
+            normalized = self._filter_codes_by_permissions(normalized)
+            if not normalized:
+                return {}
+            return self._fetch_daily_equity_bars_batch(normalized, start_date, end_date, adjust or "none")
+        return super().get_multi_bars(codes, start_date, end_date, period, adjust)
+
     # ------------------------------------------------------------------ #
     # 代码路由 / 分区列表
     # ------------------------------------------------------------------ #
@@ -245,7 +298,10 @@ class BigQueryDataSource(BaseDataSource):
         if "." not in code:
             return False
         bare, suffix = code.split(".")
-        if bare.startswith(_INDEX_PREFIXES) and suffix.upper() in ("SH", "SZ", "CSI"):
+        suffix = suffix.upper()
+        if bare.startswith(("000", "930", "932", "950")) and suffix in ("SH", "CSI"):
+            return True
+        if bare.startswith("399") and suffix == "SZ":
             return True
         return False
 
@@ -269,6 +325,98 @@ class BigQueryDataSource(BaseDataSource):
             return key, "equity_code", "equity"
 
         raise ValueError(f"不支持的 period: {period}")
+
+    def _permission_enabled(self, key: str) -> bool:
+        return bool(self.trading_permissions.get(key, False))
+
+    @staticmethod
+    def _bare_code(code: str) -> str:
+        return str(code).split(".")[0].strip()
+
+    def _is_code_allowed_by_permissions(self, code: str) -> bool:
+        """基于代码前缀做本地快速过滤。
+
+        该方法只覆盖能从代码本身判断的交易权限；ST/退市等依赖
+        ``dim_security`` 的状态字段，在 BigQuery SQL 过滤中处理。
+        """
+        bare = self._bare_code(code)
+        suffix = str(code).split(".")[-1].upper() if "." in str(code) else ""
+
+        if not self._permission_enabled("allow_bse") and (
+            suffix == "BJ" or bare.startswith(("43", "83", "87", "88", "920"))
+        ):
+            return False
+        if not self._permission_enabled("allow_star_market") and bare.startswith(("688", "689")):
+            return False
+        if not self._permission_enabled("allow_chinext") and bare.startswith(("300", "301")):
+            return False
+        return True
+
+    def _filter_codes_by_permissions(self, codes: List[str]) -> List[str]:
+        allowed = [code for code in codes if self._is_code_allowed_by_permissions(code)]
+        blocked_count = len(codes) - len(allowed)
+        if blocked_count:
+            logger.info("账户权限过滤：跳过 %s 个不可交易标的", blocked_count)
+        return allowed
+
+    def _security_permission_filter_sql(self, alias: str = "s") -> str:
+        """生成基于 dim_security 的账户权限过滤 SQL。"""
+        conditions: List[str] = []
+
+        if not self._permission_enabled("allow_unknown_security"):
+            conditions.append(f"{alias}.security_code IS NOT NULL")
+        if not self._permission_enabled("allow_bse"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.exchange_code, '') != 'BSE'",
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%北交%'",
+                    f"NOT REGEXP_CONTAINS(COALESCE({alias}.security_code, ''), r'^(43|83|87|88|920)')",
+                ]
+            )
+        if not self._permission_enabled("allow_star_market"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%科创%'",
+                    f"NOT REGEXP_CONTAINS(COALESCE({alias}.security_code, ''), r'^(688|689)')",
+                ]
+            )
+        if not self._permission_enabled("allow_chinext"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%创业%'",
+                    f"NOT REGEXP_CONTAINS(COALESCE({alias}.security_code, ''), r'^(300|301)')",
+                ]
+            )
+        if not self._permission_enabled("allow_hk_stock_connect"):
+            conditions.append(f"COALESCE({alias}.market_type, '') NOT LIKE '%港股通%'")
+        if not self._permission_enabled("allow_neeq"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.exchange_code, '') != 'NEEQ'",
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%新三板%'",
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%全国股转%'",
+                ]
+            )
+        if not self._permission_enabled("allow_risk_warning"):
+            conditions.append(
+                f"NOT REGEXP_CONTAINS(UPPER(COALESCE({alias}.security_name, '')), r'\\*?ST')"
+            )
+        if not self._permission_enabled("allow_delisting"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.security_name, '') NOT LIKE '%退%'",
+                    f"COALESCE({alias}.market_type, '') NOT LIKE '%退市%'",
+                ]
+            )
+        if not self._permission_enabled("allow_cdr"):
+            conditions.extend(
+                [
+                    f"COALESCE({alias}.security_type, '') != 'cdr'",
+                    f"COALESCE({alias}.security_name, '') NOT LIKE '%存托%'",
+                ]
+            )
+
+        return " AND ".join(conditions) if conditions else "TRUE"
 
     @staticmethod
     def _partition_months_in_range(start_date: str, end_date: str) -> List[int]:
@@ -305,6 +453,15 @@ class BigQueryDataSource(BaseDataSource):
         period: str = "daily",
         adjust: str = "qfq",
     ) -> pd.DataFrame:
+        if (
+            period == "daily"
+            and not self._is_fund_code(code)
+            and not self._is_index_code(code)
+            and not self._is_code_allowed_by_permissions(code)
+        ):
+            logger.info("账户权限过滤：跳过不可交易标的 %s", code)
+            return pd.DataFrame()
+
         norm_code = code.split(".")[0]
 
         # 1) 本地缓存优先
@@ -354,9 +511,11 @@ class BigQueryDataSource(BaseDataSource):
         """从 dim_security 获取股票列表。
 
         返回列：[code, name, list_date, industry]
-        其中 industry 字段当前为空字符串（dim_security 未提供该字段）。
+        权限配置会过滤当前账户不可交易的专项板块股票。
         """
-        if self.use_cache:
+        permission_sql = self._security_permission_filter_sql("s")
+        use_stock_list_cache = self.use_cache and permission_sql == "TRUE"
+        if use_stock_list_cache:
             cached = self.storage.load_stock_list()
             if not cached.empty:
                 return cached
@@ -364,9 +523,10 @@ class BigQueryDataSource(BaseDataSource):
         table = self._require_table("dim_security")
         sql = (
             f"SELECT security_code, security_name, list_date\n"
-            f"FROM `{self.project_id}.{self.dataset}.{table}`\n"
-            f"WHERE security_type = 'stock'\n"
-            f"  AND is_active = TRUE\n"
+            f"FROM `{self.project_id}.{self.dataset}.{table}` AS s\n"
+            f"WHERE s.security_type = 'stock'\n"
+            f"  AND s.is_active = TRUE\n"
+            f"  AND {permission_sql}\n"
             f"ORDER BY security_code"
         )
         df = self._execute_sql(sql)
@@ -389,7 +549,8 @@ class BigQueryDataSource(BaseDataSource):
         df["industry"] = ""
         df = df[["code", "name", "list_date", "industry"]].copy()
 
-        self.storage.save_stock_list(df)
+        if use_stock_list_cache:
+            self.storage.save_stock_list(df)
         return df
 
     def get_index_constituents(self, index_code: str) -> List[str]:
@@ -417,6 +578,210 @@ class BigQueryDataSource(BaseDataSource):
             )
             return []
         return df["equity_code"].astype(str).tolist()
+
+    # ------------------------------------------------------------------ #
+    # DWS 特征查询（策略可选使用，不改变 BaseDataSource 抽象接口）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _to_yyyymmdd(date_value: str) -> str:
+        digits = "".join(ch for ch in str(date_value) if ch.isdigit())
+        if len(digits) < 8:
+            raise ValueError(f"日期格式应包含 YYYYMMDD: {date_value}")
+        return digits[:8]
+
+    @staticmethod
+    def _to_date_literal(date_value: str) -> str:
+        yyyymmdd = BigQueryDataSource._to_yyyymmdd(date_value)
+        return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+
+    @staticmethod
+    def _sql_string_list(values: List[str]) -> str:
+        return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+
+    def _equity_feature_join_sql(self, feature_set: str, where_sql: str) -> str:
+        daily = self._optional_table("dws_equity_daily_features", "dws_equity_daily_features")
+        fundamental = self._optional_table(
+            "dws_equity_fundamental_features", "dws_equity_fundamental_features"
+        )
+        event = self._optional_table(
+            "dws_equity_event_money_flow_features_1d",
+            "dws_equity_event_money_flow_features_1d",
+        )
+
+        base_cols = """
+  b.equity_code,
+  b.equity_code AS code,
+  FORMAT_DATE('%Y%m%d', b.date) AS date,
+  b.partition_month,
+  SAFE_CAST(b.close AS FLOAT64) AS close,
+  SAFE_CAST(b.return_1d AS FLOAT64) AS return_1d,
+  SAFE_CAST(b.return_5d AS FLOAT64) AS return_5d,
+  SAFE_CAST(b.return_10d AS FLOAT64) AS return_10d,
+  SAFE_CAST(b.return_20d AS FLOAT64) AS return_20d,
+  SAFE_CAST(b.volume_ma5_ratio AS FLOAT64) AS volume_ma5_ratio,
+  SAFE_CAST(b.volume_ma20_ratio AS FLOAT64) AS volume_ma20_ratio,
+  SAFE_CAST(b.amount_ma5_ratio AS FLOAT64) AS amount_ma5_ratio,
+  SAFE_CAST(b.std_5d AS FLOAT64) AS std_5d,
+  SAFE_CAST(b.std_20d AS FLOAT64) AS std_20d,
+  SAFE_CAST(b.std_ratio AS FLOAT64) AS std_ratio,
+  SAFE_CAST(b.rsi_14 AS FLOAT64) AS rsi_14,
+  SAFE_CAST(b.macd_diff AS FLOAT64) AS macd_diff,
+  SAFE_CAST(b.macd_signal AS FLOAT64) AS macd_signal,
+  SAFE_CAST(b.macd_hist AS FLOAT64) AS macd_hist,
+  SAFE_CAST(b.close_to_high_20d AS FLOAT64) AS close_to_high_20d,
+  SAFE_CAST(b.close_to_ma5 AS FLOAT64) AS close_to_ma5,
+  SAFE_CAST(b.close_to_ma20 AS FLOAT64) AS close_to_ma20"""
+
+        joins = ""
+        enhanced_cols = ""
+        if feature_set == "enhanced":
+            enhanced_cols = """,
+  SAFE_CAST(f.pe_basic AS FLOAT64) AS pe_basic,
+  SAFE_CAST(f.pb AS FLOAT64) AS pb,
+  SAFE_CAST(f.roe AS FLOAT64) AS roe,
+  COALESCE(SAFE_CAST(f.gross_margin_from_income AS FLOAT64), SAFE_CAST(f.gross_margin AS FLOAT64)) AS gross_margin,
+  COALESCE(SAFE_CAST(f.net_margin_from_income AS FLOAT64), SAFE_CAST(f.net_margin AS FLOAT64)) AS net_margin,
+  COALESCE(SAFE_CAST(f.debt_to_assets_from_balance AS FLOAT64), SAFE_CAST(f.debt_to_assets AS FLOAT64)) AS debt_to_assets,
+  COALESCE(SAFE_CAST(f.current_ratio_from_balance AS FLOAT64), SAFE_CAST(f.current_ratio AS FLOAT64)) AS current_ratio,
+  COALESCE(SAFE_CAST(f.asset_turnover_from_income_balance AS FLOAT64), SAFE_CAST(f.asset_turnover AS FLOAT64)) AS asset_turnover,
+  LOG(GREATEST(COALESCE(SAFE_CAST(f.market_cap AS FLOAT64), 0), 1)) AS market_cap_log,
+  SAFE_DIVIDE(SAFE_CAST(e.net_inflow_amount AS FLOAT64), NULLIF(SAFE_CAST(b.amount AS FLOAT64), 0)) AS net_inflow_to_amount,
+  SAFE_DIVIDE(SAFE_CAST(e.main_net_inflow_amount AS FLOAT64), NULLIF(SAFE_CAST(b.amount AS FLOAT64), 0)) AS main_net_inflow_to_amount,
+  SAFE_DIVIDE(SAFE_CAST(e.dragon_tiger_net_amount AS FLOAT64), NULLIF(SAFE_CAST(b.amount AS FLOAT64), 0)) AS dragon_tiger_net_to_amount,
+  SAFE_CAST(e.dragon_tiger_department_count AS FLOAT64) AS dragon_tiger_department_count,
+  COALESCE(SAFE_CAST(e.limit_up_streak AS FLOAT64), 0) AS limit_up_streak,
+  CASE WHEN e.is_kpl_event THEN 1.0 ELSE 0.0 END AS is_kpl_event"""
+            joins = f"""
+LEFT JOIN `{self.project_id}.{self.dataset}.{fundamental}` AS f
+  ON b.equity_code = f.equity_code AND b.date = f.date
+LEFT JOIN `{self.project_id}.{self.dataset}.{event}` AS e
+  ON b.equity_code = e.equity_code AND b.date = e.date"""
+
+        return f"""SELECT
+{base_cols}{enhanced_cols}
+FROM `{self.project_id}.{self.dataset}.{daily}` AS b
+{joins}
+WHERE {where_sql}
+"""
+
+    def get_equity_feature_snapshot(
+        self,
+        codes: List[str],
+        date: str,
+        feature_set: str = "enhanced",
+    ) -> pd.DataFrame:
+        """读取某个交易日的股票 DWS 特征快照。
+
+        该方法供策略层可选调用，不属于 ``BaseDataSource`` 抽象接口。
+        """
+        if feature_set not in {"technical", "enhanced"}:
+            raise ValueError("feature_set must be 'technical' or 'enhanced'")
+        if not codes:
+            return pd.DataFrame()
+        date_literal = self._to_date_literal(date)
+        yyyymmdd = self._to_yyyymmdd(date)
+        code_list = self._sql_string_list(codes)
+        where_sql = (
+            f"b.partition_month = {yyyymmdd[:6]} "
+            f"AND b.date = DATE '{date_literal}' "
+            f"AND b.equity_code IN ({code_list})"
+        )
+        return self._execute_sql(self._equity_feature_join_sql(feature_set, where_sql))
+
+    def get_equity_feature_history(
+        self,
+        codes: List[str],
+        start_date: str,
+        end_date: str,
+        feature_set: str = "enhanced",
+        label_horizon: int = 5,
+    ) -> pd.DataFrame:
+        """读取股票 DWS 训练特征，并生成未来 horizon 日收益标签。
+
+        标签仅供训练使用；回测策略不得读取 ``label_return``。
+        """
+        if feature_set not in {"technical", "enhanced"}:
+            raise ValueError("feature_set must be 'technical' or 'enhanced'")
+        if not codes:
+            return pd.DataFrame()
+        start = self._to_yyyymmdd(start_date)
+        end = self._to_yyyymmdd(end_date)
+        start_literal = self._to_date_literal(start)
+        end_literal = self._to_date_literal(end)
+        extended_end = (
+            datetime.strptime(end, "%Y%m%d")
+            + timedelta(days=max(label_horizon * 4 + 20, 30))
+        ).strftime("%Y%m%d")
+        extended_literal = self._to_date_literal(extended_end)
+        partition_months = self._partition_months_in_range(start, extended_end)
+        pm_list = ", ".join(str(pm) for pm in partition_months)
+        code_list = self._sql_string_list(codes)
+        where_sql = (
+            f"b.partition_month IN ({pm_list}) "
+            f"AND b.date >= DATE '{start_literal}' "
+            f"AND b.date <= DATE '{extended_literal}' "
+            f"AND b.equity_code IN ({code_list})"
+        )
+        feature_sql = self._equity_feature_join_sql(feature_set, where_sql)
+        sql = f"""WITH features AS (
+{feature_sql}
+),
+labeled AS (
+  SELECT
+    *,
+    LOG(LEAD(close, {int(label_horizon)}) OVER (
+      PARTITION BY equity_code ORDER BY date
+    )) - LOG(close) AS label_return
+  FROM features
+  WHERE close IS NOT NULL AND close > 0
+)
+SELECT *
+FROM labeled
+WHERE date >= '{start}' AND date <= '{end}'
+        """
+        return self._execute_sql(sql)
+
+    def get_bqml_signal_candidates(
+        self,
+        start_date: str = "",
+        end_date: str = "",
+        table_name: str = "ads_signal_ml_stock_picker_bqml_1d",
+        candidate_pool_size: int = 10,
+    ) -> pd.DataFrame:
+        """读取 BQML ADS 候选信号，供真实撮合回测策略使用。
+
+        该方法只返回信号本身，不返回未来收益或标签。
+        """
+        candidate_pool_size = max(int(candidate_pool_size), 1)
+        table = table_name.strip() or self._optional_table(
+            "ads_signal_ml_stock_picker_bqml_1d",
+            "ads_signal_ml_stock_picker_bqml_1d",
+        )
+        dim_table = self._require_table("dim_security")
+        where = [
+            "a.is_selected",
+            f"a.score_rank <= {candidate_pool_size}",
+        ]
+        if start_date:
+            where.append(f"a.date >= DATE '{self._to_date_literal(start_date)}'")
+        if end_date:
+            where.append(f"a.date <= DATE '{self._to_date_literal(end_date)}'")
+        where.append(self._security_permission_filter_sql("s"))
+        where_sql = " AND ".join(where)
+        sql = f"""
+SELECT
+  FORMAT_DATE('%Y%m%d', a.date) AS date,
+  a.equity_code,
+  SAFE_CAST(a.prob_up AS FLOAT64) AS prob_up,
+  SAFE_CAST(a.score_rank AS INT64) AS score_rank
+FROM `{self.project_id}.{self.dataset}.{table}` AS a
+LEFT JOIN `{self.project_id}.{self.dataset}.{dim_table}` AS s
+  ON a.equity_code = s.security_code
+WHERE {where_sql}
+ORDER BY a.date, a.score_rank, a.equity_code
+"""
+        return self._execute_sql(sql)
 
     # ------------------------------------------------------------------ #
     # SQL 拼接与执行
@@ -474,7 +839,55 @@ class BigQueryDataSource(BaseDataSource):
         df = df.rename(columns={code_col: "code"})
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
         df = df.dropna(subset=["date"])
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         return df[["code", "date", "open", "high", "low", "close", "volume", "amount"]].copy()
+
+    def _fetch_daily_equity_bars_batch(
+        self,
+        codes: List[str],
+        start_date: str,
+        end_date: str,
+        adjust: str,
+    ) -> Dict[str, pd.DataFrame]:
+        table = self._require_table("kline_1d_equity")
+        partition_months = self._partition_months_in_range(start_date, end_date)
+        if not partition_months:
+            return {}
+        code_values = sorted(set(self._filter_codes_by_permissions(codes)))
+        if not code_values:
+            return {}
+
+        pm_list = ", ".join(str(pm) for pm in partition_months)
+        code_list = self._sql_string_list(code_values)
+        sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
+        ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
+        adjust_type = adjust if adjust in ("qfq", "hfq") else "none"
+        sql = f"""
+SELECT equity_code AS code, date, open, high, low, close, volume, amount
+FROM `{self.project_id}.{self.dataset}.{table}`
+WHERE equity_code IN ({code_list})
+  AND adjust_type = '{adjust_type}'
+  AND partition_month IN ({pm_list})
+  AND date >= DATE '{sd}'
+  AND date <= DATE '{ed}'
+ORDER BY equity_code, date
+"""
+        df = self._execute_sql(sql)
+        if df.empty:
+            return {}
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
+        df = df.dropna(subset=["date"])
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        result: Dict[str, pd.DataFrame] = {}
+        for code, group in df.groupby("code", sort=False):
+            result[str(code)] = group[
+                ["code", "date", "open", "high", "low", "close", "volume", "amount"]
+            ].reset_index(drop=True)
+        return result
 
     def _fetch_minute_bars(
         self,

@@ -9,11 +9,22 @@ gs://data-aquarium/a-share/standardized_parquet/
 into BigQuery dataset `ashare` with layer prefixes:
 
 - `ods_*` — 原始层（external table）
-- `dwd_*` — 明细层（native 事实表与维表）
-- `dws_*` — 汇总层（待后续 PRD 启用）
-- `ads_*` — 应用层（待后续 PRD 启用）
+- `dwd_*` — 明细层（由 `bigquery_pipeline/` 生成）
+- `dws_*` — 汇总/特征层（由 `bigquery_pipeline/` 生成）
+- `ads_*` — 应用/信号层（由 `bigquery_pipeline/` 生成）
 
-ODS uses BigQuery external tables over the existing GCS Parquet files. The pipeline does not create native BigQuery copies for ODS business tables; only manifest and error control tables are native. DWD tables are native and are produced by later transform steps.
+ODS uses BigQuery external tables over the existing GCS Parquet files. This package does not create native BigQuery copies for ODS business tables; only manifest and error control tables are native.
+
+`gcs_to_bigquery/` is intentionally limited to GCS manifest and ODS external-table operations. BigQuery-internal transforms are in `bigquery_pipeline/`:
+
+```bash
+python -m bigquery_pipeline.cli transform-dwd --config bigquery_pipeline/config.yaml
+python -m bigquery_pipeline.cli audit-dwd --config bigquery_pipeline/config.yaml
+python -m bigquery_pipeline.cli transform-dws --config bigquery_pipeline/config.yaml
+python -m bigquery_pipeline.cli audit-dws --config bigquery_pipeline/config.yaml
+python -m bigquery_pipeline.cli transform-ads --config bigquery_pipeline/config.yaml
+python -m bigquery_pipeline.cli audit-ads --config bigquery_pipeline/config.yaml
+```
 
 ## Setup
 
@@ -66,7 +77,7 @@ Preview legacy load work. This command is deprecated for the ODS external-table 
 python gcs_to_bigquery/pipeline.py load --config gcs_to_bigquery/config.yaml --dry-run
 ```
 
-Merge one ODS table into DWD after its schema and primary key are confirmed. This command is also deprecated in favor of explicit DWD transform commands.
+Merge one ODS table into DWD after its schema and primary key are confirmed. This command is deprecated in favor of `bigquery_pipeline.cli transform-dwd`.
 
 ```bash
 python gcs_to_bigquery/pipeline.py merge --config gcs_to_bigquery/config.yaml --table fact_equity_kline_1d

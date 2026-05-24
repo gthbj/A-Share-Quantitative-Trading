@@ -2,9 +2,10 @@
 
 策略逻辑：
   1. 加载预训练模型（本地或 GCS）。
-  2. 每 rebalance_freq 个交易日，为 universe 中每只股票构建技术指标特征。
+  2. 每 rebalance_freq 个交易日，优先读取 BigQuery DWS 增强特征快照。
   3. 模型预测每只股票的上涨概率（或收益排序得分）。
-  4. 取 Top-K 等权持仓，卖出不在 Top-K 中的已有持仓。
+  4. 模型缺失时使用确定性 fallback score。
+  5. 取 Top-K 等权持仓，卖出不在 Top-K 中的已有持仓。
 
 面向中频（持仓几天到几周），默认 label_horizon=5、rebalance_freq=5（周频调仓）。
 """
@@ -13,7 +14,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from strategy.base_strategy import BaseStrategy, Context
@@ -36,6 +36,9 @@ class MLStockPickerStrategy(BaseStrategy):
         top_k: 持仓数量。
         rebalance_freq: 调仓频率（交易日数）。
         position_pct: 资金使用比例（0~1）。
+        feature_source: 特征来源，auto/dws/local。
+        feature_set: 特征集合，technical/enhanced。
+        use_deterministic_fallback: 模型不可用时是否使用确定性 fallback score。
     """
 
     DEFAULT_UNIVERSE = [
@@ -59,6 +62,9 @@ class MLStockPickerStrategy(BaseStrategy):
         top_k: int = 8,
         rebalance_freq: int = 5,
         position_pct: float = 0.95,
+        feature_source: str = "auto",
+        feature_set: str = "enhanced",
+        use_deterministic_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.model_path = model_path
@@ -69,6 +75,13 @@ class MLStockPickerStrategy(BaseStrategy):
         self.top_k = top_k
         self.rebalance_freq = rebalance_freq
         self.position_pct = position_pct
+        if feature_source not in {"auto", "dws", "local"}:
+            raise ValueError("feature_source must be 'auto', 'dws' or 'local'")
+        if feature_set not in {"technical", "enhanced"}:
+            raise ValueError("feature_set must be 'technical' or 'enhanced'")
+        self.feature_source = feature_source
+        self.feature_set = feature_set
+        self.use_deterministic_fallback = use_deterministic_fallback
         # ML 训练需要较长历史 warm-up，回测引擎预加载只覆盖回测区间，
         # 模型已在训练阶段完成学习，回测时只需 model_path 加载即可。
         self.lookback_days = feature_window + 5
@@ -86,14 +99,15 @@ class MLStockPickerStrategy(BaseStrategy):
             self._model = load_model(self.model_path)
             if self._model is None:
                 logger.warning(
-                    f"模型加载失败: {self.model_path}，策略将随机选股作为 fallback。"
+                    f"模型加载失败: {self.model_path}，策略将使用确定性增强打分 fallback。"
                 )
         else:
-            logger.warning("未指定 model_path，策略将随机选股作为 fallback。")
+            logger.warning("未指定 model_path，策略将使用确定性增强打分 fallback。")
         logger.info(
             f"MLStockPicker 初始化完成: universe={len(self._init_universe)}, "
             f"top_k={self.top_k}, rebalance_freq={self.rebalance_freq}, "
-            f"model_type={self.model_type}"
+            f"model_type={self.model_type}, feature_source={self.feature_source}, "
+            f"feature_set={self.feature_set}"
         )
 
     def handle_data(self, context: Context, data: Dict[str, pd.Series]) -> None:
@@ -105,31 +119,15 @@ class MLStockPickerStrategy(BaseStrategy):
         current_date = context.current_date
         logger.info(f"{current_date} 调仓日 (bar_count={self._bar_count})")
 
-        # ── 为每只股票构建当前特征 ──
-        feature_rows = []
-        codes = []
-        for code in self._universe:
-            hist = context.get_price(code, count=self.feature_window + 5)
-            if len(hist) < self.feature_window:
-                continue
-            feat_df = self._feature_engineer.compute_features(hist)
-            if feat_df.empty:
-                continue
-            # 取最新一行作为当前截面特征
-            latest = feat_df.iloc[-1:].copy()
-            feature_cols = FeatureEngineer.feature_columns()
-            if any(c not in latest.columns for c in feature_cols):
-                continue
-            if latest[feature_cols].isnull().any().any():
-                continue
-            feature_rows.append(latest[feature_cols].values[0])
-            codes.append(code)
+        feature_df = self._load_feature_snapshot(context)
 
-        if not codes:
+        if feature_df.empty:
             logger.warning(f"{current_date} 无有效特征，跳过调仓")
             return
 
-        X = np.array(feature_rows)
+        codes = feature_df["code"].astype(str).tolist()
+        feature_cols = FeatureEngineer.feature_columns(self.feature_set)
+        X = feature_df[feature_cols].values
 
         # ── 模型预测 ──
         if self._model is not None:
@@ -140,18 +138,24 @@ class MLStockPickerStrategy(BaseStrategy):
                     import xgboost as xgb
                     scores = self._model.predict(xgb.DMatrix(X))
                 else:
-                    scores = np.random.rand(len(codes))
+                    raise ValueError(f"不支持的 model_type: {self.model_type}")
             except Exception as e:
-                logger.warning(f"模型预测失败，降级为随机: {e}")
-                scores = np.random.rand(len(codes))
+                if not self.use_deterministic_fallback:
+                    logger.warning(f"模型预测失败且禁用 fallback，跳过调仓: {e}")
+                    return
+                logger.warning(f"模型预测失败，降级为确定性增强打分: {e}")
+                scores = FeatureEngineer.deterministic_score(feature_df).values
         else:
-            scores = np.random.rand(len(codes))
+            if not self.use_deterministic_fallback:
+                logger.warning("模型不可用且禁用 fallback，跳过调仓")
+                return
+            scores = FeatureEngineer.deterministic_score(feature_df).values
 
         # ── 排序选 Top-K ──
         score_df = pd.DataFrame({"code": codes, "score": scores})
         score_df = score_df.sort_values("score", ascending=False).reset_index(drop=True)
         top_codes = score_df.head(self.top_k)["code"].tolist()
-        logger.info(f"{current_date} 选中 Top-{self.top_k}: {top_codes}")
+        logger.info(f"{current_date} 选中 Top-{len(top_codes)}: {top_codes}")
 
         # ── 调仓执行 ──
         portfolio = context.portfolio
@@ -169,18 +173,21 @@ class MLStockPickerStrategy(BaseStrategy):
 
         # 2) 计算每只目标股票的等权目标市值
         total_value = portfolio.total_value(
-            {code: data[code]["close"] for code in top_codes if code in data}
+            {code: float(data[code]["close"]) for code in top_codes if code in data}
         )
-        target_value_per_stock = total_value * self.position_pct / self.top_k
+        if not top_codes:
+            return
+        target_value_per_stock = total_value * self.position_pct / len(top_codes)
 
         # 3) 买入 Top-K 中尚无持仓或持仓不足的股票
         for code in top_codes:
             if code not in data:
                 continue
-            price = data[code]["close"]
+            price = float(data[code]["close"])
             if price <= 0:
                 continue
-            current_qty = portfolio.positions.get(code, {}).total_qty or 0
+            pos = portfolio.positions.get(code)
+            current_qty = pos.total_qty if pos is not None else 0
             target_qty = int((target_value_per_stock / price) // 100) * 100
             delta = target_qty - current_qty
             if delta > 0:
@@ -197,3 +204,59 @@ class MLStockPickerStrategy(BaseStrategy):
                         logger.info(
                             f"{current_date} 买入 {code} {affordable}股 (资金不足)"
                         )
+
+    def _load_feature_snapshot(self, context: Context) -> pd.DataFrame:
+        """调仓日加载当前截面特征，优先 BigQuery DWS，失败时回退本地计算。"""
+        feature_df = pd.DataFrame()
+        if self.feature_source in {"auto", "dws"}:
+            feature_df = self._load_dws_feature_snapshot(context)
+            if not feature_df.empty:
+                return feature_df
+            if self.feature_source == "dws":
+                return feature_df
+        return self._load_local_feature_snapshot(context)
+
+    def _load_dws_feature_snapshot(self, context: Context) -> pd.DataFrame:
+        loader = getattr(context.data_source, "get_equity_feature_snapshot", None)
+        if loader is None:
+            return pd.DataFrame()
+        try:
+            raw = loader(
+                list(self._universe),
+                context.current_date[:8],
+                feature_set=self.feature_set,
+            )
+        except Exception as exc:
+            logger.warning(f"{context.current_date} DWS 特征快照读取失败，回退本地特征: {exc}")
+            return pd.DataFrame()
+        if raw.empty:
+            return raw
+        if "code" not in raw.columns and "equity_code" in raw.columns:
+            raw = raw.rename(columns={"equity_code": "code"})
+        raw["code"] = raw["code"].astype(str)
+        prepared = self._feature_engineer.prepare_model_frame(
+            raw, feature_set=self.feature_set, require_technical=True
+        )
+        return prepared
+
+    def _load_local_feature_snapshot(self, context: Context) -> pd.DataFrame:
+        rows = []
+        feature_cols = FeatureEngineer.feature_columns("technical")
+        for code in self._universe:
+            hist = context.get_price(code, count=self.feature_window + 5)
+            if len(hist) < self.feature_window:
+                continue
+            feat_df = self._feature_engineer.compute_features(hist)
+            if feat_df.empty:
+                continue
+            latest = feat_df.iloc[-1:].copy()
+            if any(c not in latest.columns for c in feature_cols):
+                continue
+            latest["code"] = code
+            rows.append(latest)
+        if not rows:
+            return pd.DataFrame()
+        raw = pd.concat(rows, ignore_index=True)
+        return self._feature_engineer.prepare_model_frame(
+            raw, feature_set=self.feature_set, require_technical=True
+        )

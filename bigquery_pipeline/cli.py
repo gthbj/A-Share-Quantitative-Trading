@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .ads import audit_ads, transform_ads
+from .bqml import audit_ml_stock_picker_bqml, predict_ml_stock_picker_bqml, train_ml_stock_picker_bqml
 from .client import DEFAULT_CONFIG_PATH, load_config
 from .dwd import audit_dwd, transform_dwd
 from .dws import audit_dws, transform_dws
@@ -40,6 +41,9 @@ def main() -> int:
         "audit-dws",
         "transform-ads",
         "audit-ads",
+        "train-bqml-ml-stock-picker",
+        "predict-bqml-ml-stock-picker",
+        "audit-bqml-ml-stock-picker",
     ):
         p = sub.add_parser(command)
         p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
@@ -95,6 +99,15 @@ def main() -> int:
         return 0
     if args.command == "audit-ads":
         audit_ads(config, target_table=args.table)
+        return 0
+    if args.command == "train-bqml-ml-stock-picker":
+        train_ml_stock_picker_bqml(config)
+        return 0
+    if args.command == "predict-bqml-ml-stock-picker":
+        predict_ml_stock_picker_bqml(config)
+        return 0
+    if args.command == "audit-bqml-ml-stock-picker":
+        audit_ml_stock_picker_bqml(config)
         return 0
     raise AssertionError(args.command)
 
