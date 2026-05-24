@@ -24,4 +24,4 @@ tables:
 
 defaults:
   lookback_days: 30
-  currency: "USD"       # GCP 账单原币种；CNY 换算在查询层做，本期不实现
+  currency: "HKD"       # 此 Billing Account 结算货币为 HKD（港币）
