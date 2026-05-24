@@ -164,7 +164,7 @@ tables:
 
 defaults:
   lookback_days: 30
-  currency: "USD"               # GCP 账单原币种；如需 CNY 换算在查询层做
+  currency: "HKD"               # 本账号结算货币为 HKD（港币）；如需 CNY 换算在查询层做
 ```
 
 不修改 `config/backtest.yaml` 或 `bigquery_pipeline/config.yaml`。

@@ -85,9 +85,9 @@ python -m analytics.cost monthly-by-service --months 3
 ```
 invoice_month | service        | net_cost | currency
 --------------+----------------+----------+---------
-2026-05       | BigQuery       | 1.2345   | USD
-2026-05       | Cloud Storage  | 0.5678   | USD
-2026-04       | BigQuery       | 0.9876   | USD
+2026-05       | BigQuery       | 1.2345   | HKD
+2026-05       | Cloud Storage  | 0.5678   | HKD
+2026-04       | BigQuery       | 0.9876   | HKD
 ...
 ```
 
@@ -102,8 +102,8 @@ python -m analytics.cost monthly-by-resource --month 202605 --service "BigQuery"
 ```
 service  | sku                | resource_name        | resource_global_name | net_cost | currency
 ---------+--------------------+----------------------+----------------------+----------+---------
-BigQuery | Active Storage     | ashare.dwd_...       | ...                  | 0.5      | USD
-BigQuery | Analysis           | (none)               |                      | 0.7      | USD
+BigQuery | Active Storage     | ashare.dwd_...       | ...                  | 0.5      | HKD
+BigQuery | Analysis           | (none)               |                      | 0.7      | HKD
 ...
 ```
 
