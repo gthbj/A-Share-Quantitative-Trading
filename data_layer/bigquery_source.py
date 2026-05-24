@@ -474,6 +474,11 @@ class BigQueryDataSource(BaseDataSource):
         df = df.rename(columns={code_col: "code"})
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y%m%d")
         df = df.dropna(subset=["date"])
+        # BigQuery NUMERIC 列返回 decimal.Decimal，下游 numpy 计算（如 np.log）会失败；
+        # 在此处统一转 float，避免每个策略各自处理。
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
         return df[["code", "date", "open", "high", "low", "close", "volume", "amount"]].copy()
 
     def _fetch_minute_bars(

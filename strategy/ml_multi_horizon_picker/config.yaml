@@ -1,0 +1,40 @@
+# MLMultiHorizon 回测 preset
+#
+# 用法：
+#   python run_backtest.py --strategy strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy \
+#     --params strategy/ml_multi_horizon_picker/config.yaml \
+#     --start 20240101 --end 20240630
+
+name: "ml_multi_horizon_picker"
+class: "strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy"
+description: "多 Horizon ML 策略：4 buy 模型 + 1 sell 模型 + regime 调制 + 6 卖出触发"
+
+params:
+  # 模型目录
+  model_dir: "models/ml_multi_horizon"
+  # 持仓
+  target_position_count: 10
+  # 选股阈值
+  min_buy_prob: 0.50
+  min_prob_floor: 0.30
+  sell_threshold: 0.70
+  # 风控
+  stop_loss_pct_bull: 0.05
+  stop_loss_pct_bear: 0.03
+  trailing_stop_pct: 0.03
+  min_hold_days: 3
+  dropout_persistence_days: 2
+  rank_buffer_multiplier: 2
+  # 资金使用比例
+  position_pct: 0.95
+  # 模型缺失走 deterministic fallback
+  use_deterministic_fallback: true
+  # 特征窗口（17 维基础特征要求 20，sell-side 60d 自动降级）
+  feature_window: 20
+
+backtest:
+  start_date: "20240101"
+  end_date: "20240630"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"

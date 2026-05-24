@@ -1,0 +1,59 @@
+# 多 Horizon ML 策略训练配置
+#
+# 用法：
+#   python -m strategy.ml_multi_horizon_picker.train \
+#     --config strategy/ml_multi_horizon_picker/train_config.yaml
+
+logging:
+  level: "INFO"
+
+# ── 数据源 ──
+data:
+  source: "bigquery"          # bigquery | local
+  bigquery:
+    project_id: "data-aquarium"
+    dataset: "ashare"
+    location: "asia-east2"
+    table_daily: "dws_equity_daily_features"
+    table_kline: "dwd_fact_equity_kline_1d"
+  adjust_type: "qfq"
+
+# ── 训练窗口 ──
+# 训练区间留出验证集与回测时段不重叠
+window:
+  train_start_date: "20220101"
+  train_end_date: "20241231"
+  valid_start_date: "20250101"
+  valid_end_date: "20250630"
+
+# ── 股票池 ──
+# 与 config.yaml DEFAULT_UNIVERSE 保持一致；空则训练时从 DWS 取全市场
+universe: []
+
+# ── 标签 ──
+labels:
+  buy_horizons: [1, 5, 10, 20]
+  buy_top_quantile: 0.30
+  buy_bottom_quantile: 0.30
+  sell_lookforward: 5
+  sell_drawdown_threshold: -0.05
+
+# ── 模型参数 ──
+lightgbm:
+  objective: "binary"
+  metric: ["binary_logloss", "auc"]
+  num_leaves: 63
+  learning_rate: 0.05
+  feature_fraction: 0.85
+  bagging_fraction: 0.85
+  bagging_freq: 5
+  min_child_samples: 30
+  num_boost_round: 200
+  early_stopping_rounds: 25
+  random_state: 42
+  verbose: -1
+
+# ── 输出 ──
+output:
+  model_dir: "models/ml_multi_horizon"
+  save_metadata: true
