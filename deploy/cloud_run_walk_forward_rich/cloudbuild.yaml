@@ -1,0 +1,15 @@
+# Cloud Build 配置：构建 ml-rich-picker 走步训练镜像（PRD_20260525_03）
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_IMAGE}'
+      - '-f'
+      - 'deploy/cloud_run_walk_forward_rich/Dockerfile'
+      - '.'
+images:
+  - '${_IMAGE}'
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s

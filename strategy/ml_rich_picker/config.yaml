@@ -1,0 +1,55 @@
+# MLRichPicker 回测 preset（PRD_20260525_03）
+#
+# 用法::
+#   python run_backtest.py --strategy strategy.ml_rich_picker.MLRichPickerStrategy \
+#       --start 20200102 --end 20250430 --capital 1000000
+
+name: "ml_rich_picker"
+class: "strategy.ml_rich_picker.MLRichPickerStrategy"
+description: "富特征 ML 策略：30 维 buy (17 daily + 8 fundamental + 5 event) + 35 维 sell"
+
+params:
+  # 走步模型注册表（训完后路径）
+  model_dir: "models/walk_forward_rich"
+  model_registry_path: "gs://data-aquarium/models/walk_forward_rich/registry.json"
+  # BigQuery（用于策略 initialize 预加载特征）
+  bq_project: "data-aquarium"
+  bq_dataset: "ashare"
+  bq_location: "asia-east2"
+  adjust_type: "qfq"
+  # Trading permissions
+  trading_permissions:
+    allow_bse: false
+    allow_star_market: false
+    allow_chinext: false
+    allow_hk_stock_connect: false
+    allow_neeq: false
+    allow_risk_warning: false
+    allow_delisting: false
+    allow_margin_trading: false
+    allow_stock_options: false
+    allow_convertible_bonds: false
+    allow_cdr: false
+    allow_unknown_security: false
+  # 持仓
+  target_position_count: 10
+  min_buy_prob: 0.50
+  min_prob_floor: 0.30
+  sell_threshold: 0.70
+  # 风控
+  stop_loss_pct_bull: 0.05
+  stop_loss_pct_bear: 0.03
+  trailing_stop_pct: 0.03
+  min_hold_days: 3
+  dropout_persistence_days: 2
+  rank_buffer_multiplier: 2
+  position_pct: 0.95
+  use_deterministic_fallback: true
+  feature_window: 20
+
+backtest:
+  start_date: "20200102"
+  end_date: "20250430"
+  frequency: "daily"
+  initial_capital: 1000000
+  benchmark: "000300.SH"
