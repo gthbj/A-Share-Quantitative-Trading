@@ -207,20 +207,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="GCP 账单导出 BigQuery 成本分析（PRD_20260524_04）",
     )
     # 公共 flag 放在父 parser，并在每个子 parser 上再挂一份，
-    # 这样 `--dry-run` 在子命令前后均可用。
+    # 这样 `--config` / `--dry-run` 在子命令前后均可用。
     def _add_common(parser_obj):
         parser_obj.add_argument(
             "--config",
-            default=str(DEFAULT_CONFIG_PATH),
+            default=argparse.SUPPRESS,
             help=f"配置文件路径 (默认 {DEFAULT_CONFIG_PATH})",
         )
         parser_obj.add_argument(
             "--dry-run",
             action="store_true",
+            default=argparse.SUPPRESS,
             help="只打印 SQL，不实际执行",
         )
 
     _add_common(p)
+    p.set_defaults(config=str(DEFAULT_CONFIG_PATH), dry_run=False)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s1 = sub.add_parser("monthly-by-service", help="近 N 个月按服务汇总净成本")

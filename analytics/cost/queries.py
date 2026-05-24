@@ -72,7 +72,7 @@ def monthly_by_service(
     _require_bigquery()
     sql = f"""
         SELECT
-          FORMAT_DATE('%Y-%m', invoice.month_date) AS invoice_month,
+          FORMAT_DATE('%Y-%m', invoice_parsed.month_date) AS invoice_month,
           service.description                     AS service,
           ROUND({_NET_COST_EXPR}, 4)              AS net_cost,
           currency
@@ -80,7 +80,7 @@ def monthly_by_service(
           UNNEST([STRUCT(PARSE_DATE('%Y%m', invoice.month) AS month_date)]) AS invoice_parsed
         WHERE DATE(_PARTITIONTIME) >= @part_start
           AND DATE(_PARTITIONTIME) <= @part_end
-          AND PARSE_DATE('%Y%m', invoice.month) BETWEEN @start_month AND @end_month
+          AND invoice_parsed.month_date BETWEEN @start_month AND @end_month
         GROUP BY invoice_month, service, currency
         ORDER BY invoice_month DESC, net_cost DESC
     """.strip()

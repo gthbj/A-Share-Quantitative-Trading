@@ -23,6 +23,7 @@ from analytics.cost import queries
 from analytics.cost.cli import (
     BillingConfig,
     _expand_account_id,
+    build_parser,
     load_billing_config,
 )
 
@@ -37,6 +38,8 @@ def test_monthly_by_service_sql_contains_partition_filter():
         date(2026, 5, 1),
     )
     assert "_PARTITIONTIME" in bundle.sql
+    assert "invoice_parsed.month_date" in bundle.sql
+    assert "invoice.month_date" not in bundle.sql
 
 
 def test_monthly_by_resource_sql_contains_partition_filter():
@@ -151,3 +154,17 @@ def test_load_billing_config_from_repo_default():
         assert cfg.location == "asia-east2"
     finally:
         del os.environ["GCP_BILLING_ACCOUNT_ID"]
+
+
+def test_common_flags_work_before_and_after_subcommand():
+    before = build_parser().parse_args(
+        ["--config", "custom.yaml", "--dry-run", "monthly-by-service"]
+    )
+    after = build_parser().parse_args(
+        ["monthly-by-service", "--config", "custom.yaml", "--dry-run"]
+    )
+
+    assert before.config == "custom.yaml"
+    assert before.dry_run is True
+    assert after.config == "custom.yaml"
+    assert after.dry_run is True
