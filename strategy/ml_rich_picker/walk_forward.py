@@ -493,29 +493,38 @@ def _compute_optimal_remaining_days_per_group(
 ) -> pd.Series:
     """对单只股票计算每天的 ``optimal_remaining_days`` 标签。
 
-    语义：站在 T 日收盘出信号、T+1 开盘进场的口径下，往后看 ``lookforward``
-    个交易日，找出风险可控（自 T+1 起累计 drawdown 不破 ``drawdown_threshold``）
-    的窗口里**累计收益最大**那一天对应的 k。
+    语义对齐**策略推理时刻**：站在 T 日收盘后做卖出决策，T+1 开盘是最早的执行时点。
+    label k 表示「从 T 日决策起还要持有的交易日数」——
 
-    具体算法（向量化思路用循环表达）：
+    - ``k = 0``：**立刻卖**（T+1 开盘卖出，不再持有任何一天） → 基线收益 = 0
+    - ``k = 1``：再持有 1 天（T+1 开盘不卖，T+2 开盘卖）
+    - ``k = N``：再持有 N 天，T+1+N 开盘卖
 
-    ::
+    每行的标签是 ``argmax_k``：在风控可控（持仓期累计 drawdown 不破
+    ``drawdown_threshold``）的窗口里收益最高的 k\\*。
 
-        for each i:
-            entry_idx  = i + 1
-            running_min_low = entry_open
+    与策略推理的对齐保证：当模型预测 ``remaining_days = 0`` 时，
+    ``remaining_days_to_prob_sell`` 桥接出高 ``prob_sell``、父类 trigger 在
+    T 收盘卖出 → T+1 开盘成交，正好对应训练 label k=0 的"T+1 开盘卖"语义。
+
+    具体算法（向量化思路用循环表达）::
+
+        for each i (T):
+            entry_idx = i + 1                # T+1 的索引，"如果继续持有，明天开盘价"
+            baseline_open = opens[entry_idx]
             best_k = 0
-            best_return = 0
-            for k in 0 .. lookforward:
-                exit_idx = entry_idx + k + 1
-                running_min_low = min(running_min_low, low[entry_idx + k])
-                cum_drawdown = (running_min_low - entry_open) / entry_open
-                if cum_drawdown < drawdown_threshold:
-                    break                           # 已被风控截断
-                cum_return = log(open[exit_idx]) - log(entry_open)
+            best_return = 0.0                # k=0 = 立刻卖，固定收益 0
+            running_min_low = baseline_open  # 还未持有任何一天，drawdown=0
+            for k in 1 .. lookforward:
+                # 持有第 k 天的 low 参与 drawdown
+                day_idx = entry_idx + k - 1  # 持仓窗口最后一个完整交易日
+                running_min_low = min(running_min_low, low[day_idx])
+                if (running_min_low - baseline_open) / baseline_open < dd_threshold:
+                    break
+                exit_idx = entry_idx + k      # 持有 k 天后的下一个开盘
+                cum_return = log(open[exit_idx]) - log(baseline_open)
                 if cum_return > best_return:
-                    best_k = k
-                    best_return = cum_return
+                    best_k, best_return = k, cum_return
             label[i] = best_k
 
     返回 Series（与 group 同 index），缺数据的位置为 NaN。
@@ -536,34 +545,39 @@ def _compute_optimal_remaining_days_per_group(
         lows = np.full(n, np.nan, dtype=float)
 
     for i in range(n - 1):
-        entry_idx = i + 1
+        entry_idx = i + 1                  # T+1 开盘价对应索引（baseline）
         if entry_idx >= n:
             break
-        entry_open = opens[entry_idx]
-        if not np.isfinite(entry_open) or entry_open <= 0:
+        baseline_open = opens[entry_idx]
+        if not np.isfinite(baseline_open) or baseline_open <= 0:
             continue
 
-        running_min_low = entry_open
+        # k=0 = 立刻卖，作为 baseline 总是合法。后面 k>=1 才有 drawdown / exit。
         best_k = 0
         best_return = 0.0
+        running_min_low = baseline_open
+
+        # k 最大不能超过 lookforward，也不能让 exit_idx 越界
         kmax = min(lookforward, n - entry_idx - 1)
-        for k in range(kmax + 1):
-            day_idx = entry_idx + k
-            day_low = lows[day_idx]
+        for k in range(1, kmax + 1):
+            # 持有第 k 天（持仓窗口的最后一个完整交易日）。day_idx = entry_idx + k - 1
+            # 注意：k=1 时 day_idx=entry_idx=T+1，这天的 low 进入 drawdown 统计。
+            day_idx = entry_idx + k - 1
+            day_low = lows[day_idx] if day_idx < n else np.nan
             if np.isfinite(day_low) and day_low > 0:
                 if day_low < running_min_low:
                     running_min_low = day_low
-            # 风控：累计回撤超阈值就截断，剩下的 day 不再考虑
-            cum_drawdown = (running_min_low - entry_open) / entry_open
+            cum_drawdown = (running_min_low - baseline_open) / baseline_open
             if cum_drawdown < drawdown_threshold:
                 break
-            exit_idx = entry_idx + k + 1
+
+            exit_idx = entry_idx + k          # 持有 k 天后的开盘 = T+1+k
             if exit_idx >= n:
                 break
             exit_open = opens[exit_idx]
             if not np.isfinite(exit_open) or exit_open <= 0:
                 continue
-            cum_return = np.log(exit_open) - np.log(entry_open)
+            cum_return = np.log(exit_open) - np.log(baseline_open)
             if cum_return > best_return:
                 best_return = cum_return
                 best_k = k
@@ -689,9 +703,12 @@ def _train_lgbm_with_quality(
     is_regression = model_name == SELL_REMAINING_DAYS_MODEL_NAME
     params = dict(cfg.lightgbm_params or {})
     if is_regression:
-        # 覆盖父类默认的 binary 配置
-        params.setdefault("objective", "regression_l1")
-        params.setdefault("metric", ["l1", "l2"])
+        # **必须强制覆盖**，不能用 setdefault：项目 lightgbm yaml 配置默认
+        # objective=binary / metric=binary_logloss（为 buy 模型服务），如果只
+        # 用 setdefault，sell 回归模型会被错按 binary 训练，输出全部落在 [0,1]，
+        # 后续 sigmoid 桥接会把几乎所有持仓打成 prob_sell > 0.5。
+        params["objective"] = "regression_l1"
+        params["metric"] = ["l1", "l2"]
     model = _train_lgbm(Xtr, ytr, Xva, yva, params)
     pred = np.asarray(model.predict(Xva), dtype=float)
     pred_mean = float(np.nanmean(pred)) if len(pred) else float("nan")

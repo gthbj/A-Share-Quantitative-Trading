@@ -40,11 +40,16 @@ labels:
   decision_horizon: 5
   buy_top_quantile: 0.30
   buy_bottom_quantile: 0.30
+  # sell 回归 label optimal_remaining_days ∈ [0, sell_lookforward]
+  # 推理时 strategy 的 sell_max_remaining_days 必须与此对齐
   sell_lookforward: 5
   sell_drawdown_threshold: -0.05
-  sell_underperform_quantile: 0.30
+  sell_underperform_quantile: 0.30   # [兼容] 旧 binary sell 标签用，新回归路径不读
 
 lightgbm:
+  # objective 这里默认 binary 给 buy 模型用；sell 回归路径在
+  # walk_forward._train_lgbm_with_quality 里会**强制覆盖**成 regression_l1
+  # （setdefault 不行，必须硬覆盖，否则 sell 会被错按 binary 训练）。
   objective: "binary"
   metric: ["binary_logloss", "auc"]
   num_leaves: 63

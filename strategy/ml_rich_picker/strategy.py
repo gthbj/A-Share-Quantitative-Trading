@@ -95,6 +95,13 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         sell_remaining_days_threshold: float = 1.0,
         sell_remaining_days_sharpness: float = 1.5,
         sell_max_remaining_days: float = DEFAULT_MAX_REMAINING_DAYS,
+        # Position-aware sell trigger 参数（A 路线后半段）：
+        # sell 回归模型只看市场未来，浮盈兑现 / 浮亏割肉这两个核心持仓决策
+        # 由策略层 trigger 用 position_return + holding_days 真实合成。
+        profit_take_return_threshold: float = 0.20,   # 浮盈 ≥ 20%
+        profit_take_prob_ceiling: float = 0.45,        # 且 prob_up_h5 < 0.45 → 止盈
+        stale_loss_min_days: int = 8,                  # 持仓 ≥ 8 个交易日
+        stale_loss_return_threshold: float = -0.05,    # 且仍浮亏 ≥ -5% → 割肉
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -121,6 +128,12 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         self.sell_remaining_days_threshold = float(sell_remaining_days_threshold)
         self.sell_remaining_days_sharpness = float(sell_remaining_days_sharpness)
         self.sell_max_remaining_days = float(sell_max_remaining_days)
+        # Position-aware trigger 阈值（参考 v1 的 stop_loss / trailing_stop，
+        # 但这里专门针对"浮盈兑现"和"长期被套"两个 v1 触发器未覆盖的场景）
+        self.profit_take_return_threshold = float(profit_take_return_threshold)
+        self.profit_take_prob_ceiling = float(profit_take_prob_ceiling)
+        self.stale_loss_min_days = int(stale_loss_min_days)
+        self.stale_loss_return_threshold = float(stale_loss_return_threshold)
         # 预加载的富特征宽表，indexed by (date, equity_code)
         self._rich_features: Optional[pd.DataFrame] = None
         self._rich_features_index: Optional[pd.MultiIndex] = None
@@ -669,3 +682,101 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
     def _argmax_horizon(self, row: pd.Series) -> int:
         """rich 版避免跨 horizon 概率比较，持仓状态特征记录决策 horizon。"""
         return self.decision_horizon
+
+    # ──────────────────────────────────────────────────────────────
+    # Sell trigger：在父类基础上追加 position-aware 触发器
+    # ──────────────────────────────────────────────────────────────
+
+    def _check_sell_triggers(
+        self,
+        context: Context,
+        score_df: pd.DataFrame,
+        top_2n_codes: set,
+        stop_loss_pct: float,
+        data: Dict[str, pd.Series],
+    ) -> Dict[str, str]:
+        """覆盖父类：在原 6 个触发器（stop_loss / trailing / max_hold /
+        rank_dropout / prob_floor / sell_model）之外追加两个 position-aware
+        触发器，用 position_return 和 holding_days 真正合成业务决策——
+        因为新 sell 回归模型已经把持仓状态从特征里拿掉，这些信号必须在
+        策略层显式合成，否则"浮盈大该止盈 / 浮亏久该割肉"会丢失。
+        """
+        sells = super()._check_sell_triggers(
+            context, score_df, top_2n_codes, stop_loss_pct, data,
+        )
+        extra = self._check_position_aware_sell_triggers(
+            context, score_df, data, existing=sells,
+        )
+        sells.update(extra)
+        return sells
+
+    def _check_position_aware_sell_triggers(
+        self,
+        context: Context,
+        score_df: pd.DataFrame,
+        data: Dict[str, pd.Series],
+        existing: Dict[str, str],
+    ) -> Dict[str, str]:
+        """逐持仓检查两个 position-aware 触发器：
+
+        - **profit_take（止盈）**：浮盈 ≥ ``profit_take_return_threshold``
+          *且* ``prob_up_h{decision_horizon}`` < ``profit_take_prob_ceiling``
+          → 兑现。语义："已经赚很多 + 模型不再看好" → 别等回吐。
+        - **stale_loss（割肉）**：``holding_days >= stale_loss_min_days``
+          *且* 浮亏 ≤ ``stale_loss_return_threshold`` → 认输。
+          语义："拖太久且仍套" → 不再期待反弹。
+
+        触发依据用真实持仓的 ``pos.cost_price``（execution-priced，none 复权）
+        计算 ``position_return``，跟回测撮合口径一致；不依赖 _position_state
+        的快照（避免冷启动时缺失状态导致漏 trigger）。
+        """
+        portfolio = context.portfolio
+        prob_lookup = score_df.set_index("code")
+        out: Dict[str, str] = {}
+        prob_h_col = f"prob_up_h{self.decision_horizon}"
+
+        for code, pos in portfolio.positions.items():
+            if code in existing or getattr(pos, "total_qty", 0) <= 0:
+                continue
+            if getattr(pos, "sellable_qty", 0) <= 0:
+                continue
+            if code not in data:
+                continue
+            cost = float(getattr(pos, "cost_price", 0.0) or 0.0)
+            if cost <= 0:
+                continue
+            try:
+                price = float(data[code]["close"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            position_return = price / cost - 1.0
+            state = self._position_state.get(code)
+            holding_days = self._holding_trade_days(context, state, pos)
+
+            # 止盈：浮盈大 + 市场已经透支
+            if position_return >= self.profit_take_return_threshold:
+                prob_h = None
+                if code in prob_lookup.index and prob_h_col in prob_lookup.columns:
+                    try:
+                        prob_h = float(prob_lookup.loc[code, prob_h_col])
+                    except (TypeError, ValueError):
+                        prob_h = None
+                if prob_h is not None and prob_h < self.profit_take_prob_ceiling:
+                    out[code] = (
+                        f"profit_take(ret={position_return:.2%},"
+                        f"prob_h{self.decision_horizon}={prob_h:.3f})"
+                    )
+                    continue
+
+            # 割肉：持仓拖太久 + 仍浮亏
+            if (holding_days >= self.stale_loss_min_days
+                    and position_return <= self.stale_loss_return_threshold):
+                out[code] = (
+                    f"stale_loss(ret={position_return:.2%},"
+                    f"held={holding_days}d)"
+                )
+                continue
+
+        return out

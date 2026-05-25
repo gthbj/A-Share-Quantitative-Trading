@@ -900,6 +900,31 @@ def test_binary_auc_helper():
 # ──────────────────────────────────────────────────────────────
 
 
+def test_optimal_remaining_days_k_zero_means_immediate_sell():
+    """关键契约：k=0 表示"立刻卖出 T+1 开盘"、baseline 收益 0。
+
+    任何 k>=1 的收益都是相对 T+1 开盘价的对数收益，所以下行行情下
+    所有 k>=1 都 < 0 < best_return(k=0) → best_k=0；上行行情下
+    存在 k>=1 使收益为正，才会偏离 k=0。
+    """
+    from strategy.ml_rich_picker.walk_forward import (
+        _compute_optimal_remaining_days_per_group,
+    )
+
+    # 平盘：所有未来 open 等于 T+1 开盘价 → 所有 k 收益都是 0 → best_k 维持初始 0
+    flat = pd.DataFrame({
+        "date": [f"202401{i + 1:02d}" for i in range(8)],
+        "open": [10.0] * 8,
+        "low":  [9.95] * 8,
+    })
+    labels = _compute_optimal_remaining_days_per_group(
+        flat, lookforward=5, drawdown_threshold=-0.10,
+    )
+    # 所有非末尾行都该是 0（平盘无收益，立刻卖最优）
+    assert labels.iloc[0] == pytest.approx(0.0)
+    assert labels.iloc[2] == pytest.approx(0.0)
+
+
 def test_optimal_remaining_days_uphill_picks_last_day():
     """单调上涨行情：最佳卖出剩余天数应该接近 lookforward 上限。"""
     from strategy.ml_rich_picker.walk_forward import (
@@ -918,14 +943,15 @@ def test_optimal_remaining_days_uphill_picks_last_day():
         group, lookforward=5, drawdown_threshold=-0.10,
     )
 
-    # 第 0 行：T+1 进、T+6 出最赚 → label = 5（lookforward 上限）
+    # i=0: entry_idx=1, baseline=10.5; k=5: exit=opens[6]=13.0, return=log(13/10.5)
+    # 是 k 取值范围里最大者 → best_k=5
     assert labels.iloc[0] == pytest.approx(5.0)
-    # 第 5 行：往后 5 天仍单调涨 → 同样 5
+    # i=5: 同样单调涨，best_k=5
     assert labels.iloc[5] == pytest.approx(5.0)
 
 
 def test_optimal_remaining_days_downhill_picks_zero():
-    """单调下跌：立刻卖（k* = 0）。"""
+    """单调下跌：立刻卖（k* = 0），所有 k>=1 收益均为负。"""
     from strategy.ml_rich_picker.walk_forward import (
         _compute_optimal_remaining_days_per_group,
     )
@@ -948,17 +974,25 @@ def test_optimal_remaining_days_downhill_picks_zero():
 
 
 def test_optimal_remaining_days_drawdown_truncates_window():
-    """中段触发风控阈值：搜索窗被截断，不会贪婪等下一个高点。"""
+    """中段触发风控阈值：搜索窗被截断，不会贪婪等下一个高点。
+
+    数据（i=0 行的视角，entry_idx=1，baseline=10.0）::
+
+        i:     0     1     2     3     4    5     6
+        open:  9.5  10.0  11.0  12.0   8.0  13.0  14.0   ← baseline=opens[1]=10.0
+        low:   9.0   9.8  10.5  11.5   7.8  12.8  13.7
+
+        k=1: day=1, low=9.8,  dd=-2%, exit=11, ret=log(11/10)=0.095
+        k=2: day=2, low=10.5, dd=-2%, exit=12, ret=log(12/10)=0.182  ← best
+        k=3: day=3, low=11.5, dd=-2%, exit=8,  ret=log(8/10)=-0.223  不更新
+        k=4: day=4, low=7.8,  dd=-22% → break
+
+    所以 best_k=2（在风控截断前的最高收益）。
+    """
     from strategy.ml_rich_picker.walk_forward import (
         _compute_optimal_remaining_days_per_group,
     )
 
-    # T 日 = 20240101，T+1 entry_open = 10.0：
-    #   k=0：exit=opens[2]=11，return=log(11/10)=0.095，min_low so far=9.8（dd=-2%）
-    #   k=1：exit=opens[3]=12，return=log(12/10)=0.182，min_low=9.8
-    #   k=2：exit=opens[4]=8（暴跌日），return=log(8/10)=-0.223，不更新 best
-    #   k=3：day_idx=4 → low=7.8 → running_min=7.8 → dd=-22% < -10% → break
-    # 所以 best_k = 1（k=1 时收益最大且未触发风控）
     group = pd.DataFrame(
         {
             "date": ["20240101", "20240102", "20240103", "20240104",
@@ -972,7 +1006,7 @@ def test_optimal_remaining_days_drawdown_truncates_window():
         group, lookforward=5, drawdown_threshold=-0.10,
     )
 
-    assert labels.iloc[0] == pytest.approx(1.0)
+    assert labels.iloc[0] == pytest.approx(2.0)
 
 
 def test_optimal_remaining_days_label_does_not_depend_on_holding_state():
@@ -1053,6 +1087,32 @@ def test_deterministic_optimal_remaining_days_clipped_to_range():
     assert (out <= 10.0).all()
 
 
+def test_config_sell_max_remaining_days_matches_walk_forward_lookforward():
+    """关键契约：策略 sell_max_remaining_days 必须与训练 sell_lookforward 对齐。
+
+    训练 label optimal_remaining_days ∈ [0, sell_lookforward]；推理 clip 上限
+    若大于训练范围，模型实际永远预测不到大值，sigmoid 桥接会误判分布。
+    """
+    import yaml
+    from pathlib import Path
+
+    backtest_cfg_path = Path("strategy/ml_rich_picker/config.yaml")
+    train_cfg_path = Path("strategy/ml_rich_picker/walk_forward_config.yaml")
+    if not (backtest_cfg_path.exists() and train_cfg_path.exists()):
+        pytest.skip("找不到配置文件（非项目工作目录）")
+
+    bt_cfg = yaml.safe_load(backtest_cfg_path.read_text("utf-8")) or {}
+    tr_cfg = yaml.safe_load(train_cfg_path.read_text("utf-8")) or {}
+
+    inference_max = bt_cfg["params"]["sell_max_remaining_days"]
+    train_lookforward = tr_cfg["labels"]["sell_lookforward"]
+
+    assert inference_max == pytest.approx(float(train_lookforward)), (
+        f"sell_max_remaining_days={inference_max} 必须 == "
+        f"walk_forward sell_lookforward={train_lookforward}"
+    )
+
+
 def test_remaining_days_to_prob_sell_threshold_boundary():
     """剩余天数 = threshold 时桥接的 prob_sell 应为 0.5。"""
     rd = pd.Series([0.0, 1.0, 2.0, 5.0, 20.0])
@@ -1102,7 +1162,7 @@ def test_score_universe_remaining_days_clipped_when_model_overshoots():
     """模型预测超出 [0, max] 时也要被 clip 到合法范围。"""
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    # 异常大的输出 100.0（远超 max=20）
+    # 异常大的输出 100.0（远超 max=5）
     strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel(100.0)
 
     class _FakeCtx:
@@ -1110,7 +1170,12 @@ def test_score_universe_remaining_days_clipped_when_model_overshoots():
 
     out = strat._score_universe(_FakeCtx())
     assert out is not None
-    assert np.allclose(out["predicted_remaining_days"].to_numpy(), 20.0)
+    # 默认 sell_max_remaining_days=5（与 walk_forward sell_lookforward 对齐）
+    assert np.allclose(
+        out["predicted_remaining_days"].to_numpy(),
+        strat.sell_max_remaining_days,
+    )
+    assert strat.sell_max_remaining_days == pytest.approx(5.0)
 
 
 def test_score_universe_prob_sell_triggers_when_remaining_days_zero():
@@ -1181,6 +1246,57 @@ def test_train_lgbm_with_quality_regression_uses_rank_ic_gate():
     assert metrics["objective"] == "regression_l1"
 
 
+def test_train_lgbm_force_overrides_yaml_binary_objective_for_sell_regression():
+    """关键契约：项目 yaml lightgbm.objective='binary'（为 buy 服务）
+    必须被 sell 回归模型强制覆盖成 regression_l1，不能 setdefault。
+
+    回归之前的 bug：用 setdefault 时，cfg.lightgbm_params 已经从 yaml 加载到
+    objective='binary'，sell 模型会被错按 binary 训练，输出全部 ∈ [0, 1]，
+    桥接 sigmoid 后几乎所有持仓都触发卖出。
+    """
+    from strategy.ml_rich_picker.walk_forward import _train_lgbm_with_quality
+
+    rng = np.random.RandomState(11)
+    n = 400
+    X = rng.randn(n, 5)
+    y = X[:, 0] * 5.0 + rng.randn(n) * 0.5   # 显然超出 [0,1]
+    cfg = SimpleNamespace(
+        lightgbm_params={
+            # 模拟真实 walk_forward_config.yaml：lightgbm.objective=binary
+            "objective": "binary",
+            "metric": ["binary_logloss", "auc"],
+            "num_boost_round": 20,
+            "early_stopping_rounds": 5,
+            "verbose": -1,
+        },
+        min_buy_auc=0.55,
+        min_sell_rank_ic=0.0,   # 放低门槛只测 objective 行为
+    )
+
+    # Sell 回归路径：必须强制覆盖成 regression_l1
+    model, metrics = _train_lgbm_with_quality(
+        X[:300], y[:300], X[300:], y[300:], cfg,
+        SELL_REMAINING_DAYS_MODEL_NAME,
+    )
+    assert metrics["objective"] == "regression_l1", (
+        f"yaml 配置 binary 必须被 sell 回归覆盖，实际 {metrics['objective']}"
+    )
+    # cfg.lightgbm_params 原始字典不能被改坏（避免污染后续 buy 训练）
+    assert cfg.lightgbm_params["objective"] == "binary"
+
+    # Buy 路径：保留 yaml 的 binary
+    rng2 = np.random.RandomState(13)
+    y_bin = (rng2.rand(n) < 0.4).astype(int)
+    cfg.min_buy_auc = 0.0   # 放低门槛只测 objective
+    buy_model, _ = _train_lgbm_with_quality(
+        X[:300], y_bin[:300], X[300:], y_bin[300:], cfg, "buy_h5",
+    )
+    # buy 不该被改成 regression
+    pred = np.asarray(buy_model.predict(X[300:310]), dtype=float)
+    # binary 模型输出 ∈ [0, 1]
+    assert (pred >= 0).all() and (pred <= 1).all()
+
+
 def test_spearman_corr_helper():
     """无 scipy 的 Spearman 相关系数：单调关系 → 1.0。"""
     from strategy.ml_rich_picker.walk_forward import _spearman_corr
@@ -1199,6 +1315,174 @@ def test_spearman_corr_helper():
 
     # 极小样本返回 None
     assert _spearman_corr(np.array([1.0, 2.0]), np.array([1.0, 2.0])) is None
+
+
+def test_profit_take_trigger_fires_when_big_gain_and_low_prob():
+    """止盈：浮盈 ≥ 20% 且 prob_up_h5 < 0.45 → 触发 profit_take 卖出。"""
+    strat = MLRichPickerStrategy(
+        require_rich_features=False,
+        profit_take_return_threshold=0.20,
+        profit_take_prob_ceiling=0.45,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.05,
+        decision_horizon=5,
+        min_hold_days=3,
+    )
+    # 持仓状态：成本 10，当前价 13 → 浮盈 30%；持仓 5 天
+    portfolio = Portfolio(1_000_000)
+    pos = Position(
+        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    )
+    pos._buy_records["20240108"] = 1000
+    portfolio.positions["600000.SH"] = pos
+    strat._trading_date_index = strat._build_trading_date_index(
+        ["20240108", "20240109", "20240110", "20240111", "20240112", "20240115"]
+    )
+    strat._position_state["600000.SH"] = PositionState(
+        entered_date="20240108", expected_horizon=5, peak_price=14.0,
+    )
+    ctx = SimpleNamespace(
+        current_date="20240115",
+        portfolio=portfolio,
+        all_bars={},
+    )
+
+    # prob_up_h5 = 0.30（< 0.45 ceiling）→ 应触发止盈
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10, "score": 0.30,
+         "predicted_remaining_days": 4.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 13.0})}
+
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={},
+    )
+    assert "600000.SH" in out
+    assert "profit_take" in out["600000.SH"]
+
+
+def test_profit_take_not_triggered_when_market_still_bullish():
+    """浮盈大但 prob_up_h5 仍然看多（>= ceiling）→ 不止盈，让模型继续看着。"""
+    strat = MLRichPickerStrategy(
+        require_rich_features=False,
+        profit_take_return_threshold=0.20,
+        profit_take_prob_ceiling=0.45,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.05,
+    )
+    portfolio = Portfolio(1_000_000)
+    pos = Position(
+        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    )
+    portfolio.positions["600000.SH"] = pos
+    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.70, "prob_sell": 0.10, "score": 0.70,
+         "predicted_remaining_days": 4.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 14.0})}
+
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={},
+    )
+    assert "600000.SH" not in out
+
+
+def test_stale_loss_trigger_fires_when_held_long_and_still_underwater():
+    """持仓 ≥ 8 个交易日且仍浮亏 ≥ -5% → 触发 stale_loss。"""
+    strat = MLRichPickerStrategy(
+        require_rich_features=False,
+        profit_take_return_threshold=0.20,
+        profit_take_prob_ceiling=0.45,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.05,
+    )
+    portfolio = Portfolio(1_000_000)
+    pos = Position(
+        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    )
+    pos._buy_records["20240101"] = 1000
+    portfolio.positions["600000.SH"] = pos
+    # 构造 10 个交易日
+    dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
+             "20240108", "20240109", "20240110", "20240111", "20240112",
+             "20240115"]
+    strat._trading_date_index = strat._build_trading_date_index(dates)
+    strat._position_state["600000.SH"] = PositionState(
+        entered_date="20240101", expected_horizon=5, peak_price=10.5,
+    )
+    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
+
+    # 当前 9.0，浮亏 -10%（< -5% 阈值）
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20, "score": 0.50,
+         "predicted_remaining_days": 3.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 9.0})}
+
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={},
+    )
+    assert "600000.SH" in out
+    assert "stale_loss" in out["600000.SH"]
+
+
+def test_stale_loss_not_triggered_when_held_short():
+    """持仓不足 stale_loss_min_days → 即使浮亏也不触发（让 v1 stop_loss 处理）。"""
+    strat = MLRichPickerStrategy(
+        require_rich_features=False,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.05,
+    )
+    portfolio = Portfolio(1_000_000)
+    pos = Position(
+        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    )
+    pos._buy_records["20240110"] = 1000
+    portfolio.positions["600000.SH"] = pos
+    strat._trading_date_index = strat._build_trading_date_index(
+        ["20240110", "20240111", "20240112", "20240115"]
+    )
+    strat._position_state["600000.SH"] = PositionState(
+        entered_date="20240110", expected_horizon=5, peak_price=10.0,
+    )
+    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20, "score": 0.50,
+         "predicted_remaining_days": 3.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 9.0})}
+
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={},
+    )
+    # 持仓只有 3 个交易日 < 8 → 不触发 stale_loss
+    assert "600000.SH" not in out
+
+
+def test_position_aware_triggers_skip_existing_sells():
+    """已经被父类触发器决定卖出的 code，position-aware trigger 不重复处理。"""
+    strat = MLRichPickerStrategy(require_rich_features=False)
+    portfolio = Portfolio(1_000_000)
+    pos = Position(
+        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    )
+    portfolio.positions["600000.SH"] = pos
+    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10, "score": 0.30,
+         "predicted_remaining_days": 4.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 13.0})}
+
+    # 已经在 existing 里 → 跳过
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={"600000.SH": "stop_loss"},
+    )
+    assert "600000.SH" not in out
 
 
 def test_rich_bundle_save_load_round_trip(tmp_path):

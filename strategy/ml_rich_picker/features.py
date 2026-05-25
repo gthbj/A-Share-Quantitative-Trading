@@ -66,8 +66,9 @@ POSITION_STATE_FEATURE_COLUMNS: List[str] = [
 
 
 # sell 回归模型默认输出上限（天）：模型预测值会被 clip 到 [0, MAX_REMAINING_DAYS]
-# 区间。和 walk_forward_config.yaml 里的 sell_lookforward 保持一致。
-DEFAULT_MAX_REMAINING_DAYS: float = 20.0
+# 区间。**必须与 walk_forward_config.labels.sell_lookforward 严格对齐**，
+# 否则推理 clip 范围超过训练 label 范围 → sigmoid 桥接会失真。
+DEFAULT_MAX_REMAINING_DAYS: float = 5.0
 
 
 def _numeric_feature(
