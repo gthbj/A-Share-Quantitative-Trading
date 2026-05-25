@@ -32,8 +32,6 @@ bigquery:
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/bigquery-service-account.json
 ```
 
-> 如需回退到 MaxCompute，修改 `config/backtest.yaml` 中 `data.source: "maxcompute"` 并配置对应凭据。
-
 ### 3. 运行回测（推荐用 preset）
 
 ```bash
@@ -80,14 +78,13 @@ python run_backtest.py \
 ├── ARCHITECTURE.md               # 架构设计文档
 ├── config/
 │   ├── backtest.yaml             # 全局配置：费率、滑点、撮合规则、表名
-│   ├── secrets.yaml              # BigQuery / MaxCompute 凭据（不入库）
+│   ├── secrets.yaml              # BigQuery 凭据（不入库）
 │   └── secrets.yaml.example      # 凭据模板
 ├── data/                         # 本地缓存
 │   └── raw/                      # BigQuery 拉取的行情 Parquet（不入库）
 ├── data_layer/
 │   ├── base_data_source.py       # 数据源抽象基类
 │   ├── bigquery_source.py        # BigQuery 实现（默认）
-│   ├── maxcompute_source.py      # MaxCompute 实现（备选）
 │   ├── akshare_source.py         # AKShare 实现（备选，未启用）
 │   ├── tushare_source.py         # Tushare 实现（备选，未启用）
 │   └── local_storage.py          # Parquet 缓存
@@ -225,7 +222,6 @@ pytest tests/ -v
 - Python 3.9+
 - pandas / numpy
 - google-cloud-bigquery（BigQuery 数据源）
-- pyodps（MaxCompute 数据源，备选）
 - matplotlib
 - pyyaml
 - chinese-calendar

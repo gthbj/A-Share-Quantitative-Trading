@@ -5,8 +5,6 @@ import pytest
 from utils.code import (
     normalize_code,
     parse_universe,
-    to_exchange_code,
-    to_framework_code,
 )
 
 
@@ -70,33 +68,6 @@ class TestParseUniverse:
         assert parse_universe("") == []
 
 
-class TestToExchangeCode:
-    def test_sh(self):
-        assert to_exchange_code("600000.SH") == "sh600000"
-
-    def test_sz(self):
-        assert to_exchange_code("000001.SZ") == "sz000001"
-
-    def test_already_exchange_format(self):
-        # 幂等
-        assert to_exchange_code("sh600000") == "sh600000"
-
-    def test_unknown_raises(self):
-        with pytest.raises(ValueError):
-            to_exchange_code("510300.HK")
-
-
-class TestToFrameworkCode:
-    def test_sh(self):
-        assert to_framework_code("sh600000") == "600000.SH"
-
-    def test_sz(self):
-        assert to_framework_code("sz000001") == "000001.SZ"
-
-    def test_uppercase_input(self):
-        assert to_framework_code("SH600000") == "600000.SH"
-
-
 class TestBeiJingExchange:
     """北交所代码归一化与互转（PRD_20260520_10）。"""
 
@@ -129,22 +100,3 @@ class TestBeiJingExchange:
     def test_normalize_invalid_bj_suffix_raises(self):
         with pytest.raises(ValueError):
             normalize_code("832000.XY")
-
-    # --- to_exchange_code ---
-
-    def test_to_exchange_code_bj(self):
-        assert to_exchange_code("832000.BJ") == "bj832000"
-
-    def test_to_exchange_code_already_bj_format(self):
-        assert to_exchange_code("bj832000") == "bj832000"
-
-    def test_to_exchange_code_bare_bj(self):
-        assert to_exchange_code("832000") == "bj832000"
-
-    # --- to_framework_code ---
-
-    def test_to_framework_code_bj(self):
-        assert to_framework_code("bj832000") == "832000.BJ"
-
-    def test_to_framework_code_bj_uppercase(self):
-        assert to_framework_code("BJ832000") == "832000.BJ"

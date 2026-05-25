@@ -4,7 +4,6 @@
 
 约定：
   - 框架代码：``XXXXXX.SH`` / ``XXXXXX.SZ``（大写后缀）
-  - 表代码：``shXXXXXX`` / ``szXXXXXX``（小写前缀，仅部分 MaxCompute 表内使用）
   - 裸 6 位代码：按前缀推断交易所；无法识别则抛 ValueError
 """
 
@@ -71,42 +70,6 @@ def parse_universe(raw: str) -> List[str]:
         return []
     parts = [p for p in raw.replace(",", " ").split() if p]
     return [normalize_code(p) for p in parts]
-
-
-def to_exchange_code(framework_code: str) -> str:
-    """框架代码 → 表代码：``600000.SH`` → ``sh600000``。
-
-    幂等：已是表格式时（``sh600000`` / ``sz000001``）原样返回。
-    无法识别交易所时抛 ValueError（与原 maxcompute_source 的"默认 sh + WARNING"行为不同）。
-    """
-    if not framework_code:
-        raise ValueError("股票代码为空")
-    code = str(framework_code).strip()
-    lower = code.lower()
-
-    if lower.startswith(("sh", "sz", "bj")) and len(lower) == 8 and lower[2:].isdigit():
-        return lower
-
-    if "." in code:
-        bare, _, suffix = code.partition(".")
-        suffix = suffix.upper()
-        if suffix == "SH":
-            return f"sh{bare}"
-        if suffix == "SZ":
-            return f"sz{bare}"
-        if suffix == "BJ":
-            return f"bj{bare}"
-        raise ValueError(f"未知交易所后缀: {framework_code}")
-
-    bare = code
-    if bare.isdigit() and len(bare) == 6:
-        if bare.startswith(_SH_PREFIXES):
-            return f"sh{bare}"
-        if bare.startswith(_SZ_PREFIXES):
-            return f"sz{bare}"
-        if bare.startswith(_BJ_PREFIXES):
-            return f"bj{bare}"
-    raise ValueError(f"无法识别股票代码 {framework_code} 的交易所")
 
 
 def _parse_date(date_str: str) -> _dt.date | None:
@@ -210,20 +173,3 @@ def _is_within_first_n_trading_days(current: str, list_date: str, n: int) -> boo
         return False
     days = TradingCalendar.get_trading_days(list_date, current)
     return 1 <= len(days) <= n
-
-
-def to_framework_code(exchange_code: str) -> str:
-    """表代码 → 框架代码：``sh600000`` → ``600000.SH``，``bj832000`` → ``832000.BJ``。"""
-    if not exchange_code:
-        return exchange_code
-    code = str(exchange_code).strip().lower()
-    if code.startswith("sh") and len(code) == 8 and code[2:].isdigit():
-        return f"{code[2:]}.SH"
-    if code.startswith("sz") and len(code) == 8 and code[2:].isdigit():
-        return f"{code[2:]}.SZ"
-    if code.startswith("bj") and len(code) == 8 and code[2:].isdigit():
-        return f"{code[2:]}.BJ"
-    # 已是框架格式则原样返回
-    if "." in code:
-        return code.upper()
-    raise ValueError(f"无法解析交易所代码: {exchange_code}")

@@ -51,16 +51,15 @@
 |------|------|
 | `base_data_source.py` | 定义 `BaseDataSource` 抽象基类与 `Bar` 数据模型。统一接口 `get_bars(code, start, end, period)` 支持 `"daily"`、`"1min"`、`"5min"`、`"15min"`、`"30min"`、`"60min"` 多周期行情获取。 |
 | `bigquery_source.py` | **当前默认数据源实现**。通过 google-cloud-bigquery 连接 Google Cloud BigQuery（项目 `data-aquarium`，dataset `ashare`，asia-east2）拉取 A 股历史行情。包含本地 Parquet 缓存与缓存清理策略（按保留天数 + 总容量上限）。当前依赖 `ashare.dwd_*` 标准字段表；ODS external table、DWD native table、DWS 特征层与 ADS 信号层均已生成并通过 audit，财务指标 DWD、估值特征和基本面特征已完成专项修复/生成，BigQuery ML baseline 已生成 ADS 候选信号。另提供可选 DWS 股票特征快照/训练集查询 helper、BQML ADS 候选信号读取 helper、日线股票批量行情预加载能力，以及按回测首日前历史成交额选取流动性 Top-N 股票池的 helper，供 ML / BQML 策略使用。数据源会读取 `account.trading_permissions`，默认过滤当前账户无专项权限的北交所、科创板、创业板、ST/退市整理等标的，不改变 `BaseDataSource` 抽象接口。详见 §4.6 / §4.7 / §4.8 / §4.16。 |
-| `maxcompute_source.py` | 阿里云 MaxCompute 数据源实现（保留为备选）。通过 pyodps 连接。历史支持：5min K 线、15min ETF K 线。 |
 | `akshare_source.py` | AKShare 免费数据源实现（已保留为备选，但未被 `run_backtest.py` 装载）。首次请求调用 API 拉取并写入 `LocalStorage`；后续优先读本地缓存，支持增量更新。 |
 | `local_storage.py` | 本地数据缓存管理器。支持 Parquet/CSV 格式，按 `data/raw/daily/{code}_{period}.parquet` 组织（如 `000001_1min.parquet`），避免不同周期数据互相覆盖，提供按日期范围快速索引；读取缓存时统一将 `open/high/low/close/volume/amount` 转为数值，避免 BigQuery Decimal 缓存命中后进入撮合计算。 |
 
 **设计要点**：
 - 抽象接口隔离具体数据源，便于后续接入 Wind、Tushare Pro 等付费源。
 - 缓存策略为 **写时缓存**：首次从远程拉取后自动落盘，不预加载全量数据。
-- **缓存清理（BigQuery / MaxCompute 数据源共用）**：实例化时根据 `data.cache.retention_days` 与 `data.cache.max_size_gb` 自动清理过期或溢出的本地缓存文件，避免长期累积。
+- **缓存清理**：实例化时根据 `data.cache.retention_days` 与 `data.cache.max_size_gb` 自动清理过期或溢出的本地缓存文件，避免长期累积。
 - 分钟级数据时间列统一格式化为 `YYYYMMDDHHMM`（12位），便于按交易日前缀快速筛选。
-- **凭据隔离**：BigQuery 服务账号通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml` 中 `bigquery.credentials_path` 注入；MaxCompute AccessKey 仍保留为备选凭据。均不入仓库。
+- **凭据隔离**：BigQuery 服务账号通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml` 中 `bigquery.credentials_path` 注入，不入仓库。
 
 ---
 
@@ -170,7 +169,7 @@ strategy/<name>/
 | 文件 | 职责 |
 |------|------|
 | `calendar.py` | A 股交易日历。优先调用 `chinese_calendar` 处理法定假日与调休补班（每年初需 `pip install -U chinese-calendar`）；超出范围或库缺失时降级为"非周末 + 硬编码 2020-2024 假期" + WARNING。注意：chinese_calendar 把"周末补班"标为 workday，但 A 股不在补班日开市，已二次过滤。 |
-| `code.py` | **股票代码归一化**（PRD_20260520_03）：`normalize_code('510300')` → `'510300.SH'`，按前缀推断交易所；`to_exchange_code` / `to_framework_code` 处理框架格式与 MaxCompute 表内 `shXXXXXX` 格式的双向转换。统一由 CLI / data_layer / engine / strategy 共享。 |
+| `code.py` | **股票代码归一化**：`normalize_code('510300')` → `'510300.SH'`，按前缀推断交易所。统一由 CLI / data_layer / engine / strategy 共享。 |
 | `logger.py` | 统一日志配置。支持控制台 + 文件双输出，UTF-8 编码。 |
 
 ---
@@ -257,7 +256,7 @@ context.order(code, target_qty - current_qty)
 
 ### 4.6 为什么默认数据源切换为 BigQuery？
 
-历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选），后迁移至阿里云 MaxCompute。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，单 dataset `ashare`，通过表前缀 `ods_` / `dwd_` / `dws_` / `ads_` 表达数据分层）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
+历史上本框架默认使用 AKShare（免费）+ Tushare Pro（备选）。随着数据规模扩大与 GCP 生态整合需求，项目所有者已将数据仓库迁移至 Google Cloud BigQuery（项目 `data-aquarium`，单 dataset `ashare`，通过表前缀 `ods_` / `dwd_` / `dws_` / `ads_` 表达数据分层）。BigQuery 提供标准 SQL、列式存储与分区裁剪能力，适合作为长期研究和回测数据仓库。
 
 截至 PRD_20260524_06，数据迁移处于 **单 dataset 已确认、当前 GCS Parquet 作为唯一正式输入源、ODS/DWD/DWS/ADS 已覆盖旧表和新增 raw 标准化表并通过审计，财务指标和基本面特征专项修复完成，新增事件/资金流 DWS/ADS 已生成** 的状态：
 
@@ -279,7 +278,7 @@ context.order(code, target_qty - current_qty)
 - `BigQueryDataSource.get_multi_bars(codes, start, end, period="daily")` 对股票日线走 BigQuery 批量查询，减少 ADS 候选池回测时的串行 per-code 查询开销；其他周期或资产类型仍回退到逐标的 `get_bars()`。
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入；本地开发可设置 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1` 临时复用 `gcloud auth print-access-token`。
 - 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
-- `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
+- `akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
 - GCS 到 BigQuery 的 ODS 接入由 `gcs_to_bigquery/pipeline.py` 负责，包括 manifest、ODS external table 创建、ODS audit 和历史 staging/load 兼容命令。
 - 新增 raw 到标准化 Parquet 的 VM 处理仍由 `data_transfer/prepare_parquet_to_gcs.py` 负责。`sync-raw` 命令只读 GCS raw，并按 per-prefix suffix 规则同步到 `/mnt/localssd/raw_incremental/...`，随后复用 `build` / `upload` / `audit` 命令生成并上传 month-partitioned Parquet；普通指数日/周/月 K 线全量和普通指数日线增量已从新增 raw 任务中排除，避免与现有 `fact_index_kline_*` 重复。
 - BigQuery 内部 DWD/DWS/ADS 加工由 `bigquery_pipeline/` 负责。当前入口已承接完整 DWD transform/audit、DWS/ADS 策略特征与信号层、BigQuery ML baseline、`fact_financial_indicator` 专项修复、利润表/资产负债表 core 抽取、估值/基本面特征和事件/资金流特征/信号生成；后续新的 BigQuery 内部加工不得继续放入 `gcs_to_bigquery`。
@@ -335,7 +334,7 @@ context.order(code, target_qty - current_qty)
 
 **关键约定**：
 
-1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ` / `XXXXXX.BJ`，**无需像 MaxCompute 那样做 shXXXXXX 双向映射**。股票事实表使用 `equity_code`，指数事实表使用 `index_code`；指数代码中 `000/930/932/950` 前缀归一为 `.SH`，`399` 前缀归一为 `.SZ`。
+1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ` / `XXXXXX.BJ`。股票事实表使用 `equity_code`，指数事实表使用 `index_code`；指数代码中 `000/930/932/950` 前缀归一为 `.SH`，`399` 前缀归一为 `.SZ`。
 2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `partition_month` 列表（`_partition_months_in_range()`），SQL 中以 `partition_month IN (202001, 202002, ...)` 触发分区裁剪。**不裁剪则全表扫描，查询成本显著增加。**
 3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。若 ODS 贴源字段暂未提供复权口径，DWD 转换不得伪造 qfq/hfq；第一版只能安全生成 `none` 或明确来源可验证的复权类型。
 4. **资产类型自动路由**：`BigQueryDataSource._resolve_kline_table()` 根据代码前缀自动判断：
@@ -646,7 +645,7 @@ handle_data → Context.limit_order / stop_order
 |------|------|------|
 | `run_backtest.py` | 入口 | CLI 命令行入口（含 `--preset` 模式与 GCS 归档开关） |
 | `config/backtest.yaml` | 配置 | 回测参数、费率与 GCS 产物归档配置 |
-| `config/secrets.yaml` | 配置 | BigQuery / MaxCompute 凭据，**不入 git** |
+| `config/secrets.yaml` | 配置 | BigQuery 凭据，**不入 git** |
 | `config/secrets.yaml.example` | 配置 | secrets.yaml 模板 |
 | `data_transfer/` | 工具 | 原始数据到 GCS、Parquet 构建与上传工具；当前 Parquet 目标前缀为 `gs://data-aquarium/a-share/standardized_parquet/`，并支持新增 raw GCS prefix 同步到 VM local SSD 后标准化 |
 | `gcs_to_bigquery/pipeline.py` | 工具 | GCS Parquet 到 BigQuery ODS external table 的管道；支持 ADC/gcloud token 认证、持久 manifest、ODS external table 创建与 audit，并保留历史 staging/load 兼容命令 |
@@ -656,7 +655,6 @@ handle_data → Context.limit_order / stop_order
 | `scripts/legacy/` | 工具 | 历史 GCE VM 恢复脚本归档，包含硬编码 `/mnt/localssd/...` 路径，不属于新装载流程 |
 | `data_layer/base_data_source.py` | 抽象 | 数据源接口 |
 | `data_layer/bigquery_source.py` | 实现 | Google Cloud BigQuery 数据源（默认） |
-| `data_layer/maxcompute_source.py` | 实现 | 阿里云 MaxCompute 数据源（保留备选） |
 | `data_layer/akshare_source.py` | 实现 | AKShare 数据源（保留备选） |
 | `data_layer/tushare_source.py` | 实现 | Tushare 数据源（保留备选） |
 | `data_layer/local_storage.py` | 工具 | 本地缓存读写 |

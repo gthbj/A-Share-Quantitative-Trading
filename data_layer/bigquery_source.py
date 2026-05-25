@@ -12,8 +12,7 @@
   - ⚠️  分钟K线：对应表尚未建立，调用时抛 NotImplementedError
 
 代码格式约定：
-  - 框架对外与表内存储统一使用标准格式 ``XXXXXX.SH`` / ``XXXXXX.SZ``，
-    无需像 MaxCompute 那样做 shXXXXXX 双向映射。
+  - 框架对外与表内存储统一使用标准格式 ``XXXXXX.SH`` / ``XXXXXX.SZ``。
 
 分区裁剪：
   - 所有表按 partition_month INT64（格式 YYYYMM）分区
