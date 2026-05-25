@@ -70,6 +70,15 @@ def test_fundamental_sql_uses_announcement_date_intervals():
     assert "dwd_fact_balance_sheet_core" in sql
 
 
+def test_fundamental_sql_uses_unadjusted_price_for_valuation():
+    config = {"project_id": "data-aquarium", "dataset": "ashare", "table_prefixes": {"dwd": "dwd_", "dws": "dws_"}}
+
+    sql = build_equity_fundamental_features_sql(config)
+
+    assert "AND adjust_type = 'none'" in sql
+    assert "AND adjust_type = 'qfq'" not in sql
+
+
 def test_bigquery_pipeline_cli_exposes_fundamental_commands(capsys, monkeypatch):
     monkeypatch.setattr("sys.argv", ["cli.py", "--help"])
 

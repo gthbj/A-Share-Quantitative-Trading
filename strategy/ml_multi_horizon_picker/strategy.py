@@ -3,13 +3,13 @@
 设计要点（详见 PRD_20260524_12）：
 - 4 个独立 LightGBM 买入模型（horizon 1/5/10/20 天）
 - 1 个独立 LightGBM 卖出风险模型
-- 6 个卖出触发（任一命中即卖）：
+- 卖出触发（任一命中即卖）：
     a. 硬止损（regime 调制）
     b. 追踪止盈（从持仓期高点回撤）
-    c. Horizon 到期（建仓时锁定的预期持有期）
+    c. 最大持仓交易日兜底
     d. 排名迟滞（连续 N 天不在 Top-2K）
     e. prob_up 兜底（低于 floor 阈值）
-    f. 卖出模型（prob_sell > threshold）
+    f. 卖出持仓决策模型（prob_sell > threshold）
 - Regime 三态调制目标持仓数与止损宽度
 
 回测路径：日频 handle_data，符合 BacktestEngine T 信号 → T+1 开盘成交规范。
@@ -41,6 +41,7 @@ from strategy.ml_multi_horizon_picker.model_storage import (
 from strategy.ml_multi_horizon_picker.regime import (
     Regime,
     combine_regime_with_market_breadth,
+    is_crisis_regime,
     latest_regime,
     market_breadth_metrics,
     regime_stop_loss,
@@ -56,7 +57,7 @@ class PositionState:
     """每个持仓的额外状态簿记（除 Portfolio.Position 之外）。"""
 
     entered_date: str
-    expected_horizon: int  # 建仓时锁定的 horizon 天数
+    expected_horizon: int  # 建仓时记录的 buy horizon，仅作为持仓状态特征
     peak_price: float       # 持仓期间最高收盘价
     rank_dropout_streak: int = 0  # 连续不在 Top-2K 的天数
 
@@ -94,6 +95,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
         stop_loss_pct_bear: float = 0.03,
         trailing_stop_pct: float = 0.03,
         min_hold_days: int = 3,
+        max_hold_days: Optional[int] = 20,
         dropout_persistence_days: int = 2,
         rank_buffer_multiplier: int = 2,
         use_deterministic_fallback: bool = True,
@@ -101,6 +103,11 @@ class MLMultiHorizonStrategy(BaseStrategy):
         regime_target_position_counts: Optional[Dict[str, int]] = None,
         regime_position_pcts: Optional[Dict[str, float]] = None,
         bear_clear_existing: bool = True,
+        crisis_enabled: bool = False,
+        crisis_drawdown_threshold: float = -0.10,
+        crisis_fast_drop_threshold: float = -0.06,
+        crisis_breadth_threshold: float = 0.20,
+        crisis_selloff_share_threshold: float = 0.75,
         breadth_bear_threshold: float = 0.35,
         breadth_recovery_threshold: float = 0.55,
         feature_window: int = 20,    # 与 BaseFeatureEngineer 默认一致；sell-side 60d 特征用 min_periods=1 降级
@@ -136,6 +143,11 @@ class MLMultiHorizonStrategy(BaseStrategy):
         self.stop_loss_pct_bear = stop_loss_pct_bear
         self.trailing_stop_pct = trailing_stop_pct
         self.min_hold_days = min_hold_days
+        self.max_hold_days = (
+            int(max_hold_days)
+            if max_hold_days is not None and int(max_hold_days) > 0
+            else None
+        )
         self.dropout_persistence_days = dropout_persistence_days
         self.rank_buffer_multiplier = rank_buffer_multiplier
         self.use_deterministic_fallback = use_deterministic_fallback
@@ -147,6 +159,11 @@ class MLMultiHorizonStrategy(BaseStrategy):
             regime_position_pcts
         )
         self.bear_clear_existing = bool(bear_clear_existing)
+        self.crisis_enabled = bool(crisis_enabled)
+        self.crisis_drawdown_threshold = float(crisis_drawdown_threshold)
+        self.crisis_fast_drop_threshold = float(crisis_fast_drop_threshold)
+        self.crisis_breadth_threshold = float(crisis_breadth_threshold)
+        self.crisis_selloff_share_threshold = float(crisis_selloff_share_threshold)
         self.breadth_bear_threshold = float(breadth_bear_threshold)
         self.breadth_recovery_threshold = float(breadth_recovery_threshold)
         self.feature_window = feature_window
@@ -158,6 +175,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
         )
         self._models: Dict[str, Optional[Any]] = {}
         self._position_state: Dict[str, PositionState] = {}
+        self._trading_date_index: Dict[str, int] = {}
         # 走步模式专用
         self._model_registry: Optional[ModelRegistry] = None
         self._current_model_dir: Optional[str] = None
@@ -178,6 +196,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
             Regime.BULL.value: max_count,
             Regime.NEUTRAL.value: min(3, max_count),
             Regime.BEAR.value: 0,
+            Regime.CRISIS.value: 0,
         }
         if configured:
             for key, value in configured.items():
@@ -195,6 +214,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
             Regime.BULL.value: min(base, 0.85),
             Regime.NEUTRAL.value: min(base, 0.45),
             Regime.BEAR.value: 0.0,
+            Regime.CRISIS.value: 0.0,
         }
         if configured:
             for key, value in configured.items():
@@ -349,7 +369,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
             score_sorted.head(max(target_n, 1) * self.rank_buffer_multiplier)["code"].tolist()
         )
 
-        # 5. 遍历现有持仓，检查 6 个 sell trigger
+        # 5. 遍历现有持仓，检查 sell trigger
         sells = self._check_sell_triggers(
             context=context,
             score_df=score_df,
@@ -384,10 +404,10 @@ class MLMultiHorizonStrategy(BaseStrategy):
             )
             return
 
-        # 6. Bear regime 不开新仓
-        if regime == Regime.BEAR.value:
+        # 6. 零风险预算时不开新仓；bear 若配置了非零预算则允许补仓。
+        if target_n <= 0 or position_pct <= 0:
             logger.info(
-                f"{current_date} regime=bear，不开新仓 "
+                f"{current_date} regime={regime}，零风险预算不开新仓 "
                 f"(target_n={target_n}, position_pct={position_pct:.0%})"
             )
             return
@@ -477,6 +497,21 @@ class MLMultiHorizonStrategy(BaseStrategy):
                 breadth_bear_threshold=self.breadth_bear_threshold,
                 breadth_recovery_threshold=self.breadth_recovery_threshold,
             )
+            if self.crisis_enabled and is_crisis_regime(
+                close,
+                score_df,
+                drawdown_threshold=self.crisis_drawdown_threshold,
+                fast_drop_threshold=self.crisis_fast_drop_threshold,
+                breadth_threshold=self.crisis_breadth_threshold,
+                selloff_share_threshold=self.crisis_selloff_share_threshold,
+            ):
+                if regime != Regime.CRISIS.value:
+                    metrics = market_breadth_metrics(score_df)
+                    logger.info(
+                        f"{context.current_date} regime 由 {regime} 修正为 crisis "
+                        f"(crisis_metrics={metrics})"
+                    )
+                return Regime.CRISIS.value
             if regime != base_regime:
                 metrics = market_breadth_metrics(score_df)
                 logger.info(
@@ -609,6 +644,71 @@ class MLMultiHorizonStrategy(BaseStrategy):
     # Helpers: position state
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_trade_date(value: Any) -> str:
+        digits = "".join(ch for ch in str(value)[:10] if ch.isdigit())
+        return digits[:8] if len(digits) >= 8 else ""
+
+    @classmethod
+    def _build_trading_date_index(cls, values: Any) -> Dict[str, int]:
+        dates = sorted({d for d in (cls._normalize_trade_date(v) for v in values) if d})
+        return {date: idx for idx, date in enumerate(dates)}
+
+    def _ensure_trading_date_index(self, context: Optional[Context] = None) -> Dict[str, int]:
+        if self._trading_date_index:
+            return self._trading_date_index
+
+        all_bars = getattr(context, "all_bars", None) if context is not None else None
+        if all_bars:
+            dates: List[Any] = []
+            for frame in all_bars.values():
+                if frame is not None and not frame.empty and "date" in frame.columns:
+                    dates.extend(frame["date"].tolist())
+            self._trading_date_index = self._build_trading_date_index(dates)
+        return self._trading_date_index
+
+    def _trading_day_diff(
+        self,
+        start: str,
+        end: str,
+        context: Optional[Context] = None,
+    ) -> int:
+        """返回交易日差：买入成交日到当前交易日经过了几个交易日。"""
+        start_key = self._normalize_trade_date(start)
+        end_key = self._normalize_trade_date(end)
+        if not start_key or not end_key or end_key <= start_key:
+            return 0
+
+        index = self._ensure_trading_date_index(context)
+        if start_key in index and end_key in index:
+            return max(0, index[end_key] - index[start_key])
+        dates = sorted(index)
+        if dates:
+            return sum(1 for date in dates if start_key < date <= end_key)
+
+        return max(0, self._date_diff(start_key, end_key))
+
+    def _actual_position_entry_date(self, pos: Any) -> str:
+        records = getattr(pos, "_buy_records", {}) or {}
+        dates = [
+            self._normalize_trade_date(date)
+            for date, qty in records.items()
+            if qty and qty > 0
+        ]
+        dates = [date for date in dates if date]
+        return min(dates) if dates else ""
+
+    def _holding_trade_days(
+        self,
+        context: Context,
+        state: Optional[PositionState],
+        pos: Any,
+    ) -> int:
+        entry_date = self._actual_position_entry_date(pos)
+        if not entry_date and state is not None:
+            entry_date = self._normalize_trade_date(getattr(state, "entered_date", ""))
+        return self._trading_day_diff(entry_date, context.current_date, context)
+
     def _update_position_states(
         self,
         context: Context,
@@ -642,6 +742,23 @@ class MLMultiHorizonStrategy(BaseStrategy):
                 if price > state.peak_price:
                     state.peak_price = price
 
+        # 订单在 T 日信号生成、T+1 开盘成交。state 初始写入的是信号日，
+        # 这里用 Portfolio 真实成交记录修正为买入成交日，持仓天数才是交易日口径。
+        for code, state in list(self._position_state.items()):
+            pos = portfolio.get_position(code)
+            if pos is None or pos.total_qty <= 0:
+                continue
+            actual_entry = self._actual_position_entry_date(pos)
+            if not actual_entry:
+                continue
+            if self._normalize_trade_date(state.entered_date) == actual_entry:
+                continue
+            state.entered_date = actual_entry
+            if code in data:
+                price = float(data[code]["close"])
+                cost = float(getattr(pos, "cost_price", 0.0) or 0.0)
+                state.peak_price = max(cost, price)
+
     def _check_sell_triggers(
         self,
         context: Context,
@@ -650,9 +767,8 @@ class MLMultiHorizonStrategy(BaseStrategy):
         stop_loss_pct: float,
         data: Dict[str, pd.Series],
     ) -> Dict[str, str]:
-        """逐持仓检查 6 个 sell trigger，返回 {code: reason}。"""
+        """逐持仓检查 sell trigger，返回 {code: reason}。"""
         portfolio = context.portfolio
-        current_date = context.current_date
         prob_lookup = score_df.set_index("code")
 
         sells: Dict[str, str] = {}
@@ -683,16 +799,15 @@ class MLMultiHorizonStrategy(BaseStrategy):
                     )
                     continue
 
-            # c. Horizon 到期
-            if state is not None:
-                holding_days = self._date_diff(state.entered_date, current_date)
-                if holding_days >= state.expected_horizon:
-                    sells[code] = f"horizon_expired({holding_days}d>={state.expected_horizon}d)"
-                    continue
+            holding_days = self._holding_trade_days(context, state, pos)
+
+            # c. 最大持仓交易日兜底。decision_horizon/h5 不再作为硬卖出条件。
+            if self.max_hold_days is not None and holding_days >= self.max_hold_days:
+                sells[code] = f"max_hold_expired({holding_days}d>={self.max_hold_days}d)"
+                continue
 
             # d. 排名迟滞
             if state is not None:
-                holding_days = self._date_diff(state.entered_date, current_date)
                 if code not in top_2n_codes:
                     state.rank_dropout_streak += 1
                 else:
@@ -711,7 +826,6 @@ class MLMultiHorizonStrategy(BaseStrategy):
             if code in prob_lookup.index:
                 prob_h5 = float(prob_lookup.loc[code, "prob_up_h5"])
                 if state is not None:
-                    holding_days = self._date_diff(state.entered_date, current_date)
                     if (
                         prob_h5 < self.min_prob_floor
                         and holding_days >= self.min_hold_days
@@ -721,7 +835,7 @@ class MLMultiHorizonStrategy(BaseStrategy):
 
                 # f. 卖出模型
                 prob_sell = float(prob_lookup.loc[code, "prob_sell"])
-                if prob_sell > self.sell_threshold:
+                if holding_days >= self.min_hold_days and prob_sell > self.sell_threshold:
                     sells[code] = f"sell_model(prob_sell={prob_sell:.3f})"
                     continue
 

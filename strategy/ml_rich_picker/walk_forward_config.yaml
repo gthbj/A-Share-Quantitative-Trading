@@ -69,3 +69,5 @@ data:
 
 validation:
   valid_days: 60
+  min_buy_auc: 0.52
+  min_sell_auc: 0.52

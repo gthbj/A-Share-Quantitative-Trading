@@ -42,6 +42,7 @@ params:
     allow_unknown_security: false
   # 持仓
   target_position_count: 10
+  decision_horizon: 5
   min_buy_prob: 0.50
   min_prob_floor: 0.30
   sell_threshold: 0.70
@@ -50,10 +51,13 @@ params:
   stop_loss_pct_bear: 0.03
   trailing_stop_pct: 0.03
   min_hold_days: 3
+  max_hold_days: 20
   dropout_persistence_days: 2
   rank_buffer_multiplier: 2
   position_pct: 0.95
-  use_deterministic_fallback: true
+  # 正式 rich 回测必须使用训练好的 rich 模型；模型缺失/维度不匹配时直接失败。
+  # 调试管道时才显式改成 true。
+  use_deterministic_fallback: false
   feature_window: 20
 
 backtest:

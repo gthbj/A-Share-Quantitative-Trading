@@ -4,7 +4,7 @@
 - labels.py：多 horizon 标签 / sell 标签
 - features.py：5 维 sell-side 风险特征
 - regime.py：bull/neutral/bear 三态
-- strategy.py：6 个 sell trigger 各自命中（独立场景）
+- strategy.py：sell trigger 各自命中（独立场景）
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from strategy.ml_multi_horizon_picker.regime import (
     Regime,
     combine_regime_with_market_breadth,
     detect_regime,
+    is_crisis_regime,
     regime_position_multiplier,
     regime_stop_loss,
 )
@@ -224,8 +225,20 @@ def test_regime_helpers():
     assert regime_position_multiplier(Regime.BULL.value) == 1.0
     assert regime_position_multiplier(Regime.NEUTRAL.value) == 0.5
     assert regime_position_multiplier(Regime.BEAR.value) == 0.0
+    assert regime_position_multiplier(Regime.CRISIS.value) == 0.0
     assert regime_stop_loss(Regime.BEAR.value, 0.05, 0.03) == 0.03
+    assert regime_stop_loss(Regime.CRISIS.value, 0.05, 0.03) == 0.03
     assert regime_stop_loss(Regime.BULL.value, 0.05, 0.03) == 0.05
+
+
+def test_crisis_regime_detects_severe_fast_drop():
+    close = pd.Series(
+        np.concatenate([
+            np.linspace(80, 120, 260),
+            np.array([120, 118, 115, 111, 108, 104], dtype=float),
+        ])
+    )
+    assert is_crisis_regime(close, fast_drop_threshold=-0.06)
 
 
 # ─────────────────────────────────────────────────────────
@@ -236,9 +249,10 @@ def test_regime_helpers():
 class _StubContext:
     """最小可用 Context stub，仅满足 strategy 内部使用的方法/属性。"""
 
-    def __init__(self, portfolio: Portfolio, current_date: str):
+    def __init__(self, portfolio: Portfolio, current_date: str, all_bars=None):
         self.portfolio = portfolio
         self.current_date = current_date
+        self.all_bars = all_bars or {}
         self.orders: List[tuple] = []
 
     def order(self, code: str, amount: int) -> None:
@@ -266,6 +280,7 @@ def _build_strategy_with_held(
     pos.total_qty = qty
     pos.sellable_qty = qty
     pos.cost_price = cost
+    pos._buy_records[entered_date] = qty
     portfolio.positions[code] = pos
     portfolio.available_cash -= cost * qty
 
@@ -323,8 +338,8 @@ def test_sell_trigger_trailing_stop():
     assert "trailing_stop" in sells["600000.SH"]
 
 
-def test_sell_trigger_horizon_expired():
-    """用例 3: Horizon 到期"""
+def test_decision_horizon_elapsed_does_not_force_sell():
+    """h5/expected_horizon 不再是硬卖出条件。"""
     strat, portfolio = _build_strategy_with_held(
         code="600000.SH", cost=10.0, qty=1000,
         entered_date="20240101", expected_horizon=5,
@@ -336,8 +351,41 @@ def test_sell_trigger_horizon_expired():
         context=ctx, score_df=score_df, top_2n_codes={"600000.SH"},
         stop_loss_pct=0.05, data=data,
     )
+    assert "600000.SH" not in sells
+
+
+def test_sell_trigger_max_hold_expired_uses_trading_days():
+    """max_hold_days 按交易日计数，不按自然日计数。"""
+    strat, portfolio = _build_strategy_with_held(
+        code="600000.SH", cost=10.0, qty=1000,
+        entered_date="20240105", expected_horizon=5,
+    )
+    strat.max_hold_days = 3
+    all_bars = {
+        "600000.SH": pd.DataFrame(
+            {
+                "date": ["20240105", "20240108", "20240109", "20240110"],
+                "close": [10.0, 10.1, 10.2, 10.3],
+            }
+        )
+    }
+    data = {"600000.SH": pd.Series({"close": 10.20})}
+    score_df = _score_df_for("600000.SH", prob_h5=0.6)
+
+    early_ctx = _StubContext(portfolio, "20240108", all_bars=all_bars)
+    early_sells = strat._check_sell_triggers(
+        context=early_ctx, score_df=score_df, top_2n_codes={"600000.SH"},
+        stop_loss_pct=0.05, data=data,
+    )
+    assert "600000.SH" not in early_sells
+
+    ctx = _StubContext(portfolio, "20240110", all_bars=all_bars)
+    sells = strat._check_sell_triggers(
+        context=ctx, score_df=score_df, top_2n_codes={"600000.SH"},
+        stop_loss_pct=0.05, data=data,
+    )
     assert "600000.SH" in sells
-    assert "horizon_expired" in sells["600000.SH"]
+    assert "max_hold_expired" in sells["600000.SH"]
 
 
 def test_sell_trigger_rank_dropout():
@@ -345,7 +393,7 @@ def test_sell_trigger_rank_dropout():
     strat, portfolio = _build_strategy_with_held(
         code="600000.SH", cost=10.0, qty=1000,
         entered_date="20240101",
-        expected_horizon=20,                # 避免 horizon 优先触发
+        expected_horizon=20,
         rank_dropout_streak=1,              # 之前已累积 1 天
     )
     ctx = _StubContext(portfolio, "20240108")  # 持有 7 天 > min_hold_days=3
@@ -397,6 +445,39 @@ def test_sell_trigger_sell_model():
     assert "sell_model" in sells["600000.SH"]
 
 
+def test_sell_model_respects_min_hold_days():
+    """sell 持仓模型属于软退出，min_hold_days 前不触发。"""
+    strat, portfolio = _build_strategy_with_held(
+        code="600000.SH", cost=10.0, qty=1000, entered_date="20240105",
+        expected_horizon=5,
+    )
+    all_bars = {
+        "600000.SH": pd.DataFrame(
+            {
+                "date": ["20240105", "20240108", "20240109", "20240110"],
+                "close": [10.0, 10.1, 10.2, 10.3],
+            }
+        )
+    }
+    data = {"600000.SH": pd.Series({"close": 10.20})}
+    score_df = _score_df_for("600000.SH", prob_h5=0.65, prob_sell=0.85)
+
+    early_ctx = _StubContext(portfolio, "20240108", all_bars=all_bars)
+    early_sells = strat._check_sell_triggers(
+        context=early_ctx, score_df=score_df, top_2n_codes={"600000.SH"},
+        stop_loss_pct=0.05, data=data,
+    )
+    assert "600000.SH" not in early_sells
+
+    ctx = _StubContext(portfolio, "20240110", all_bars=all_bars)
+    sells = strat._check_sell_triggers(
+        context=ctx, score_df=score_df, top_2n_codes={"600000.SH"},
+        stop_loss_pct=0.05, data=data,
+    )
+    assert "600000.SH" in sells
+    assert "sell_model" in sells["600000.SH"]
+
+
 def test_no_sell_when_all_conditions_clean():
     """所有触发条件都不命中时不卖。"""
     strat, portfolio = _build_strategy_with_held(
@@ -421,11 +502,13 @@ def test_default_regime_risk_budget_counts():
         Regime.BULL.value: 5,
         Regime.NEUTRAL.value: 3,
         Regime.BEAR.value: 0,
+        Regime.CRISIS.value: 0,
     }
     assert strat.regime_position_pcts == {
         Regime.BULL.value: 0.85,
         Regime.NEUTRAL.value: 0.45,
         Regime.BEAR.value: 0.0,
+        Regime.CRISIS.value: 0.0,
     }
 
 
@@ -463,6 +546,29 @@ def test_bear_risk_budget_clears_sellable_positions():
         "600000.SH": "bear_risk_budget_clear",
         "000001.SZ": "bear_risk_budget_clear",
     }
+
+
+def test_bear_nonzero_budget_does_not_clear_existing_positions():
+    """实验组可把 bear 作为降风险预算，而非清仓信号。"""
+    strat, portfolio = _build_strategy_with_held(
+        code="600000.SH", cost=10.0, qty=1000, entered_date="20240101"
+    )
+    strat.bear_clear_existing = False
+    ctx = _StubContext(portfolio, "20240105")
+    score_df = pd.DataFrame([{"code": "600000.SH", "score": 0.8}])
+    data = {"600000.SH": pd.Series({"close": 10.2})}
+
+    sells = strat._risk_budget_sells(
+        context=ctx,
+        score_df=score_df,
+        regime=Regime.BEAR.value,
+        target_n=2,
+        position_pct=0.30,
+        data=data,
+        existing_sells=set(),
+    )
+
+    assert sells == {}
 
 
 def test_neutral_risk_budget_sells_lowest_score_when_too_many_positions():

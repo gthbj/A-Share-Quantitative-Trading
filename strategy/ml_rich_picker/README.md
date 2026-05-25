@@ -5,10 +5,10 @@
 | 维度 | v1 (ml_multi_horizon) | **v2 (ml_rich_picker)** |
 |---|---|---|
 | Buy 特征 | 17（日线技术）| **30**（17 daily + 8 fundamental + 5 event）|
-| Sell 特征 | 22（17 + 5 risk）| **35**（30 + 5 risk）|
+| Sell 特征 | 22（17 + 5 risk）| **39**（30 + 5 risk + 4 position state）|
 | 数据源表 | 1（`dws_equity_daily_features`）| **3**（+ `dws_equity_fundamental_features`, `dws_equity_event_money_flow_features_1d`）|
 | 模型架构 | 4 horizon buy + 1 sell | **同**（完全继承）|
-| Sell 触发 | 6 个（止损/追踪止盈/horizon/排名/prob 兜底/sell 模型）| **同**（完全继承）|
+| Sell 触发 | 止损/追踪止盈/排名/prob 兜底/sell 模型/max_hold 兜底 | **继承新持仓决策口径：无 h5 到期硬卖** |
 | Regime 调制 | bull/neutral/bear | **同**（完全继承）|
 
 配套 PRD：[`PRD/PRD_20260525_03_*`](../../PRD/PRD_20260525_03_富特征ML策略.md)。
@@ -111,7 +111,7 @@ v2 在 initialize 里一次拉 5 年 × 500 股的全部特征（约 30 MB），
 
 ### 不重新训练 sell 模型？
 
-继承 v1 的 sell 模型结构（35 维输入），但训练数据用 rich features 重新训。
+sell 模型使用 rich sell 特征（39 维输入，含持仓状态特征）重新训练。
 所以 sell 模型有自己的 .pkl，与 v1 模型不冲突。
 
 ---

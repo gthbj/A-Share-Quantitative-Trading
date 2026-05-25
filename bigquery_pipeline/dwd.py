@@ -32,6 +32,7 @@ REQUIRED_DWD_FIELDS: dict[str, set[str]] = {
     "dwd_fact_equity_kline_1d": {"equity_code", "date", "partition_month", "adjust_type", "open", "high", "low", "close", "volume", "amount"},
     "dwd_fact_fund_kline_1d": {"fund_code", "date", "partition_month", "adjust_type", "open", "high", "low", "close", "volume", "amount"},
     "dwd_fact_index_kline_1d": {"index_code", "date", "partition_month", "open", "high", "low", "close", "volume", "amount"},
+    "dwd_fact_adjust_factor": {"equity_code", "date", "partition_month", "adjust_type", "adjust_factor"},
     "dwd_fact_board_component_1d": {"board_code", "equity_code", "date", "partition_month"},
     "dwd_dim_security": {"security_code", "security_name", "security_type", "list_date", "is_active"},
     "dwd_fact_financial_indicator": {"equity_code", "announcement_date", "report_period", "partition_month"},
@@ -93,6 +94,25 @@ def source_expr(
     return None
 
 
+def adjust_type_from_lineage_sql() -> str:
+    """从 ODS lineage 推断复权类型。
+
+    ODS external table 当前没有显式 adjust_type 字段，但 source_file 可以稳定
+    区分 daily.zip / daily_qfq.zip / daily_hfq.zip 以及退市股票前后复权文件。
+    """
+    lineage = (
+        "LOWER(CONCAT("
+        "COALESCE(CAST(t.source_file AS STRING), ''), '/', "
+        "COALESCE(CAST(t.source_entry AS STRING), '')"
+        "))"
+    )
+    return f"""CASE
+    WHEN REGEXP_CONTAINS({lineage}, r'(前复权|qfq|daily_qfq)') THEN 'qfq'
+    WHEN REGEXP_CONTAINS({lineage}, r'(后复权|hfq|daily_hfq)') THEN 'hfq'
+    ELSE 'none'
+  END"""
+
+
 def build_kline_dwd_sql(table_key: str, source_id: str, destination_id: str, columns: Sequence[str]) -> str:
     if "equity" in table_key:
         code_column = "equity_code"
@@ -120,7 +140,7 @@ def build_kline_dwd_sql(table_key: str, source_id: str, destination_id: str, col
     raw_code = source_expr(columns, code_candidates, ordinal_map["code"])
     period = table_key.rsplit("_", 1)[-1]
     has_adjust = code_column in {"equity_code", "fund_code"}
-    adjust_items = ["'qfq' AS adjust_type"] if has_adjust else []
+    adjust_items = [f"{adjust_type_from_lineage_sql()} AS adjust_type"] if has_adjust else []
     select_items = [
         f"{parsed_date} AS date",
         f"{partition_month_sql(columns, parsed_date)} AS partition_month",
@@ -148,10 +168,11 @@ def _dedup_sql(
     where_clause: str,
 ) -> str:
     partition_by = ", ".join(key_columns)
+    select_sql = ",\n    ".join(select_items)
     return f"""{prefix}
 WITH normalized AS (
   SELECT
-    {",\n    ".join(select_items)}
+    {select_sql}
   FROM {quote_table(source_id)} AS t
 ),
 ranked AS (
@@ -216,11 +237,12 @@ def build_adjust_factor_dwd_sql(source_id: str, destination_id: str, columns: Se
         f"{parsed_date} AS date",
         f"{partition_month_sql(columns, parsed_date)} AS partition_month",
         f"{normalize_code_sql(code_expr)} AS equity_code",
+        f"{adjust_type_from_lineage_sql()} AS adjust_type",
         f"{numeric_sql(source_expr(columns, ['adjust_factor', '复权因子'], 3))} AS adjust_factor",
         *lineage_select_items(columns),
     ]
-    prefix = create_table_prefix(destination_id, partition=True, partition_field="partition_month", cluster_by=["equity_code"])
-    return _dedup_sql(prefix, source_id, select_items, ["equity_code", "date"], "equity_code IS NOT NULL AND date IS NOT NULL")
+    prefix = create_table_prefix(destination_id, partition=True, partition_field="partition_month", cluster_by=["equity_code", "adjust_type"])
+    return _dedup_sql(prefix, source_id, select_items, ["equity_code", "date", "adjust_type"], "equity_code IS NOT NULL AND date IS NOT NULL")
 
 
 def build_kpl_board_dwd_sql(source_id: str, destination_id: str, columns: Sequence[str]) -> str:
@@ -467,9 +489,10 @@ def build_generic_dwd_sql(table_key: str, source_id: str, destination_id: str, c
     select_items.extend(lineage_select_items(columns))
     cluster = [code_column] if code_column else []
     prefix = create_table_prefix(destination_id, partition=False, cluster_by=cluster)
+    select_sql = ",\n  ".join(select_items)
     return f"""{prefix}
 SELECT
-  {",\n  ".join(select_items)}
+  {select_sql}
 FROM {quote_table(source_id)} AS t
 """
 

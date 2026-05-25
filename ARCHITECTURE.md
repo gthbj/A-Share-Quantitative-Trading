@@ -130,6 +130,8 @@ strategy/<name>/
 | `double_ma` | `strategy.double_ma.DoubleMAStrategy` | 双均线（MA5/MA20）金叉买入、死叉卖出，默认 510300.SH × 15min |
 | `ml_stock_picker` | `strategy.ml_stock_picker.MLStockPickerStrategy` | LightGBM/XGBoost 日线选股，优先读取 BigQuery DWS 技术 + 估值/基本面 + 事件/资金流增强特征；模型缺失时使用确定性 fallback score |
 | `ml_multi_horizon_picker` | `strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy` | 多 Horizon 走步 ML 策略，读取 GCS 月度模型 registry，最多 3~5 只持仓；regime 是风险预算开关：bull 最多 5 只/85% 资金，neutral 最多 3 只/45% 资金，bear 目标 0 只/0% 资金并清掉可卖持仓 |
+| `ml_multi_horizon_picker_bear_budget` | `strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy` | 风险预算实验组：新手续费口径下，bear 不清仓，降为最多 2 只/30% 资金，neutral 最多 4 只/60% 资金 |
+| `ml_multi_horizon_picker_crisis_budget` | `strategy.ml_multi_horizon_picker.MLMultiHorizonStrategy` | 风险预算实验组：bear 降为最多 2 只/30% 资金，并启用 `crisis` 零预算清仓层 |
 | `ml_rich_picker` | `strategy.ml_rich_picker.MLRichPickerStrategy` | **富特征版**（PRD_20260525_03）：在 ml_multi_horizon 基础上把特征从 17 维扩展到 30 维（含 8 维基本面 PE/PB/ROE + 5 维资金流/龙虎榜/涨停连板）；initialize 时一次性预拉特征宽表，handle_data O(1) 查表；模型存储 `gs://.../walk_forward_rich/`，与 v1 完全隔离 |
 | `bqml_signal_picker` | `strategy.bqml_signal_picker.BQMLSignalPickerStrategy` | 直接读取 BigQuery ML ADS 候选信号，动态 universe，按真实撮合引擎执行；默认 10 万资金、最多 5 只持仓、5 个交易日固定持有期 |
 
@@ -138,6 +140,8 @@ strategy/<name>/
 - `python run_backtest.py --preset double_ma` → 加载 `strategy/double_ma/config.yaml`
 - `python run_backtest.py --preset ml_stock_picker` → 加载 `strategy/ml_stock_picker/config.yaml`
 - `python run_backtest.py --preset ml_multi_horizon_picker` → 加载 `strategy/ml_multi_horizon_picker/config.yaml`，按 `gs://data-aquarium/models/walk_forward/registry.json` 逐月切换模型
+- `python run_backtest.py --preset ml_multi_horizon_picker_bear_budget` → bear 作为非零风险预算状态，用于对照测试
+- `python run_backtest.py --preset ml_multi_horizon_picker_crisis_budget` → bear 非零预算 + crisis 清仓层，用于对照测试
 - `python run_backtest.py --preset bqml_signal_picker` → 从 `ashare.ads_signal_ml_stock_picker_bqml_1d` 读取候选信号并真实撮合回测
 - 参数优先级（高到低）：**CLI 参数 > preset config > 全局 `config/backtest.yaml` > 内置默认**
 - 输出目录优先级：`--output` > `strategy/<preset>/runs/`（preset 模式）> `output/`（兜底）
@@ -630,7 +634,8 @@ handle_data → Context.limit_order / stop_order
 ### 5.3 修改交易规则
 
 编辑 `config/backtest.yaml`：
-- `trading.commission_rate`：佣金费率
+- `trading.commission_rate`：佣金费率；当前默认万一（`0.0001`）
+- `trading.min_commission`：最低佣金；当前默认免五（`0.0`）
 - `slippage.value`：滑点大小
 - `execution.price_type`：`next_open` 或 `current_close`
 - `stop_loss.enabled`：是否启用全局止损
@@ -694,6 +699,8 @@ handle_data → Context.limit_order / stop_order
 | `requirements.txt` | 依赖 | 运行依赖 |
 | `requirements-dev.txt` | 依赖 | 开发依赖（pytest） |
 | `pytest.ini` | 配置 | pytest 配置 |
+| `.gitmessage.txt` | 开发工具 | Git commit template，提示中文提交规范和 Agent 归因环境变量 |
+| `.githooks/commit-msg` / `.githooks/prepare-commit-msg` | 开发工具 | 版本化 Git hook，自动补充 `Agent` / `Agent-Model` / `Agent-Task` trailer；本地需配置 `core.hooksPath=.githooks` |
 
 ---
 

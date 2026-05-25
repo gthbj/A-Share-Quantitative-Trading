@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+message_file="${1:-}"
+source_type="${2:-}"
+if [ -z "$message_file" ] || [ ! -f "$message_file" ]; then
+  exit 0
+fi
+
+# For editor-based commits, wait until commit-msg so an untouched template
+# still aborts as an empty commit message.
+case "$source_type" in
+  ""|"template")
+    exit 0
+    ;;
+esac
+
+hook_dir="$(dirname "$0")"
+"$hook_dir/commit-msg" "$message_file"

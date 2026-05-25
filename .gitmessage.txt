@@ -1,0 +1,12 @@
+# 中文提交标题：简洁描述本次改动目的
+#
+# 正文可选：说明关键变更、验证结果、风险。
+#
+# Agent 归因会由 .githooks/commit-msg 自动补到末尾。
+# 推荐提交前设置：
+#   AGENT_NAME=codex AGENT_MODEL=gpt-5 AGENT_TASK="简述本次工作" git commit
+# 或设置本仓库默认值：
+#   git config agent.name codex
+#   git config agent.model gpt-5
+#
+# 不要把 Git Author/Committer 改成 agent；项目所有者账号仍是提交责任人。

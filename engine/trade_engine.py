@@ -131,8 +131,8 @@ class TradeEngine:
 
     def __init__(
         self,
-        commission_rate: float = 0.00025,
-        min_commission: float = 5.0,
+        commission_rate: float = 0.0001,
+        min_commission: float = 0.0,
         stamp_duty_rate: float = 0.0005,
         transfer_fee_rate: float = 0.00001,
         slippage_type: str = "percent",

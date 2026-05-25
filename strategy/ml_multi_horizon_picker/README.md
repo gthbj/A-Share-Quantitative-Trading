@@ -8,8 +8,8 @@
 |---|---|---|
 | 模型数 | 1（固定 horizon=5）| **5**（4 buy × horizon + 1 sell）|
 | 调仓频率 | 5 日 | **每日重新评分** |
-| 持有期 | 5 日固定 | **动态**：argmax_h h × prob_up_h |
-| 卖出触发 | 跌出 Top-K | **6 个独立触发**（见下）|
+| 持有期 | 5 日固定 | **动态**：sell 持仓决策 + 最大持仓交易日兜底 |
+| 卖出触发 | 跌出 Top-K | **5 类独立触发**（见下）|
 | 市场状态 | 无 | **regime 三态**（调制持仓数与止损宽度）|
 | 风险控制 | 无 | 硬止损 + 追踪止盈 + sell 模型 |
 
@@ -19,10 +19,10 @@
 |---|---|---|
 | **a. 硬止损** | 现价 < cost × (1 − stop_loss_pct) | bull/neutral: -5%, bear: -3% |
 | **b. 追踪止盈** | 现价 < 持仓期高点 × (1 − trailing_stop_pct) | -3% from peak |
-| **c. Horizon 到期** | 持有天数 ≥ 建仓时锁定的 expected_horizon | argmax_h h × prob_up_h |
+| **c. 最大持仓兜底** | 持仓交易日数 ≥ max_hold_days | 20 个交易日 |
 | **d. 排名迟滞** | 持有 ≥ min_hold_days 且连续 ≥ dropout_persistence_days 不在 Top-2K | 3 天 / 2 天 |
 | **e. prob_up 兜底** | prob_up_h5 < min_prob_floor 且持有 ≥ min_hold_days | 0.30 |
-| **f. 卖出模型** | prob_sell > sell_threshold | 0.70 |
+| **f. 卖出模型** | 持有 ≥ min_hold_days 且 prob_sell > sell_threshold | 3 天 / 0.70 |
 
 ## Regime 调制
 
@@ -167,4 +167,4 @@ strategy/ml_multi_horizon_picker/
 └── train_config.yaml     — 训练配置
 ```
 
-测试：`tests/test_strategy_ml_multi_horizon.py`（19 用例，覆盖 labels / features / regime / 6 个 sell trigger）。
+测试：`tests/test_strategy_ml_multi_horizon.py`（覆盖 labels / features / regime / sell trigger）。

@@ -20,13 +20,13 @@ def _make_portfolio(cash: float = 1_000_000.0) -> Portfolio:
 
 
 class TestFeeCalc:
-    def test_commission_min_floor(self, trade_engine: TradeEngine):
-        # 1000 元 × 0.00025 = 0.25 元 → 触发最低 5 元
-        assert trade_engine.calc_commission(1000) == 5.0
+    def test_commission_waives_min_floor(self, trade_engine: TradeEngine):
+        # 万一免五：1000 元 × 0.0001 = 0.1 元，不再触发最低 5 元
+        assert trade_engine.calc_commission(1000) == pytest.approx(0.1)
 
     def test_commission_above_min(self, trade_engine: TradeEngine):
-        # 100_000 元 × 0.00025 = 25 元
-        assert trade_engine.calc_commission(100_000) == 25.0
+        # 100_000 元 × 0.0001 = 10 元
+        assert trade_engine.calc_commission(100_000) == pytest.approx(10.0)
 
     def test_stamp_duty(self, trade_engine: TradeEngine):
         # 10_000 元 × 0.0005 = 5.0 元

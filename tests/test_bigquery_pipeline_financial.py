@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from bigquery_pipeline import cli
-from bigquery_pipeline.financial import normalize_financial_frame
+from bigquery_pipeline.financial import build_equity_valuation_features_sql, normalize_financial_frame
 from bigquery_pipeline.sql import coerce_date_value, normalize_security_code
 
 
@@ -45,6 +45,15 @@ def test_normalize_financial_frame_maps_core_fields():
     assert result.loc[0, "roe"] == 12.8
     assert result.loc[0, "source_file"] == "gs://bucket/fact_financial_indicator/part.parquet"
     assert result.loc[0, "source_hash"]
+
+
+def test_valuation_sql_uses_unadjusted_price_for_valuation():
+    config = {"project_id": "data-aquarium", "dataset": "ashare", "table_prefixes": {"dwd": "dwd_", "dws": "dws_"}}
+
+    sql = build_equity_valuation_features_sql(config)
+
+    assert "AND adjust_type = 'none'" in sql
+    assert "AND adjust_type = 'qfq'" not in sql
 
 
 def test_bigquery_pipeline_cli_exposes_internal_commands(capsys, monkeypatch):

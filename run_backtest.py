@@ -287,8 +287,8 @@ def main() -> int:
     slip_cfg = cfg.get("slippage", {})
     exec_cfg = cfg.get("execution", {})
     trade_engine = TradeEngine(
-        commission_rate=trading_cfg.get("commission_rate", 0.00025),
-        min_commission=trading_cfg.get("min_commission", 5.0),
+        commission_rate=trading_cfg.get("commission_rate", 0.0001),
+        min_commission=trading_cfg.get("min_commission", 0.0),
         stamp_duty_rate=trading_cfg.get("stamp_duty_rate", 0.0005),
         transfer_fee_rate=trading_cfg.get("transfer_fee_rate", 0.00001),
         slippage_type=slip_cfg.get("type", "percent"),

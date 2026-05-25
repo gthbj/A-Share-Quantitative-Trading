@@ -4,15 +4,16 @@
 
 - 特征加载：initialize 时预拉取整个回测期 + warmup 的 rich features 宽表，
   按 (date, equity_code) 建索引；handle_data 时 O(1) 查表
-- 推理特征列：30 维 buy / 35 维 sell（含基本面 + 资金流）
+- 推理特征列：30 维 buy / 39 维 sell（含基本面 + 资金流 + 持仓状态）
 
-其余逻辑（6 个 sell trigger / regime / 走步切换 / trading_permissions 过滤）
-继承自父类，零修改。
+其余逻辑（regime / 走步切换 / trading_permissions 过滤）继承自父类；
+sell trigger 使用当前持仓决策口径：不做 h5 到期硬卖，仅用更长
+max_hold_days 作为异常兜底。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -20,17 +21,18 @@ import pandas as pd
 from strategy.base_strategy import Context
 from strategy.ml_multi_horizon_picker.strategy import MLMultiHorizonStrategy
 from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS, SELL_MODEL_NAME
+from strategy.ml_multi_horizon_picker.tradable import filter_codes
 
 from strategy.ml_rich_picker.features import (
     DAILY_FEATURE_COLUMNS,
     FUNDAMENTAL_FEATURE_COLUMNS,
     EVENT_FEATURE_COLUMNS,
+    POSITION_STATE_FEATURE_COLUMNS,
     RICH_BUY_FEATURE_COLUMNS,
     RICH_SELL_FEATURE_COLUMNS,
     deterministic_rich_score,
     deterministic_rich_sell_score,
 )
-from strategy.ml_multi_horizon_picker.features import compute_sell_risk_features
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -46,9 +48,10 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
        handle_data 时 O(1) 查表，无需每只股票循环。
 
     2. **特征维度**：buy 30 维（17 daily + 8 fundamental + 5 event），
-       sell 35 维（30 + 5 sell-side 风险特征）。
+       sell 39 维（30 + 5 sell-side 风险特征 + 4 持仓状态特征）。
 
-    其余（6 个 sell trigger / regime / 走步切换）完全复用父类。
+    其余（regime / 走步切换）复用父类；sell trigger 使用当前持仓决策口径，
+    不再按 h5/expected_horizon 到期硬卖。
     """
 
     # 类常量
@@ -63,6 +66,8 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         bq_location: str = "asia-east2",
         adjust_type: str = "qfq",
         require_rich_features: bool = True,
+        decision_horizon: int = 5,
+        max_hold_days: Optional[int] = 20,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -75,9 +80,18 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         #              避免悄无声息退回 v1 17 维路径让用户拿到误以为是 v2 的回测结果
         # False：允许退化（仅用于调试/CI；正式回测不要打开）
         self.require_rich_features = bool(require_rich_features)
+        self.decision_horizon = int(decision_horizon)
+        if self.decision_horizon not in BUY_HORIZONS:
+            raise ValueError(f"decision_horizon 必须在 {BUY_HORIZONS} 内")
+        self.max_hold_days = (
+            int(max_hold_days)
+            if max_hold_days is not None and int(max_hold_days) > 0
+            else None
+        )
         # 预加载的富特征宽表，indexed by (date, equity_code)
         self._rich_features: Optional[pd.DataFrame] = None
         self._rich_features_index: Optional[pd.MultiIndex] = None
+        self._trading_date_index: Dict[str, int] = {}
         # before_trading_start 的"第一次"标记（懒加载）
         self._rich_preloaded: bool = False
 
@@ -90,7 +104,36 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
     def initialize(self, context: Context) -> None:
         """父类初始化。Rich features 预加载推迟到 before_trading_start。"""
         super().initialize(context)
+        if self.universe_source == "liquidity_top" and not self._explicit_universe:
+            broad_universe = self._load_broad_trading_universe(context)
+            if broad_universe:
+                self._init_universe = broad_universe
+                self.set_universe(broad_universe)
+                logger.info(
+                    f"rich 动态 universe 启用：预加载可交易全市场 {len(broad_universe)} 只，"
+                    f"每日按近 {self.liquidity_lookback_days} 日成交额取 Top{self.liquidity_top_n}"
+                )
         # 不在这里调 _preload_rich_features —— 此时 context.all_bars 未注入
+
+    def _load_broad_trading_universe(self, context: Context) -> List[str]:
+        """返回预加载用宽股票池；实际交易池在每日打分时动态收敛。"""
+        loader = getattr(context.data_source, "get_stock_list", None)
+        if not callable(loader):
+            return []
+        try:
+            stock_df = loader()
+        except Exception as exc:
+            logger.warning(f"加载全市场股票池失败，保留父类初始 universe: {exc}")
+            return []
+        if stock_df is None or stock_df.empty:
+            return []
+        code_col = "code" if "code" in stock_df.columns else "equity_code"
+        if code_col not in stock_df.columns:
+            return []
+        codes = stock_df[code_col].dropna().astype(str).unique().tolist()
+        if self.trading_permissions is not None:
+            codes = filter_codes(codes, self.trading_permissions)
+        return sorted(codes)
 
     def before_trading_start(self, context: Context, data: Dict[str, pd.Series]) -> None:
         """在第一个交易日调用一次预加载（懒加载到 all_bars 已就绪）。"""
@@ -181,8 +224,11 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             cfg, load_start, end_date, code_filter=self._init_universe
         )
         if df.empty:
-            logger.warning("rich features 加载为空")
+            msg = "rich features 加载为空"
+            logger.warning(msg)
             self._rich_features = None
+            if self.require_rich_features:
+                raise RuntimeError(msg)
             return
 
         # 计算 sell-side 5 维风险特征
@@ -193,7 +239,96 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         df = df.sort_values(["date", "equity_code"]).reset_index(drop=True)
         df = df.set_index(["date", "equity_code"])
         self._rich_features = df
+        self._trading_date_index = self._build_trading_date_index(
+            df.index.get_level_values("date")
+        )
         logger.info(f"rich features 预加载完成: {len(df):,} 行")
+
+    def _ensure_trading_date_index(self, context: Optional[Context] = None) -> Dict[str, int]:
+        if self._trading_date_index:
+            return self._trading_date_index
+
+        if self._rich_features is not None and not self._rich_features.empty:
+            if isinstance(self._rich_features.index, pd.MultiIndex) and "date" in self._rich_features.index.names:
+                self._trading_date_index = self._build_trading_date_index(
+                    self._rich_features.index.get_level_values("date")
+                )
+                return self._trading_date_index
+            if "date" in self._rich_features.columns:
+                self._trading_date_index = self._build_trading_date_index(
+                    self._rich_features["date"]
+                )
+                return self._trading_date_index
+
+        return super()._ensure_trading_date_index(context)
+
+    def _dynamic_universe_for_date(self, today_df: pd.DataFrame, current_date: str) -> List[str]:
+        """按当前信号日可见数据动态选近 N 日成交额 Top 股票池。"""
+        if self._explicit_universe or self.universe_source != "liquidity_top":
+            return list(self._universe)
+        if self._rich_features is None or self._rich_features.empty:
+            return list(self._universe)
+
+        lookback_start = (
+            pd.to_datetime(current_date) - pd.Timedelta(days=self.liquidity_lookback_days * 2)
+        ).strftime("%Y%m%d")
+        hist = self._rich_features.reset_index()
+        recent = hist[
+            (hist["date"] >= lookback_start)
+            & (hist["date"] <= current_date)
+            & (hist["equity_code"].isin(today_df["equity_code"]))
+        ]
+        if recent.empty or "amount" not in recent.columns:
+            codes = today_df["equity_code"].head(self.liquidity_top_n).astype(str).tolist()
+        else:
+            codes = (
+                recent.groupby("equity_code")["amount"]
+                .mean()
+                .sort_values(ascending=False)
+                .head(self.liquidity_top_n)
+                .index.astype(str)
+                .tolist()
+            )
+        if self.trading_permissions is not None:
+            codes = filter_codes(codes, self.trading_permissions)
+        self._universe = codes
+        return codes
+
+    def _position_state_features(
+        self,
+        context: Context,
+        today_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """为 sell 模型补齐当前真实持仓状态；未持仓股票使用中性状态。"""
+        out = pd.DataFrame(index=today_df.index)
+        out["holding_days"] = 0.0
+        out["position_return"] = 0.0
+        out["drawdown_from_position_peak"] = 0.0
+        out["days_to_expected_horizon"] = float(self.decision_horizon)
+
+        portfolio = getattr(context, "portfolio", None)
+        if portfolio is None:
+            return out
+        close_by_code = today_df.set_index("equity_code")["close"].astype(float)
+        for code, state in self._position_state.items():
+            if code not in close_by_code.index:
+                continue
+            pos = portfolio.get_position(code) if hasattr(portfolio, "get_position") else None
+            if pos is None or getattr(pos, "total_qty", 0) <= 0:
+                continue
+            matching_idx = today_df.index[today_df["equity_code"] == code]
+            if len(matching_idx) == 0:
+                continue
+            idx = matching_idx[0]
+            close = float(close_by_code.loc[code])
+            cost = float(getattr(pos, "cost_price", 0.0) or 0.0)
+            peak = max(float(state.peak_price or 0.0), close)
+            holding_days = float(self._holding_trade_days(context, state, pos))
+            out.loc[idx, "holding_days"] = holding_days
+            out.loc[idx, "position_return"] = (close / cost - 1.0) if cost > 0 else 0.0
+            out.loc[idx, "drawdown_from_position_peak"] = (close / peak - 1.0) if peak > 0 else 0.0
+            out.loc[idx, "days_to_expected_horizon"] = float(state.expected_horizon) - holding_days
+        return out
 
     # ──────────────────────────────────────────────────────────────
     # 重写 _score_universe：从预加载表查特征
@@ -228,16 +363,23 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         try:
             today_df = self._rich_features.xs(current_date, level="date").copy()
         except KeyError:
-            logger.warning(f"{current_date} 在预加载特征表中无记录")
+            msg = f"{current_date} 在预加载特征表中无记录"
+            if self.require_rich_features:
+                raise RuntimeError(msg)
+            logger.warning(msg)
             return None
 
         if today_df.empty:
+            if self.require_rich_features:
+                raise RuntimeError(f"{current_date} rich features 当日截面为空")
             return None
 
         today_df = today_df.reset_index()
-        # 限制到 universe
-        today_df = today_df[today_df["equity_code"].isin(self._universe)]
+        dynamic_universe = self._dynamic_universe_for_date(today_df, current_date)
+        today_df = today_df[today_df["equity_code"].isin(dynamic_universe)]
         if today_df.empty:
+            if self.require_rich_features:
+                raise RuntimeError(f"{current_date} rich features 与 universe 无交集")
             return None
 
         # 缺失任何 daily 特征的股票直接丢弃（基本面 / event NaN 允许）
@@ -246,14 +388,21 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         if len(today_df) < before:
             logger.debug(f"{current_date} daily 特征不全丢弃 {before - len(today_df)} 股")
         if today_df.empty:
+            if self.require_rich_features:
+                raise RuntimeError(f"{current_date} daily 特征完整的 rich 截面为空")
             return None
+        today_df = today_df.reset_index(drop=True)
+        position_features = self._position_state_features(context, today_df)
+        for col in POSITION_STATE_FEATURE_COLUMNS:
+            today_df[col] = position_features[col].astype(float).to_numpy()
 
-        codes = today_df["equity_code"].tolist()
         X_buy = today_df[RICH_BUY_FEATURE_COLUMNS].values
         X_sell = today_df[RICH_SELL_FEATURE_COLUMNS].values
 
-        # 预测 4 个 buy horizon
-        score_df = pd.DataFrame({"code": codes})
+        # 保留当日可见特征列，供父类 regime 市场广度/危机判断复用。
+        score_df = today_df[["equity_code"] + RICH_BUY_FEATURE_COLUMNS].rename(
+            columns={"equity_code": "code"}
+        ).copy()
         for h in BUY_HORIZONS:
             col = f"prob_up_h{h}"
             model = self._models.get(f"buy_h{h}")
@@ -262,16 +411,24 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                     pred = model.predict(X_buy)
                     score_df[col] = self._squash_to_prob(pred)
                 except Exception as exc:
+                    if not self.use_deterministic_fallback:
+                        raise RuntimeError(
+                            f"buy_h{h} 模型预测失败，且 use_deterministic_fallback=False"
+                        ) from exc
                     logger.warning(f"buy_h{h} 预测失败，降级 fallback: {exc}")
                     score_df[col] = self._squash_to_prob(
-                        deterministic_rich_score(today_df[RICH_BUY_FEATURE_COLUMNS])
+                        deterministic_rich_score(
+                            today_df[RICH_BUY_FEATURE_COLUMNS]
+                        ).to_numpy()
                     )
             elif self.use_deterministic_fallback:
                 score_df[col] = self._squash_to_prob(
-                    deterministic_rich_score(today_df[RICH_BUY_FEATURE_COLUMNS])
+                    deterministic_rich_score(today_df[RICH_BUY_FEATURE_COLUMNS]).to_numpy()
                 )
             else:
-                score_df[col] = 0.0
+                raise RuntimeError(
+                    f"buy_h{h} 模型缺失，且 use_deterministic_fallback=False"
+                )
 
         # 预测 sell
         sell_model = self._models.get(SELL_MODEL_NAME)
@@ -279,15 +436,27 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             try:
                 score_df["prob_sell"] = self._squash_to_prob(sell_model.predict(X_sell))
             except Exception as exc:
+                if not self.use_deterministic_fallback:
+                    raise RuntimeError(
+                        "sell 模型预测失败，且 use_deterministic_fallback=False"
+                    ) from exc
                 logger.warning(f"sell 预测失败，降级 fallback: {exc}")
                 score_df["prob_sell"] = deterministic_rich_sell_score(
                     today_df[RICH_SELL_FEATURE_COLUMNS]
-                )
-        else:
+                ).to_numpy()
+        elif self.use_deterministic_fallback:
             score_df["prob_sell"] = deterministic_rich_sell_score(
                 today_df[RICH_SELL_FEATURE_COLUMNS]
+            ).to_numpy()
+        else:
+            raise RuntimeError(
+                f"{SELL_MODEL_NAME} 模型缺失，且 use_deterministic_fallback=False"
             )
 
-        # score = max(h5, h10, h20)（与 v1 一致）
-        score_df["score"] = score_df[["prob_up_h5", "prob_up_h10", "prob_up_h20"]].max(axis=1)
+        # 不跨 horizon 比较原始概率；交易排序固定用一个决策 horizon。
+        score_df["score"] = score_df[f"prob_up_h{self.decision_horizon}"]
         return score_df
+
+    def _argmax_horizon(self, row: pd.Series) -> int:
+        """rich 版避免跨 horizon 概率比较，持仓状态特征记录决策 horizon。"""
+        return self.decision_horizon

@@ -16,6 +16,24 @@
 
 - **Commit 语言**：所有 Commit Message 必须使用**中文**书写。
 - **Commit 内容**：简洁描述改动目的，如需列出详细变更项可在消息正文中分点说明。
+- **Agent 归因**：提交与推送仍使用项目所有者自己的 Git 账号，不把 Git `Author` 或 `Committer` 改成 agent。需要记录代码由哪个 agent/model 协助完成时，写入 Commit Message trailer。
+- **推荐 trailer 格式**：
+  ```text
+  Agent: codex
+  Agent-Model: gpt-5
+  Agent-Task: 简述本次 agent 负责的工作
+  ```
+- **多 agent 协作时**：可在同一个 commit message 中保留多组 `Agent` / `Agent-Model` / `Agent-Task`，或在正文中按 agent 分段说明。GitHub 默认只显示用户账号，agent/model 信息以后通过 `git log --format=full` 或 PR 描述查看。
+- **责任归属**：Git author/committer 代表最终提交责任人；agent/model 仅作为辅助开发来源记录，不替代项目所有者的代码责任。
+
+---
+
+## Agent 记忆与项目级偏好
+
+- **项目级长期记忆**：本文件是本仓库的项目级偏好来源。后续 agent 在开始重要改动前，应优先阅读 `PROJECT_OWNER_PREFERENCES.md`、`ARCHITECTURE.md` 和相关 PRD。
+- **模型长期记忆边界**：不要假设当前对话中的任何 agent 都具备跨会话、跨项目的永久记忆。需要长期生效的规则必须写入仓库文件、开发文档、commit template、hook 或外部项目管理系统。
+- **可执行落地方式**：如需强制每次提交记录 agent/model，可后续增加 Git commit template 或 `prepare-commit-msg` hook，自动插入 `Agent:`、`Agent-Model:`、`Agent-Task:` 字段。
+- **本仓库已落地**：当前仓库使用 `.gitmessage.txt` 作为 commit template，使用 `.githooks/commit-msg` 自动补充 agent trailer，并保留 `.githooks/prepare-commit-msg` 处理 `git commit -m` / merge 等已有消息场景。本地需保持 `git config core.hooksPath .githooks` 与 `git config commit.template .gitmessage.txt`。
 
 ---
 

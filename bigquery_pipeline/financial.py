@@ -332,7 +332,7 @@ price_base AS (
     AND date IS NOT NULL
     AND close IS NOT NULL
     AND SAFE_CAST(close AS FLOAT64) > 0
-    AND adjust_type = 'qfq'
+    AND adjust_type = 'none'
 )
 SELECT
   p.equity_code,

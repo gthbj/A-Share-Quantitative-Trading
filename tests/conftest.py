@@ -27,8 +27,8 @@ def portfolio() -> Portfolio:
 def trade_engine() -> TradeEngine:
     """默认参数的撮合引擎（与 config/backtest.yaml 默认一致）。"""
     return TradeEngine(
-        commission_rate=0.00025,
-        min_commission=5.0,
+        commission_rate=0.0001,
+        min_commission=0.0,
         stamp_duty_rate=0.0005,
         transfer_fee_rate=0.00001,
         slippage_type="percent",

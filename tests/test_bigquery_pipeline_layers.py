@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from bigquery_pipeline.ads import build_event_money_flow_signal_sql
 from bigquery_pipeline.dwd import (
+    build_adjust_factor_dwd_sql,
     build_dragon_tiger_dwd_sql,
+    build_kline_dwd_sql,
     build_index_component_dwd_sql,
     build_kpl_board_dwd_sql,
     build_money_flow_dwd_sql,
@@ -68,3 +70,54 @@ def test_event_money_flow_dws_and_ads_sql_are_registered():
     assert "ads_signal_event_money_flow_1d" in ads_sql
     assert "score_proxy" in ads_sql
     assert "is_selected" in ads_sql
+
+
+def test_equity_kline_dwd_infers_adjust_type_from_source_file():
+    sql = build_kline_dwd_sql(
+        "fact_equity_kline_1d",
+        "data-aquarium.ashare.ods_fact_equity_kline_1d",
+        "data-aquarium.ashare.dwd_fact_equity_kline_1d",
+        [
+            "__",
+            "____",
+            "___",
+            "_____",
+            "______",
+            "_______",
+            "________",
+            "_________",
+            "date",
+            "security_code",
+            "source_file",
+            "source_entry",
+            "partition_month",
+        ],
+    )
+
+    assert "AS adjust_type" in sql
+    assert "daily_qfq" in sql
+    assert "daily_hfq" in sql
+    assert "ELSE 'none'" in sql
+    assert "PARTITION BY equity_code, date, adjust_type" in sql
+
+
+def test_adjust_factor_dwd_keeps_qfq_and_hfq_and_reads_placeholder_factor():
+    sql = build_adjust_factor_dwd_sql(
+        "data-aquarium.ashare.ods_fact_adjust_factor",
+        "data-aquarium.ashare.dwd_fact_adjust_factor",
+        [
+            "____",
+            "_____",
+            "______",
+            "date",
+            "security_code",
+            "source_file",
+            "source_entry",
+            "partition_month",
+        ],
+    )
+
+    assert "AS adjust_type" in sql
+    assert "SAFE_CAST(NULLIF(TRIM(CAST(t.`______` AS STRING)), '') AS NUMERIC) AS adjust_factor" in sql
+    assert "CLUSTER BY equity_code, adjust_type" in sql
+    assert "PARTITION BY equity_code, date, adjust_type" in sql

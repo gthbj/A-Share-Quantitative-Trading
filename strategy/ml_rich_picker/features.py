@@ -8,7 +8,7 @@
 
 总特征维度：
     Buy 模型: 17 (daily) + 8 (fundamental) + 5 (event) = 30
-    Sell 模型: 30 + 5 (sell-side risk) = 35
+    Sell 模型: 30 + 5 (sell-side risk) + 4 (position state) = 39
 """
 
 from __future__ import annotations
@@ -49,6 +49,16 @@ EVENT_FEATURE_COLUMNS: List[str] = [
 ]
 
 
+# 4 维持仓状态特征。sell 模型是“当前持仓是否应在下一开盘卖出”的
+# 决策模型，必须看到成本、持仓年龄、持仓高点回撤等状态。
+POSITION_STATE_FEATURE_COLUMNS: List[str] = [
+    "holding_days",
+    "position_return",
+    "drawdown_from_position_peak",
+    "days_to_expected_horizon",
+]
+
+
 # 完整的 buy / sell 特征列定义
 RICH_BUY_FEATURE_COLUMNS: List[str] = (
     DAILY_FEATURE_COLUMNS         # 17 维
@@ -59,7 +69,8 @@ RICH_BUY_FEATURE_COLUMNS: List[str] = (
 RICH_SELL_FEATURE_COLUMNS: List[str] = (
     RICH_BUY_FEATURE_COLUMNS       # 30 维
     + SELL_RISK_FEATURE_COLUMNS    # 5 维
-)  # = 35
+    + POSITION_STATE_FEATURE_COLUMNS  # 4 维
+)  # = 39
 
 
 def deterministic_rich_score(feature_df: pd.DataFrame) -> pd.Series:
@@ -118,12 +129,17 @@ def deterministic_rich_sell_score(feature_df: pd.DataFrame) -> pd.Series:
         - 龙虎榜净卖出 → 风险加分
     """
     df = feature_df.copy()
+    zero = pd.Series(0.0, index=df.index)
+    default_days_to_horizon = pd.Series(5.0, index=df.index)
     raw = (
         # 与 v1 一致的风险因子
         -df.get("drawdown_from_high_20d", 0).fillna(0).astype(float) * 3
         + (df.get("vol_expansion", 1).fillna(1).astype(float) - 1).clip(0, None) * 2
         + (df.get("rsi_overbought_streak", 0).fillna(0).astype(float) > 5).astype(float) * 0.3
         + (df.get("return_5d", 0).fillna(0).astype(float) < -0.05).astype(float) * 0.3
+        + (df.get("position_return", zero).fillna(0).astype(float) < -0.03).astype(float) * 0.4
+        - df.get("drawdown_from_position_peak", zero).fillna(0).astype(float).clip(-1, 0) * 0.6
+        + (df.get("days_to_expected_horizon", default_days_to_horizon).fillna(5).astype(float) <= 0).astype(float) * 0.2
         # 富特征新增风险因子
         + df.get("debt_to_assets", 0).fillna(0).astype(float).clip(0, 1) * 0.3
         - df.get("dragon_tiger_net_pct", 0).fillna(0).astype(float).clip(-1, 0) * 0.5  # 净卖出（负值）

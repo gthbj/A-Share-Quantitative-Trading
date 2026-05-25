@@ -1,7 +1,7 @@
 """ml_rich_picker 单元测试（PRD_20260525_03）。
 
 覆盖：
-- 富特征列定义（30 维 buy / 35 维 sell）
+- 富特征列定义（30 维 buy / 39 维 sell）
 - deterministic_rich_score / deterministic_rich_sell_score 兜底逻辑
 - MLRichPickerStrategy 构造（继承父类）
 - walk_forward 模块 import 不报错
@@ -13,10 +13,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from account.portfolio import Portfolio
+from account.position import Position
 from strategy.ml_rich_picker import (
     DAILY_FEATURE_COLUMNS,
     FUNDAMENTAL_FEATURE_COLUMNS,
     EVENT_FEATURE_COLUMNS,
+    POSITION_STATE_FEATURE_COLUMNS,
     RICH_BUY_FEATURE_COLUMNS,
     RICH_SELL_FEATURE_COLUMNS,
     MLRichPickerStrategy,
@@ -24,7 +27,8 @@ from strategy.ml_rich_picker import (
     deterministic_rich_sell_score,
 )
 from strategy.ml_multi_horizon_picker.features import SELL_RISK_FEATURE_COLUMNS
-from strategy.ml_multi_horizon_picker.strategy import MLMultiHorizonStrategy
+from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS, SELL_MODEL_NAME
+from strategy.ml_multi_horizon_picker.strategy import MLMultiHorizonStrategy, PositionState
 
 
 # ──────────────────────────────────────────────────────────────
@@ -57,11 +61,12 @@ def test_rich_buy_feature_count():
 
 
 def test_rich_sell_feature_count():
-    """Sell 特征 35 维 = 30 + 5。"""
-    assert len(RICH_SELL_FEATURE_COLUMNS) == 35
-    # 前 30 维与 buy 一致，最后 5 维是 sell-side 风险
+    """Sell 特征 39 维 = 30 + 5 + 4。"""
+    assert len(RICH_SELL_FEATURE_COLUMNS) == 39
+    # 前 30 维与 buy 一致，然后 5 维 sell-side 风险，最后 4 维持仓状态
     assert RICH_SELL_FEATURE_COLUMNS[:30] == RICH_BUY_FEATURE_COLUMNS
-    assert RICH_SELL_FEATURE_COLUMNS[30:] == SELL_RISK_FEATURE_COLUMNS
+    assert RICH_SELL_FEATURE_COLUMNS[30:35] == SELL_RISK_FEATURE_COLUMNS
+    assert RICH_SELL_FEATURE_COLUMNS[35:] == POSITION_STATE_FEATURE_COLUMNS
 
 
 def test_no_duplicate_features():
@@ -102,6 +107,64 @@ def _toy_rich_features(n: int = 5) -> pd.DataFrame:
     return df
 
 
+def _indexed_rich_features(codes: list[str] | None = None) -> pd.DataFrame:
+    """构造 _score_universe 可直接查表的 indexed rich features。"""
+    codes = codes or ["000001.SZ", "600000.SH"]
+    rows = []
+    for i, code in enumerate(codes):
+        row = {
+            "date": "20240102",
+            "equity_code": code,
+            "close": 10.0 + i,
+            "high": 10.5 + i,
+            "ma_60": 9.5 + i,
+            "amount": 1_000_000.0,
+        }
+        for col in RICH_SELL_FEATURE_COLUMNS:
+            row[col] = 0.1
+        row.update(
+            {
+                "rsi_14": 50.0,
+                "pe_basic": 10.0,
+                "pb": 1.5,
+                "roe": 0.15,
+                "debt_to_assets": 0.35,
+                "dragon_tiger_net_pct": 0.0,
+                "drawdown_from_high_20d": 0.0,
+                "vol_expansion": 1.0,
+                "rsi_overbought_streak": 0.0,
+                "return_5d": 0.02,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows).set_index(["date", "equity_code"])
+
+
+class _ConstantModel:
+    def __init__(self, value: float = 0.6):
+        self.value = value
+
+    def predict(self, X):
+        return np.full(len(X), self.value)
+
+
+class _FailingModel:
+    def predict(self, X):
+        raise ValueError("dimension mismatch")
+
+
+def _rich_strategy_with_features(use_fallback: bool = False) -> MLRichPickerStrategy:
+    codes = ["000001.SZ", "600000.SH"]
+    strat = MLRichPickerStrategy(
+        universe=codes,
+        require_rich_features=True,
+        use_deterministic_fallback=use_fallback,
+    )
+    strat._universe = codes
+    strat._rich_features = _indexed_rich_features(codes)
+    return strat
+
+
 def test_deterministic_rich_score_returns_series():
     """fallback 函数返回长度匹配的 Series。"""
     df = _toy_rich_features()
@@ -120,6 +183,130 @@ def test_deterministic_rich_sell_score_in_range():
         df[col] = np.random.uniform(-0.5, 0.5, len(df))
     out = deterministic_rich_sell_score(df)
     assert (out >= 0).all() and (out <= 1).all()
+
+
+def test_score_universe_raises_when_buy_model_missing_without_fallback():
+    """正式 rich 模式：buy 模型缺失应失败，不写 0 或 deterministic 分数。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models.pop("buy_h10")
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    with pytest.raises(RuntimeError, match="buy_h10 模型缺失"):
+        strat._score_universe(_FakeCtx())
+
+
+def test_score_universe_raises_when_sell_model_missing_without_fallback():
+    """正式 rich 模式：sell 模型缺失也应失败，不静默用 deterministic sell。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    with pytest.raises(RuntimeError, match=f"{SELL_MODEL_NAME} 模型缺失"):
+        strat._score_universe(_FakeCtx())
+
+
+def test_score_universe_raises_when_prediction_fails_without_fallback():
+    """正式 rich 模式：模型维度不匹配 / predict 失败应直接暴露。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models["buy_h1"] = _FailingModel()
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    with pytest.raises(RuntimeError, match="buy_h1 模型预测失败"):
+        strat._score_universe(_FakeCtx())
+
+
+def test_score_universe_allows_missing_models_only_when_fallback_enabled():
+    """显式 fallback 调试模式仍可用 deterministic rich 分数。"""
+    strat = _rich_strategy_with_features(use_fallback=True)
+    strat._models = {}
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+    assert out is not None
+    assert set(["prob_up_h1", "prob_up_h5", "prob_up_h10", "prob_up_h20", "prob_sell"]).issubset(out.columns)
+    assert len(out) == 2
+
+
+def test_score_universe_retains_features_for_parent_regime_breadth():
+    """rich score_df 必须保留父类 regime 广度判断所需的可见特征。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+
+    assert out is not None
+    assert {"return_5d", "return_20d", "close_to_ma20"}.issubset(out.columns)
+    assert {"pe_basic", "main_net_inflow_pct"}.issubset(out.columns)
+
+
+def test_score_universe_uses_fixed_decision_horizon_score():
+    """不同 horizon 不再取 max，交易排序固定使用 decision_horizon。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {
+        "buy_h1": _ConstantModel(0.9),
+        "buy_h5": _ConstantModel(0.4),
+        "buy_h10": _ConstantModel(0.8),
+        "buy_h20": _ConstantModel(0.7),
+        SELL_MODEL_NAME: _ConstantModel(0.2),
+    }
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+
+    assert out is not None
+    assert (out["score"] == out["prob_up_h5"]).all()
+
+
+def test_score_universe_dynamic_liquidity_universe():
+    """回测交易 universe 每天按近 N 日成交额动态收敛，而不是首日静态。"""
+    codes = ["000001.SZ", "600000.SH"]
+    rows = []
+    for date, amounts in [
+        ("20240101", [1_000.0, 10_000.0]),
+        ("20240102", [1_000.0, 20_000.0]),
+    ]:
+        frame = _indexed_rich_features(codes).reset_index()
+        frame["date"] = date
+        frame["amount"] = amounts
+        rows.append(frame)
+    features = pd.concat(rows, ignore_index=True).set_index(["date", "equity_code"])
+    strat = MLRichPickerStrategy(
+        require_rich_features=True,
+        use_deterministic_fallback=False,
+        universe_source="liquidity_top",
+        liquidity_top_n=1,
+    )
+    strat._explicit_universe = False
+    strat._universe = codes
+    strat._rich_features = features
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+
+    assert out is not None
+    assert out["code"].tolist() == ["600000.SH"]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -145,6 +332,7 @@ def test_strategy_construct_minimal():
     assert strat.bq_location == "asia-east2"
     # 默认严格 rich 模式
     assert strat.require_rich_features is True
+    assert strat.max_hold_days == 20
     # 富特征常量挂在类上
     assert strat.RICH_BUY_FEATURE_COLUMNS == RICH_BUY_FEATURE_COLUMNS
     assert strat.RICH_SELL_FEATURE_COLUMNS == RICH_SELL_FEATURE_COLUMNS
@@ -166,6 +354,17 @@ def test_score_universe_raises_when_rich_features_missing_and_strict():
         current_date = "20240101"
 
     with pytest.raises(RuntimeError, match="rich features 未加载"):
+        strat._score_universe(_FakeCtx())
+
+
+def test_score_universe_raises_when_current_date_missing_and_strict():
+    """严格 rich 模式：某交易日缺 rich 截面不能静默跳过。"""
+    strat = _rich_strategy_with_features(use_fallback=True)
+
+    class _FakeCtx:
+        current_date = "20240103"
+
+    with pytest.raises(RuntimeError, match="预加载特征表中无记录"):
         strat._score_universe(_FakeCtx())
 
 
@@ -269,6 +468,39 @@ def test_strategy_inherits_trading_permissions_filter():
     assert set(strat._init_universe) == {"600000.SH", "000001.SZ"}
 
 
+def test_rich_position_state_uses_trading_day_holding_days():
+    """持仓状态特征按交易日计数，并使用 Portfolio 的真实成交日。"""
+    strat = MLRichPickerStrategy(require_rich_features=True)
+    strat._trading_date_index = strat._build_trading_date_index(
+        ["20240105", "20240108", "20240109", "20240110"]
+    )
+    portfolio = Portfolio(initial_capital=1_000_000)
+    pos = Position(code="600000.SH")
+    pos.total_qty = 1000
+    pos.sellable_qty = 1000
+    pos.cost_price = 10.0
+    pos._buy_records["20240105"] = 1000
+    portfolio.positions["600000.SH"] = pos
+    strat._position_state["600000.SH"] = PositionState(
+        entered_date="20240104",  # 模拟信号日；真实成交日应来自 _buy_records
+        expected_horizon=5,
+        peak_price=10.5,
+    )
+
+    class _FakeCtx:
+        pass
+    ctx = _FakeCtx()
+    ctx.current_date = "20240108"
+    ctx.all_bars = {}
+    ctx.portfolio = portfolio
+
+    today_df = pd.DataFrame([{"equity_code": "600000.SH", "close": 10.2}])
+    out = strat._position_state_features(ctx, today_df)
+
+    assert out.loc[0, "holding_days"] == 1.0
+    assert out.loc[0, "days_to_expected_horizon"] == 4.0
+
+
 # ──────────────────────────────────────────────────────────────
 # walk_forward 模块
 # ──────────────────────────────────────────────────────────────
@@ -281,6 +513,7 @@ def test_walk_forward_module_importable():
     assert hasattr(walk_forward, "main")
     assert hasattr(walk_forward, "_load_rich_features_from_bq")
     assert hasattr(walk_forward, "_train_one_retrain_point_rich")
+    assert hasattr(walk_forward, "_missing_rich_model_components")
 
 
 def test_config_yaml_has_universe_top500():
@@ -299,11 +532,13 @@ def test_config_yaml_has_universe_top500():
         f"config liquidity_top_n 应为 500，实际 {params.get('liquidity_top_n')}"
     assert params.get("liquidity_lookback_days") == 60, \
         f"config liquidity_lookback_days 应为 60，实际 {params.get('liquidity_lookback_days')}"
+    assert params.get("max_hold_days") == 20, \
+        f"config max_hold_days 应为 20，实际 {params.get('max_hold_days')}"
 
 
 def test_config_yaml_strict_rich_default():
     """P2 修复：config.yaml 应默认 require_rich_features=true，
-    避免静默退化为 v1 行为。"""
+    且正式回测不应启用 deterministic fallback。"""
     import yaml
     from pathlib import Path
     cfg_path = Path("strategy/ml_rich_picker/config.yaml")
@@ -313,6 +548,8 @@ def test_config_yaml_strict_rich_default():
     params = raw.get("params", {})
     assert params.get("require_rich_features") is True, \
         "config 必须默认 require_rich_features: true"
+    assert params.get("use_deterministic_fallback") is False, \
+        "正式 rich preset 必须默认 use_deterministic_fallback: false"
 
 
 def test_walk_forward_sql_contains_3_tables():
@@ -325,6 +562,87 @@ def test_walk_forward_sql_contains_3_tables():
     src = inspect.getsource(_load_rich_features_from_bq)
     assert "dws_equity_daily_features" in src or "bq_table_daily" in src
     assert "dws_equity_fundamental_features" in src
-    assert "dws_equity_event_money_flow_features_1d" in src
+    assert "dwd_fact_money_flow_1d" in src
+    assert "dwd_fact_dragon_tiger_seat_1d" in src
+    assert "dwd_fact_kpl_board_1d" in src
     assert "LEFT JOIN" in src
     assert "SAFE_DIVIDE" in src
+    assert src.count("partition_month IN UNNEST(@partition_months)") >= 4
+    assert 'ArrayQueryParameter("partition_months", "INT64"' in src
+    assert "financial_announcement_date < date" in src
+    assert "available_signal_date" in src
+
+
+def test_walk_forward_partition_months_cover_full_range():
+    from strategy.ml_rich_picker.walk_forward import _partition_months_in_range
+
+    assert _partition_months_in_range("20231229", "20240201") == [
+        202312,
+        202401,
+        202402,
+    ]
+
+
+def test_walk_forward_requires_complete_rich_model_bundle():
+    from strategy.ml_rich_picker.walk_forward import _missing_rich_model_components
+
+    complete = {h: object() for h in BUY_HORIZONS}
+    assert _missing_rich_model_components(complete, object()) == []
+
+    partial = {1: object(), 5: object()}
+    missing = _missing_rich_model_components(partial, object())
+    assert missing == ["buy_h10", "buy_h20"]
+    assert _missing_rich_model_components(complete, None) == [SELL_MODEL_NAME]
+
+
+def test_buy_label_uses_next_open_execution_return():
+    from strategy.ml_rich_picker.walk_forward import _compute_execution_horizon_return
+
+    group = pd.DataFrame(
+        {
+            "date": ["20240101", "20240102", "20240103"],
+            "open": [10.0, 20.0, 30.0],
+            "close": [100.0, 100.0, 100.0],
+        }
+    )
+
+    ret = _compute_execution_horizon_return(group, 1)
+
+    assert ret.iloc[0] == pytest.approx(np.log(30.0) - np.log(20.0))
+
+
+def test_sell_training_frame_contains_position_state_features():
+    from strategy.ml_rich_picker.walk_forward import _build_held_position_sell_training_frame
+
+    rows = []
+    for i in range(30):
+        row = {
+            "date": f"202401{i + 1:02d}",
+            "equity_code": "000001.SZ",
+            "open": 10.0 + i * 0.1,
+            "high": 10.2 + i * 0.1,
+            "low": 9.8 + i * 0.1,
+            "close": 10.1 + i * 0.1,
+        }
+        for col in RICH_BUY_FEATURE_COLUMNS:
+            row[col] = 0.1
+        rows.append(row)
+    frame = pd.DataFrame(rows)
+
+    out = _build_held_position_sell_training_frame(
+        frame,
+        lookforward=5,
+        drawdown_threshold=-0.05,
+        holding_day_samples=[1, 5],
+    )
+
+    assert set(POSITION_STATE_FEATURE_COLUMNS).issubset(out.columns)
+    assert "label_sell" in out.columns
+    assert set(out["holding_days"].dropna().unique()) == {1.0, 5.0}
+
+
+def test_binary_auc_helper():
+    from strategy.ml_rich_picker.walk_forward import _binary_auc
+
+    assert _binary_auc(np.array([0, 0, 1, 1]), np.array([0.1, 0.2, 0.8, 0.9])) == pytest.approx(1.0)
+    assert _binary_auc(np.array([1, 1]), np.array([0.1, 0.2])) is None

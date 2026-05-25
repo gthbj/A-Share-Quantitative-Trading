@@ -10,8 +10,8 @@ backtest:
 
 # 交易费率
 trading:
-  commission_rate: 0.00025   # 券商佣金：万分之2.5
-  min_commission: 5.0       # 最低佣金5元
+  commission_rate: 0.0001    # 券商佣金：万分之1
+  min_commission: 0.0        # 免五：取消最低佣金5元
   stamp_duty_rate: 0.0005   # 印花税：千分之0.5（卖出时收取）
   transfer_fee_rate: 0.00001 # 过户费：万分之0.1（沪市双向）
 

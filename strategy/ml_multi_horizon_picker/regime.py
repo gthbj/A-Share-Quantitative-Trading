@@ -1,4 +1,4 @@
-"""市场状态（Regime）检测：bull / neutral / bear。
+"""市场状态（Regime）检测：bull / neutral / bear / crisis。
 
 Regime 在本策略中不是行情标签，而是风险预算开关。判定只使用当前日
 及历史数据，避免未来函数：
@@ -25,6 +25,7 @@ class Regime(str, Enum):
     BULL = "bull"
     NEUTRAL = "neutral"
     BEAR = "bear"
+    CRISIS = "crisis"
 
 
 def detect_regime(
@@ -234,17 +235,64 @@ def combine_regime_with_market_breadth(
     return base_regime
 
 
+def is_crisis_regime(
+    index_close: pd.Series,
+    feature_frame: pd.DataFrame | None = None,
+    drawdown_window: int = 20,
+    fast_drop_window: int = 5,
+    drawdown_threshold: float = -0.10,
+    fast_drop_threshold: float = -0.06,
+    breadth_threshold: float = 0.20,
+    selloff_share_threshold: float = 0.75,
+) -> bool:
+    """判断是否进入 crisis 风险状态。
+
+    crisis 是比 bear 更严格的零预算层，只使用当前日及历史数据：
+    指数快速下跌、短期回撤，或股票池广度极端恶化均可触发。
+    """
+    if index_close.empty:
+        return False
+
+    close = pd.to_numeric(index_close, errors="coerce").dropna().astype(float)
+    if len(close) < max(drawdown_window, fast_drop_window) + 1:
+        return False
+
+    current = float(close.iloc[-1])
+    ret_fast = current / float(close.iloc[-1 - fast_drop_window]) - 1
+    recent_peak = float(close.tail(drawdown_window).max())
+    drawdown = current / recent_peak - 1 if recent_peak > 0 else 0.0
+    if ret_fast <= fast_drop_threshold or drawdown <= drawdown_threshold:
+        return True
+
+    if feature_frame is None or feature_frame.empty:
+        return False
+    metrics = market_breadth_metrics(feature_frame)
+    above_ma20_share = metrics.get("above_ma20_share")
+    positive_return_20d_share = metrics.get("positive_return_20d_share")
+    selloff_5d_share = metrics.get("selloff_5d_share")
+    return any(
+        [
+            above_ma20_share is not None and above_ma20_share <= breadth_threshold,
+            positive_return_20d_share is not None
+            and positive_return_20d_share <= breadth_threshold,
+            selloff_5d_share is not None
+            and selloff_5d_share >= selloff_share_threshold,
+        ]
+    )
+
+
 def regime_position_multiplier(regime: str) -> float:
     """Regime → 目标仓位比例乘数。"""
     return {
         Regime.BULL.value: 1.0,
         Regime.NEUTRAL.value: 0.5,
         Regime.BEAR.value: 0.0,
+        Regime.CRISIS.value: 0.0,
     }.get(regime, 0.7)
 
 
 def regime_stop_loss(regime: str, bull_pct: float = 0.05, bear_pct: float = 0.03) -> float:
     """Regime → 止损百分比。bear 收紧。"""
-    if regime == Regime.BEAR.value:
+    if regime in {Regime.BEAR.value, Regime.CRISIS.value}:
         return bear_pct
     return bull_pct

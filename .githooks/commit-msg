@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+message_file="${1:-}"
+if [ -z "$message_file" ] || [ ! -f "$message_file" ]; then
+  exit 0
+fi
+
+# Do not turn an untouched template into a non-empty commit. Git will abort it.
+if ! grep -Ev '^[[:space:]]*(#|$)' "$message_file" \
+  | grep -Ev '^(Agent|Agent-Model|Agent-Task):' \
+  | grep -q .; then
+  exit 0
+fi
+
+git_config_get() {
+  git config --get "$1" 2>/dev/null || true
+}
+
+agent_name="${AGENT_NAME:-${CODEX_AGENT_NAME:-}}"
+agent_model="${AGENT_MODEL:-${CODEX_AGENT_MODEL:-}}"
+agent_task="${AGENT_TASK:-${CODEX_AGENT_TASK:-}}"
+
+if [ -z "$agent_name" ]; then
+  agent_name="$(git_config_get agent.name)"
+fi
+if [ -z "$agent_model" ]; then
+  agent_model="$(git_config_get agent.model)"
+fi
+if [ -z "$agent_task" ]; then
+  agent_task="$(git_config_get agent.task)"
+fi
+
+agent_name="${agent_name:-unspecified}"
+agent_model="${agent_model:-unspecified}"
+agent_task="${agent_task:-unspecified}"
+
+add_trailer_if_missing() {
+  token="$1"
+  value="$2"
+  if grep -Eq "^${token}:" "$message_file"; then
+    return
+  fi
+  git interpret-trailers --in-place --if-exists=add --if-missing=add \
+    --trailer "$token: $value" \
+    "$message_file"
+}
+
+add_trailer_if_missing "Agent" "$agent_name"
+add_trailer_if_missing "Agent-Model" "$agent_model"
+add_trailer_if_missing "Agent-Task" "$agent_task"
