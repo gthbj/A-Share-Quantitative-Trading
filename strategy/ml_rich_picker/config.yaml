@@ -67,11 +67,12 @@ params:
   position_pct: 0.95
   # Position-aware sell trigger（rich 专属，弥补 sell 回归模型不看持仓状态的缺口）
   # - 止盈：已经赚 >= 20% 且 prob_up_h5 跌回 0.45 以下 → 兑现
-  # - 割肉：持仓 >= 8 个交易日且仍浮亏 -5% 以上 → 认输
+  # - 温水割肉：持仓 >= 8 个交易日且浮亏在 (-2%, -5%) 区间（**比 stop_loss 浅**
+  #   一档，专门覆盖 stop_loss 抓不到但又拖太久的"温水"亏损）→ 认输
   profit_take_return_threshold: 0.20
   profit_take_prob_ceiling: 0.45
   stale_loss_min_days: 8
-  stale_loss_return_threshold: -0.05
+  stale_loss_return_threshold: -0.02
   # 正式 rich 回测必须使用训练好的 rich 模型；模型缺失/维度不匹配时直接失败。
   # 调试管道时才显式改成 true。
   use_deterministic_fallback: false

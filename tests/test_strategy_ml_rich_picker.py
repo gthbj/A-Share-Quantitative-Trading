@@ -1317,40 +1317,71 @@ def test_spearman_corr_helper():
     assert _spearman_corr(np.array([1.0, 2.0]), np.array([1.0, 2.0])) is None
 
 
-def test_profit_take_trigger_fires_when_big_gain_and_low_prob():
-    """止盈：浮盈 ≥ 20% 且 prob_up_h5 < 0.45 → 触发 profit_take 卖出。"""
+def _make_strat_with_position(
+    *,
+    cost: float,
+    qty: int = 1000,
+    entry_date: str,
+    current_date: str,
+    peak_price: float,
+    trading_days: "list[str]",
+    profit_take_return_threshold: float = 0.20,
+    profit_take_prob_ceiling: float = 0.45,
+    stale_loss_min_days: int = 8,
+    stale_loss_return_threshold: float = -0.02,
+    **strat_kwargs,
+):
+    """组装一个带 1 只持仓的 rich 策略 + ctx，方便共享给多个 sell trigger 测试。"""
     strat = MLRichPickerStrategy(
         require_rich_features=False,
-        profit_take_return_threshold=0.20,
-        profit_take_prob_ceiling=0.45,
-        stale_loss_min_days=8,
-        stale_loss_return_threshold=-0.05,
-        decision_horizon=5,
-        min_hold_days=3,
+        profit_take_return_threshold=profit_take_return_threshold,
+        profit_take_prob_ceiling=profit_take_prob_ceiling,
+        stale_loss_min_days=stale_loss_min_days,
+        stale_loss_return_threshold=stale_loss_return_threshold,
+        **strat_kwargs,
     )
-    # 持仓状态：成本 10，当前价 13 → 浮盈 30%；持仓 5 天
     portfolio = Portfolio(1_000_000)
     pos = Position(
-        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+        code="600000.SH",
+        total_qty=qty,
+        sellable_qty=qty,
+        cost_price=cost,
     )
-    pos._buy_records["20240108"] = 1000
+    pos._buy_records[entry_date] = qty
     portfolio.positions["600000.SH"] = pos
-    strat._trading_date_index = strat._build_trading_date_index(
-        ["20240108", "20240109", "20240110", "20240111", "20240112", "20240115"]
-    )
+    strat._trading_date_index = strat._build_trading_date_index(trading_days)
     strat._position_state["600000.SH"] = PositionState(
-        entered_date="20240108", expected_horizon=5, peak_price=14.0,
+        entered_date=entry_date,
+        expected_horizon=5,
+        peak_price=peak_price,
     )
     ctx = SimpleNamespace(
-        current_date="20240115",
+        current_date=current_date,
         portfolio=portfolio,
         all_bars={},
     )
+    return strat, ctx
 
-    # prob_up_h5 = 0.30（< 0.45 ceiling）→ 应触发止盈
+
+def test_profit_take_helper_fires_when_no_trailing_risk():
+    """helper-level：当 peak_price 不超过当前价（无 trailing 回撤）时触发 profit_take。
+
+    与 reviewer 反馈对应：之前测试用 peak=14, price=13，在完整调用链里 trailing_stop
+    会先抢走。这里改成 peak == 当前价（新高保持中），保证父类 trailing 不命中、
+    profit_take 是真正可达的。
+    """
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240108",
+        current_date="20240115",
+        peak_price=13.0,                # 与当前价持平：无 trailing 回撤
+        trading_days=["20240108", "20240109", "20240110", "20240111",
+                       "20240112", "20240115"],
+    )
+
     score_df = pd.DataFrame([
-        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10, "score": 0.30,
-         "predicted_remaining_days": 4.0},
+        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10,
+         "score": 0.30, "predicted_remaining_days": 4.0},
     ])
     data = {"600000.SH": pd.Series({"close": 13.0})}
 
@@ -1361,25 +1392,20 @@ def test_profit_take_trigger_fires_when_big_gain_and_low_prob():
     assert "profit_take" in out["600000.SH"]
 
 
-def test_profit_take_not_triggered_when_market_still_bullish():
+def test_profit_take_helper_not_triggered_when_market_still_bullish():
     """浮盈大但 prob_up_h5 仍然看多（>= ceiling）→ 不止盈，让模型继续看着。"""
-    strat = MLRichPickerStrategy(
-        require_rich_features=False,
-        profit_take_return_threshold=0.20,
-        profit_take_prob_ceiling=0.45,
-        stale_loss_min_days=8,
-        stale_loss_return_threshold=-0.05,
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240108",
+        current_date="20240115",
+        peak_price=14.0,
+        trading_days=["20240108", "20240109", "20240110", "20240111",
+                       "20240112", "20240115"],
     )
-    portfolio = Portfolio(1_000_000)
-    pos = Position(
-        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
-    )
-    portfolio.positions["600000.SH"] = pos
-    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
 
     score_df = pd.DataFrame([
-        {"code": "600000.SH", "prob_up_h5": 0.70, "prob_sell": 0.10, "score": 0.70,
-         "predicted_remaining_days": 4.0},
+        {"code": "600000.SH", "prob_up_h5": 0.70, "prob_sell": 0.10,
+         "score": 0.70, "predicted_remaining_days": 4.0},
     ])
     data = {"600000.SH": pd.Series({"close": 14.0})}
 
@@ -1389,37 +1415,30 @@ def test_profit_take_not_triggered_when_market_still_bullish():
     assert "600000.SH" not in out
 
 
-def test_stale_loss_trigger_fires_when_held_long_and_still_underwater():
-    """持仓 ≥ 8 个交易日且仍浮亏 ≥ -5% → 触发 stale_loss。"""
-    strat = MLRichPickerStrategy(
-        require_rich_features=False,
-        profit_take_return_threshold=0.20,
-        profit_take_prob_ceiling=0.45,
-        stale_loss_min_days=8,
-        stale_loss_return_threshold=-0.05,
-    )
-    portfolio = Portfolio(1_000_000)
-    pos = Position(
-        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
-    )
-    pos._buy_records["20240101"] = 1000
-    portfolio.positions["600000.SH"] = pos
-    # 构造 10 个交易日
+def test_stale_loss_helper_fires_in_stop_loss_safe_zone():
+    """helper-level：浮亏在 (-2%, stop_loss_pct) 区间（即父类 stop_loss 抓不到
+    但比 stale_loss 阈值更负）+ 持仓 ≥ 8 天 → 触发 stale_loss。
+
+    与 reviewer 反馈对应：之前测试用浮亏 -10%（父类 stop_loss 已经 -5% 触发），
+    现在改成 -3%，刚好在父类 5% 安全区内，stale_loss 才有意义。
+    """
     dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
              "20240108", "20240109", "20240110", "20240111", "20240112",
              "20240115"]
-    strat._trading_date_index = strat._build_trading_date_index(dates)
-    strat._position_state["600000.SH"] = PositionState(
-        entered_date="20240101", expected_horizon=5, peak_price=10.5,
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240101",
+        current_date="20240115",
+        peak_price=10.5,
+        trading_days=dates,
     )
-    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
 
-    # 当前 9.0，浮亏 -10%（< -5% 阈值）
+    # 当前 9.7 → 浮亏 -3%，落在 (-2%, -5%) 区间——stop_loss 抓不到、stale_loss 应该捕
     score_df = pd.DataFrame([
-        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20, "score": 0.50,
-         "predicted_remaining_days": 3.0},
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
     ])
-    data = {"600000.SH": pd.Series({"close": 9.0})}
+    data = {"600000.SH": pd.Series({"close": 9.7})}
 
     out = strat._check_position_aware_sell_triggers(
         ctx, score_df, data, existing={},
@@ -1428,32 +1447,21 @@ def test_stale_loss_trigger_fires_when_held_long_and_still_underwater():
     assert "stale_loss" in out["600000.SH"]
 
 
-def test_stale_loss_not_triggered_when_held_short():
-    """持仓不足 stale_loss_min_days → 即使浮亏也不触发（让 v1 stop_loss 处理）。"""
-    strat = MLRichPickerStrategy(
-        require_rich_features=False,
-        stale_loss_min_days=8,
-        stale_loss_return_threshold=-0.05,
+def test_stale_loss_helper_not_triggered_when_held_short():
+    """持仓不足 stale_loss_min_days → 不触发（让父类 stop_loss 处理更深的亏）。"""
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240110",
+        current_date="20240115",
+        peak_price=10.0,
+        trading_days=["20240110", "20240111", "20240112", "20240115"],
     )
-    portfolio = Portfolio(1_000_000)
-    pos = Position(
-        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
-    )
-    pos._buy_records["20240110"] = 1000
-    portfolio.positions["600000.SH"] = pos
-    strat._trading_date_index = strat._build_trading_date_index(
-        ["20240110", "20240111", "20240112", "20240115"]
-    )
-    strat._position_state["600000.SH"] = PositionState(
-        entered_date="20240110", expected_horizon=5, peak_price=10.0,
-    )
-    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
 
     score_df = pd.DataFrame([
-        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20, "score": 0.50,
-         "predicted_remaining_days": 3.0},
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
     ])
-    data = {"600000.SH": pd.Series({"close": 9.0})}
+    data = {"600000.SH": pd.Series({"close": 9.7})}
 
     out = strat._check_position_aware_sell_triggers(
         ctx, score_df, data, existing={},
@@ -1464,17 +1472,18 @@ def test_stale_loss_not_triggered_when_held_short():
 
 def test_position_aware_triggers_skip_existing_sells():
     """已经被父类触发器决定卖出的 code，position-aware trigger 不重复处理。"""
-    strat = MLRichPickerStrategy(require_rich_features=False)
-    portfolio = Portfolio(1_000_000)
-    pos = Position(
-        code="600000.SH", total_qty=1000, sellable_qty=1000, cost_price=10.0,
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240108",
+        current_date="20240115",
+        peak_price=13.0,
+        trading_days=["20240108", "20240109", "20240110", "20240111",
+                       "20240112", "20240115"],
     )
-    portfolio.positions["600000.SH"] = pos
-    ctx = SimpleNamespace(current_date="20240115", portfolio=portfolio, all_bars={})
 
     score_df = pd.DataFrame([
-        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10, "score": 0.30,
-         "predicted_remaining_days": 4.0},
+        {"code": "600000.SH", "prob_up_h5": 0.30, "prob_sell": 0.10,
+         "score": 0.30, "predicted_remaining_days": 4.0},
     ])
     data = {"600000.SH": pd.Series({"close": 13.0})}
 
@@ -1483,6 +1492,162 @@ def test_position_aware_triggers_skip_existing_sells():
         ctx, score_df, data, existing={"600000.SH": "stop_loss"},
     )
     assert "600000.SH" not in out
+
+
+# ──────────────────────────────────────────────────────────────
+# Full _check_sell_triggers 链路测试：rich trigger 在真实调用链里必须可达
+# ──────────────────────────────────────────────────────────────
+#
+# Reviewer 反馈：helper-level 测试绕过了父类 6 个 trigger 的顺序判定，无法证明
+# rich 触发器在真实调用链里是可达的。下面这些测试调 ``_check_sell_triggers``
+# 主入口，覆盖 stop_loss / trailing_stop / max_hold / rank_dropout / prob_floor
+# / sell_model 都不命中的真实场景，确认 rich 的 g/h 触发器才是命中者。
+
+
+def _full_chain_call(strat, ctx, *, score_df, data, top_2n_codes=None,
+                     stop_loss_pct=None):
+    """统一封装一下 full chain 调用：默认让 top_2n 包含本持仓避开 rank_dropout，
+    stop_loss_pct 默认走 bull 0.05 (rich config 默认值)。"""
+    top = top_2n_codes if top_2n_codes is not None else set(
+        score_df["code"].tolist()
+    )
+    pct = stop_loss_pct if stop_loss_pct is not None else strat.stop_loss_pct_bull
+    return strat._check_sell_triggers(ctx, score_df, top, pct, data)
+
+
+def test_full_chain_profit_take_reaches_rich_trigger():
+    """完整调用链：浮盈 30%、peak == current price（无 trailing 回撤）、
+    prob_up_h5 < ceiling、prob_sell 低 → 父类 6 个 trigger 全部不命中，
+    rich profit_take 才是真正命中者。
+    """
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240108",
+        current_date="20240115",
+        peak_price=13.0,                # 与当前价持平：无 trailing 回撤
+        trading_days=["20240108", "20240109", "20240110", "20240111",
+                       "20240112", "20240115"],
+        min_hold_days=3,
+        max_hold_days=20,
+        min_prob_floor=0.30,
+        sell_threshold=0.50,
+    )
+
+    score_df = pd.DataFrame([
+        # prob_h5=0.35 ≥ min_prob_floor(0.30) → 不触发 prob_floor
+        # prob_h5=0.35 < profit_take_prob_ceiling(0.45) → 触发 profit_take
+        # prob_sell=0.10 ≤ sell_threshold(0.50) → 不触发 sell_model
+        {"code": "600000.SH", "prob_up_h5": 0.35, "prob_sell": 0.10,
+         "score": 0.35, "predicted_remaining_days": 5.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 13.0})}
+
+    sells = _full_chain_call(strat, ctx, score_df=score_df, data=data)
+
+    assert "600000.SH" in sells, "rich profit_take 在父类不命中时应可达"
+    assert sells["600000.SH"].startswith("profit_take"), (
+        f"应是 rich profit_take 而非父类 trigger，实际：{sells['600000.SH']}"
+    )
+
+
+def test_full_chain_stale_loss_reaches_rich_trigger():
+    """完整调用链：浮亏 -3%（父类 5% stop_loss 抓不到）、持仓 10 个交易日、
+    peak=cost（无 trailing 回撤候选）、prob_h5 在 floor 之上、prob_sell 低
+    → 父类 6 个 trigger 全部不命中，rich stale_loss 才是真正命中者。
+    """
+    dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
+             "20240108", "20240109", "20240110", "20240111", "20240112",
+             "20240115"]
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240101",
+        current_date="20240115",
+        peak_price=10.0,                # = cost → trailing_stop 不触发（要求 price > cost）
+        trading_days=dates,
+        min_hold_days=3,
+        max_hold_days=20,
+        min_prob_floor=0.30,
+        sell_threshold=0.50,
+    )
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
+    ])
+    # 当前 9.7 → 浮亏 -3%，父类 stop_loss 5% 抓不到
+    data = {"600000.SH": pd.Series({"close": 9.7})}
+
+    sells = _full_chain_call(strat, ctx, score_df=score_df, data=data)
+
+    assert "600000.SH" in sells, "rich stale_loss 在父类不命中时应可达"
+    assert sells["600000.SH"].startswith("stale_loss"), (
+        f"应是 rich stale_loss 而非父类 trigger，实际：{sells['600000.SH']}"
+    )
+
+
+def test_full_chain_stop_loss_takes_precedence_over_stale_loss():
+    """完整调用链：浮亏 -8%（父类 5% stop_loss 命中）+ 持仓 10 天
+    → 必须是父类 stop_loss 卖出，不是 rich stale_loss。
+
+    这是 reviewer 反馈的关键场景：旧 stale_loss=-5% 时几乎所有"应该 stop_loss"
+    的场景在 helper-level 里也会判定为 stale_loss；full chain 下父类先到。
+    现在 stale_loss 阈值改成 -2%（比 stop_loss 浅）后，stop_loss 自然优先，
+    stale_loss 只覆盖"温水"区间。
+    """
+    dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
+             "20240108", "20240109", "20240110", "20240111", "20240112",
+             "20240115"]
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240101",
+        current_date="20240115",
+        peak_price=10.0,
+        trading_days=dates,
+    )
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
+    ])
+    # 浮亏 -8%（明显超过父类 bull stop_loss 5%）
+    data = {"600000.SH": pd.Series({"close": 9.2})}
+
+    sells = _full_chain_call(strat, ctx, score_df=score_df, data=data)
+
+    assert "600000.SH" in sells
+    assert sells["600000.SH"].startswith("stop_loss"), (
+        f"父类 stop_loss 应优先于 rich stale_loss，实际：{sells['600000.SH']}"
+    )
+
+
+def test_full_chain_trailing_stop_takes_precedence_over_profit_take():
+    """完整调用链：浮盈 30% 但 peak=15、当前 13（自高点回撤 -13% > 3%）
+    → 父类 trailing_stop 命中，不是 rich profit_take。
+
+    虽然 rich profit_take 条件也满足（浮盈≥20% 且 prob 不再看好），但父类
+    trailing_stop 先到。helper-level 测试容易遗漏这种"父类先抢走"的真实顺序。
+    """
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240108",
+        current_date="20240115",
+        peak_price=15.0,                # 高点 15、当前 13 → 回撤 -13% > 3%
+        trading_days=["20240108", "20240109", "20240110", "20240111",
+                       "20240112", "20240115"],
+    )
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.35, "prob_sell": 0.10,
+         "score": 0.35, "predicted_remaining_days": 4.0},
+    ])
+    data = {"600000.SH": pd.Series({"close": 13.0})}
+
+    sells = _full_chain_call(strat, ctx, score_df=score_df, data=data)
+
+    assert "600000.SH" in sells
+    assert sells["600000.SH"].startswith("trailing_stop"), (
+        f"父类 trailing_stop 应优先于 rich profit_take，实际：{sells['600000.SH']}"
+    )
 
 
 def test_rich_bundle_save_load_round_trip(tmp_path):

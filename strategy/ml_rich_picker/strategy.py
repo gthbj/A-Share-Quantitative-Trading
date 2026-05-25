@@ -98,10 +98,13 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         # Position-aware sell trigger 参数（A 路线后半段）：
         # sell 回归模型只看市场未来，浮盈兑现 / 浮亏割肉这两个核心持仓决策
         # 由策略层 trigger 用 position_return + holding_days 真实合成。
+        # 注意：父类 stop_loss 已经在浮亏 5%(bull)/3%(bear) 时硬止损；
+        # stale_loss 必须用**比 stop_loss 浅**的阈值，专门捕"温水煮青蛙"的
+        # 小幅浮亏长拖场景——否则会被父类 stop_loss 完全盖死、成为死代码。
         profit_take_return_threshold: float = 0.20,   # 浮盈 ≥ 20%
         profit_take_prob_ceiling: float = 0.45,        # 且 prob_up_h5 < 0.45 → 止盈
         stale_loss_min_days: int = 8,                  # 持仓 ≥ 8 个交易日
-        stale_loss_return_threshold: float = -0.05,    # 且仍浮亏 ≥ -5% → 割肉
+        stale_loss_return_threshold: float = -0.02,    # 且浮亏在 (-2%, stop_loss) → 拖久无起色，认输
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -722,9 +725,24 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         - **profit_take（止盈）**：浮盈 ≥ ``profit_take_return_threshold``
           *且* ``prob_up_h{decision_horizon}`` < ``profit_take_prob_ceiling``
           → 兑现。语义："已经赚很多 + 模型不再看好" → 别等回吐。
-        - **stale_loss（割肉）**：``holding_days >= stale_loss_min_days``
-          *且* 浮亏 ≤ ``stale_loss_return_threshold`` → 认输。
-          语义："拖太久且仍套" → 不再期待反弹。
+          覆盖父类没有的场景："价仍在创新高所以 trailing_stop 没触发，但
+          模型已经看不到上行了，应该兑现"。
+        - **stale_loss（温水割肉）**：``holding_days >= stale_loss_min_days``
+          *且* 浮亏 ≤ ``stale_loss_return_threshold``（**比父类 stop_loss
+          浅一档**，默认 -2% vs 父类 -5%/-3%）→ 认输。
+          覆盖父类没有的场景："亏得不够深所以 stop_loss 没触发，但已经
+          拖了 8+ 个交易日还在水下"——典型温水煮青蛙。
+
+        与父类触发器的关系（rich 在父类之后追加，已被父类卖出的 code 跳过）：
+
+        ::
+
+            父类:  a. stop_loss     | 浮亏 > stop_loss_pct（5%/3%）→ 卖
+                   b. trailing_stop | 从持仓高点回撤 > trailing_stop_pct → 卖
+                   ...
+                   f. sell_model    | prob_sell > sell_threshold → 卖
+            rich:  g. profit_take   | 浮盈 ≥ 20% 且模型转弱 → 卖
+                   h. stale_loss    | 持仓久 + 浅幅亏（避开 a） → 卖
 
         触发依据用真实持仓的 ``pos.cost_price``（execution-priced，none 复权）
         计算 ``position_return``，跟回测撮合口径一致；不依赖 _position_state
