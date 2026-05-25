@@ -25,11 +25,15 @@ checkpoint:
   # 默认只跳过已成功上传的数据；empty 不跳过，避免当天数据未入库时被永久记空。
   skip_statuses: ["uploaded"]
 
+run_behavior:
+  # 单个任务失败后继续跑后续任务；整批结束后如果存在 failed 记录，CLI 仍返回失败状态。
+  fail_run_on_job_error: true
+
 tushare:
   token_env: "TUSHARE_TOKEN"
   # 代理或私有 Tushare HTTP 入口。不要把 token 写进配置；token 只走环境变量或 Secret Manager。
   http_url_env: "TUSHARE_HTTP_URL"
-  http_url: "http://118.89.66.41:8010/"
+  http_url: "http://121.40.135.59:8010/"
   request_timeout_seconds: 30
   calendar_exchange: "SSE"
   # 当前账号接口上限为 120 次/分钟；代码兜底值也按 120 执行。
@@ -87,9 +91,9 @@ endpoints:
     phase: 1
     api_name: "dividend"
     target_table: "fact_dividend"
-    mode: "by_calendar_date"
+    mode: "by_trade_date"
     date_param: "ex_date"
-    row_limit: 6000
+    row_limit: 5000
     params: {}
 
   stock_basic_listed:
@@ -100,9 +104,6 @@ endpoints:
     mode: "snapshot"
     partition: "all"
     row_limit: 6000
-    paginate: true
-    page_size: 5000
-    max_pages: 3
     params:
       exchange: ""
       list_status: "L"
@@ -115,9 +116,6 @@ endpoints:
     mode: "snapshot"
     partition: "all"
     row_limit: 6000
-    paginate: true
-    page_size: 5000
-    max_pages: 3
     params:
       exchange: ""
       list_status: "D"
@@ -130,9 +128,6 @@ endpoints:
     mode: "snapshot"
     partition: "all"
     row_limit: 6000
-    paginate: true
-    page_size: 5000
-    max_pages: 3
     params:
       exchange: ""
       list_status: "P"
@@ -154,7 +149,10 @@ endpoints:
     target_table: "fact_limit_price_1d"
     mode: "by_trade_date"
     date_param: "trade_date"
-    row_limit: 6000
+    row_limit: 5800
+    paginate: true
+    page_size: 5000
+    max_pages: 3
     params: {}
 
   suspend_d:
@@ -164,7 +162,7 @@ endpoints:
     target_table: "fact_suspend_1d"
     mode: "by_trade_date"
     date_param: "trade_date"
-    row_limit: 6000
+    row_limit: 5000
     params: {}
 
   namechange:
@@ -172,12 +170,8 @@ endpoints:
     phase: 1
     api_name: "namechange"
     target_table: "dim_security_name_history"
-    mode: "snapshot"
-    partition: "all"
-    row_limit: 6000
-    paginate: true
-    page_size: 5000
-    max_pages: 10
+    mode: "by_year_range"
+    row_limit: 5000
     params: {}
 
   moneyflow:
@@ -188,6 +182,9 @@ endpoints:
     mode: "by_trade_date"
     date_param: "trade_date"
     row_limit: 6000
+    paginate: true
+    page_size: 5000
+    max_pages: 3
     params: {}
 
   margin:
@@ -208,6 +205,9 @@ endpoints:
     mode: "by_trade_date"
     date_param: "trade_date"
     row_limit: 6000
+    paginate: true
+    page_size: 5000
+    max_pages: 3
     params: {}
 
   income:

@@ -169,8 +169,9 @@ raw 路径里的 `partition_date` 来自 `logical_date`。
 
 | mode | 任务拆分方式 | `logical_date` / `partition_date` |
 |---|---|---|
-| `snapshot` | 每个 endpoint 只拉一次当前快照 | 拉取当天日期。 |
+| `snapshot` | 每个 endpoint 只拉一次当前快照 | 本次 `run_id` 对应日期；同一 run 内冻结不变。 |
 | `date_range` | 一个请求覆盖 `start_date` 到 `end_date` | 请求区间的 `end_date`。 |
+| `by_year_range` | 按自然年切分 `start_date` / `end_date` 区间 | 每个年度区间的 `end_date`。 |
 | `by_trade_date` | 按交易日逐日拉全市场 | `trade_date`。 |
 | `by_calendar_date` | 按自然日逐日拉 | 对应自然日。 |
 | `by_period` | 按季度报告期拉 | 季度末 `period` 或 `enddate`。 |
@@ -182,17 +183,17 @@ raw 路径里的 `partition_date` 来自 `logical_date`。
 | `trade_cal` | `trade_cal` | `date_range` | `start_date/end_date` | 请求区间 `end_date` |
 | `daily` | `daily` | `by_trade_date` | `trade_date` | 交易日 |
 | `adj_factor` | `adj_factor` | `by_trade_date` | `trade_date` | 交易日 |
-| `dividend` | `dividend` | `by_calendar_date` | `ex_date` | 除权除息日 |
+| `dividend` | `dividend` | `by_trade_date` | `ex_date` | 除权除息日 |
 | `stock_basic_listed` | `stock_basic` | `snapshot` | 无 | 快照拉取日 |
 | `stock_basic_delisted` | `stock_basic` | `snapshot` | 无 | 快照拉取日 |
 | `stock_basic_pending` | `stock_basic` | `snapshot` | 无 | 快照拉取日 |
 | `daily_basic` | `daily_basic` | `by_trade_date` | `trade_date` | 交易日 |
-| `stk_limit` | `stk_limit` | `by_trade_date` | `trade_date` | 交易日 |
+| `stk_limit` | `stk_limit` | `by_trade_date` + 分页 | `trade_date` | 交易日 |
 | `suspend_d` | `suspend_d` | `by_trade_date` | `trade_date` | 停复牌日期 |
-| `namechange` | `namechange` | `snapshot` | 无 | 快照拉取日 |
-| `moneyflow` | `moneyflow` | `by_trade_date` | `trade_date` | 交易日 |
+| `namechange` | `namechange` | `by_year_range` | `start_date/end_date` | 年度请求区间 `end_date` |
+| `moneyflow` | `moneyflow` | `by_trade_date` + 分页 | `trade_date` | 交易日 |
 | `margin` | `margin` | `by_trade_date` | `trade_date` | 交易日 |
-| `margin_detail` | `margin_detail` | `by_trade_date` | `trade_date` | 交易日 |
+| `margin_detail` | `margin_detail` | `by_trade_date` + 分页 | `trade_date` | 交易日 |
 | `income` | `income_vip` | `by_period` | `period` | 报告期 |
 | `balancesheet` | `balancesheet_vip` | `by_period` | `period` | 报告期 |
 | `cashflow` | `cashflow_vip` | `by_period` | `period` | 报告期 |
@@ -283,7 +284,9 @@ Tushare 部分接口有单次返回行数限制。第一版必须避免静默截
 2. 非分页 endpoint 如果返回行数达到 `row_limit`，默认报错。
 3. 可分页 endpoint 使用 `limit` / `offset` 拉取。
 4. 可分页 endpoint 可配置 `page_size` 和 `max_pages`。
-5. 如果达到 `max_pages` 仍未结束，报错并要求拆分得更细。
+5. 如果刚好达到 `max_pages * page_size`，额外 probe 下一页；下一页为空则允许成功。
+6. 如果达到 `max_pages` 后下一页仍有数据，报错并要求拆分得更细。
+7. 如果分页返回重复页，认为该 endpoint 可能不支持 `limit` / `offset`，报错并要求改为更细粒度拆分。
 
 示例：
 
@@ -298,6 +301,8 @@ income:
 ```
 
 说明：`limit` / `offset` 是通用分页策略；如果实际 smoke test 发现某个 Tushare endpoint 不支持该参数，则改为更细粒度拆分，例如按公告日、股票代码或其他参数拆分。
+
+当前配置中 `stk_limit`、`moneyflow` 和 `margin_detail` 使用 `page_size=5000`、`max_pages=3` 分页拉取，避免全市场日频接口接近或超过单页上限时出现截断风险。`namechange` 官方要求至少传入 `ts_code`、`start_date/end_date` 或 `ann_date` 之一，因此不能用空参数 snapshot，当前用 `by_year_range` 按年切分历史区间。
 
 ## 12. 断点续传
 
@@ -324,6 +329,8 @@ checkpoint:
 - 下次运行如果发现同一 endpoint + logical_date 已是 `uploaded`，则跳过。
 - `empty` 默认不跳过，避免“当天数据暂未更新”被永久记为空。
 - 失败任务写 manifest，不写成功 checkpoint，下次会继续尝试。
+- 单个任务失败不终止后续任务；整批结束后写 summary。
+- 默认 `run_behavior.fail_run_on_job_error=true`，只要本轮存在 failed record，CLI 最终仍返回失败状态，便于 Cloud Run/Scheduler 告警。
 
 ## 13. Manifest
 
@@ -403,10 +410,10 @@ PRIORITY=p2 START_DATE=20190101 END_DATE=20260525 \
 
 | 阶段 | 估算请求数 | 理论耗时 | 建议预留 |
 |---|---:|---:|---:|
-| p0 | 约 6284 | 约 52 分钟 | 60-75 分钟 |
-| p1 | 约 6290 | 约 52 分钟 | 60-75 分钟 |
-| p2 | 约 6300-7000 | 约 53-59 分钟 | 70-100 分钟 |
-| 合计 | 约 18900-19600 | 约 2.6-2.8 小时 | 3.2-4.5 小时 |
+| p0 | 约 5370 | 约 45 分钟 | 55-70 分钟 |
+| p1 | 约 7170 | 约 60 分钟 | 75-95 分钟 |
+| p2 | 约 7400-10600 | 约 62-89 分钟 | 90-130 分钟 |
+| 合计 | 约 19945-23145 | 约 2.8-3.2 小时 | 3.7-5.0 小时 |
 
 p2 不确定性最大，原因是财务、股东和业绩类接口可能分页。
 

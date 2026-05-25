@@ -16,6 +16,11 @@ _checkpoints/endpoint=<endpoint>/logical_date=<YYYYMMDD>.json
 
 `raw` is enabled by default. `standardized_parquet` is optional and can be enabled in
 `config/tushare_to_gcs.yaml` when BigQuery DWD/DWS loading needs a physical standard layer.
+Snapshot endpoints use a run-level frozen snapshot date derived from `run_id`, so every
+snapshot endpoint in one run lands under the same logical date. Failed endpoint jobs write
+manifest records, continue with the remaining jobs, and make the Cloud Run Job fail only
+after the run summary is written.
+
 P2 financial and earnings endpoints use the 5000-point quarterly VIP interfaces:
 `income_vip`, `balancesheet_vip`, `cashflow_vip`, `fina_indicator_vip`,
 `forecast_vip`, and `express_vip`.
@@ -61,7 +66,7 @@ Run a single endpoint smoke test locally:
 
 ```bash
 ASHARE_USE_GCLOUD_ACCESS_TOKEN=1 TUSHARE_TOKEN=... \
-  TUSHARE_HTTP_URL=http://118.89.66.41:8010/ \
+  TUSHARE_HTTP_URL=http://121.40.135.59:8010/ \
   python -m data_ingestion.tushare_to_gcs run \
   --config config/tushare_to_gcs.yaml \
   --endpoint daily \

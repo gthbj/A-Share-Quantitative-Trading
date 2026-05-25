@@ -16,11 +16,14 @@ from data_ingestion.tushare_to_gcs import (
     add_ingestion_metadata,
     dataframe_to_parquet_bytes,
     iter_quarter_periods,
+    iter_year_ranges,
+    is_retryable_tushare_error,
     load_config,
     normalize_yyyymmdd,
     partition_month_for,
     priority_order,
     select_endpoints,
+    snapshot_date_for_run_id,
     standardize_dataframe,
 )
 
@@ -38,6 +41,39 @@ class FakeTusharePro:
         if offset >= self.rows:
             return pd.DataFrame()
         return pd.DataFrame({"row_id": list(range(offset, end))})
+
+
+class FakeIgnoredPaginationPro:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def daily(self, **params):
+        self.calls.append(params)
+        return pd.DataFrame({"row_id": [1, 2, 3]})
+
+
+class FakeNoneTusharePro:
+    def daily(self, **params):
+        return None
+
+
+class FakeRunTusharePro:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def daily(self, **params):
+        self.calls.append(params)
+        if params.get("trade_date") == "20260524":
+            raise RuntimeError("temporary timeout")
+        return pd.DataFrame(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": params.get("trade_date"),
+                    "close": 10.0,
+                }
+            ]
+        )
 
 
 class FakeBlob:
@@ -97,6 +133,14 @@ def test_iter_quarter_periods_limits_to_range():
     ]
 
 
+def test_iter_year_ranges_limits_to_requested_dates():
+    assert list(iter_year_ranges("20191115", "20210203")) == [
+        ("20191115", "20191231"),
+        ("20200101", "20201231"),
+        ("20210101", "20210203"),
+    ]
+
+
 def test_select_phase_includes_lower_phases():
     config = {
         "endpoints": {
@@ -149,6 +193,32 @@ def test_config_uses_trade_date_for_suspend_d():
     assert suspend_d["date_param"] == "trade_date"
 
 
+def test_config_uses_safe_modes_for_calendar_and_snapshot_endpoints():
+    config = load_config(Path("config/tushare_to_gcs.yaml"))
+    endpoints = config["endpoints"]
+
+    assert endpoints["dividend"]["mode"] == "by_trade_date"
+    assert endpoints["dividend"]["date_param"] == "ex_date"
+    assert endpoints["dividend"]["row_limit"] == 5000
+    assert endpoints["suspend_d"]["row_limit"] == 5000
+    assert "paginate" not in endpoints["stock_basic_listed"]
+    assert "paginate" not in endpoints["stock_basic_delisted"]
+    assert "paginate" not in endpoints["stock_basic_pending"]
+    assert endpoints["namechange"]["mode"] == "by_year_range"
+    assert endpoints["namechange"]["row_limit"] == 5000
+    assert "paginate" not in endpoints["namechange"]
+
+
+def test_config_paginates_near_full_market_endpoints():
+    config = load_config(Path("config/tushare_to_gcs.yaml"))
+    endpoints = config["endpoints"]
+
+    for key in ("stk_limit", "moneyflow", "margin_detail"):
+        assert endpoints[key]["paginate"] is True
+        assert endpoints[key]["page_size"] == 5000
+        assert endpoints[key]["max_pages"] == 3
+
+
 def test_create_tushare_pro_sets_private_http_url(monkeypatch):
     fake_tushare = FakeTushareModule()
     monkeypatch.setitem(sys.modules, "tushare", fake_tushare)
@@ -162,6 +232,13 @@ def test_create_tushare_pro_sets_private_http_url(monkeypatch):
     assert fake_tushare.token == "test-token"
     assert pro._DataApi__http_url == "http://127.0.0.1:8010/"
     assert pro._DataApi__timeout == 7
+
+
+def test_snapshot_date_is_frozen_from_run_id():
+    assert snapshot_date_for_run_id("20260525T010203Z") == "20260525"
+    fallback = snapshot_date_for_run_id("manual-run")
+    assert len(fallback) == 8
+    assert fallback.isdigit()
 
 
 def test_build_jobs_uses_trade_dates_for_daily_mode():
@@ -189,6 +266,22 @@ def test_build_jobs_uses_trade_dates_for_daily_mode():
     assert ingestor.standardized_object_name(jobs[0]).startswith(
         "a-share/tushare/standardized_parquet/fact_equity_kline_1d/partition_month=202605/run_id=run1/"
     )
+
+
+def test_build_jobs_uses_year_ranges_for_namechange():
+    config = load_config(Path("config/tushare_to_gcs.yaml"))
+    ingestor = TushareGCSIngestor(config, run_id="20260525T010203Z")
+    endpoint = select_endpoints(config, endpoint_keys=["namechange"])[0]
+
+    jobs = ingestor.build_jobs(endpoint, "20251115", "20260525")
+
+    assert len(jobs) == 2
+    assert jobs[0].params["start_date"] == "20251115"
+    assert jobs[0].params["end_date"] == "20251231"
+    assert jobs[0].logical_date == "20251231"
+    assert jobs[1].params["start_date"] == "20260101"
+    assert jobs[1].params["end_date"] == "20260525"
+    assert jobs[1].logical_date == "20260525"
 
 
 def test_fetch_job_dataframe_fails_when_non_paginated_call_hits_row_limit():
@@ -245,6 +338,131 @@ def test_fetch_job_dataframe_paginates_until_short_page():
     assert len(df) == 12001
     assert [call["offset"] for call in fake_pro.calls] == [0, 5000, 10000]
     assert [call["limit"] for call in fake_pro.calls] == [5000, 5000, 5000]
+
+
+def test_fetch_job_dataframe_allows_exact_max_pages_after_empty_probe():
+    config = {
+        "project_id": "data-aquarium",
+        "gcs": {"bucket": "data-aquarium", "prefix": "a-share/tushare"},
+        "tushare": {"max_calls_per_minute": 0},
+    }
+    ingestor = TushareGCSIngestor(config, run_id="run1")
+    fake_pro = FakeTusharePro(rows=10000)
+    ingestor._pro = fake_pro
+    job = IngestJob(
+        endpoint_key="top10_holders",
+        api_name="daily",
+        target_table="fact_top10_shareholders",
+        params={"period": "20251231"},
+        phase=2,
+        mode="by_period",
+        logical_date="20251231",
+        partition_month="202512",
+        chunk_key="abc123",
+        paginate=True,
+        page_size=5000,
+        max_pages=2,
+    )
+
+    df = ingestor.fetch_job_dataframe(job)
+
+    assert len(df) == 10000
+    assert [call["offset"] for call in fake_pro.calls] == [0, 5000, 10000]
+
+
+def test_fetch_job_dataframe_detects_ignored_limit_offset_pagination():
+    config = {
+        "project_id": "data-aquarium",
+        "gcs": {"bucket": "data-aquarium", "prefix": "a-share/tushare"},
+        "tushare": {"max_calls_per_minute": 0},
+    }
+    ingestor = TushareGCSIngestor(config, run_id="run1")
+    ingestor._pro = FakeIgnoredPaginationPro()
+    job = IngestJob(
+        endpoint_key="stock_basic_listed",
+        api_name="daily",
+        target_table="dim_security",
+        params={"list_status": "L"},
+        phase=1,
+        mode="snapshot",
+        logical_date="20260525",
+        partition_month="all",
+        chunk_key="abc123",
+        paginate=True,
+        page_size=3,
+        max_pages=2,
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate pagination page"):
+        ingestor.fetch_job_dataframe(job)
+
+
+def test_call_tushare_treats_none_response_as_failure():
+    config = {
+        "project_id": "data-aquarium",
+        "gcs": {"bucket": "data-aquarium", "prefix": "a-share/tushare"},
+        "tushare": {"max_calls_per_minute": 0, "retry": {"attempts": 1}},
+    }
+    ingestor = TushareGCSIngestor(config, run_id="run1")
+    ingestor._pro = FakeNoneTusharePro()
+
+    with pytest.raises(RuntimeError, match="Tushare API call failed"):
+        ingestor.call_tushare("daily", {"trade_date": "20260525"})
+
+
+def test_retryable_error_detection_uses_precise_token_markers():
+    assert not is_retryable_tushare_error(RuntimeError("token is invalid"))
+    assert not is_retryable_tushare_error(RuntimeError("请输入参数 ts_code"))
+    assert is_retryable_tushare_error(RuntimeError("connection reset while reading token"))
+    assert is_retryable_tushare_error(RuntimeError("tushare token API timed out"))
+
+
+def test_run_jobs_continues_after_failure_writes_summary_then_fails_run():
+    config = {
+        "project_id": "data-aquarium",
+        "gcs": {"bucket": "data-aquarium", "prefix": "a-share/tushare"},
+        "tushare": {"max_calls_per_minute": 0, "retry": {"attempts": 1}},
+        "outputs": {"raw": {"enabled": True}, "standardized": {"enabled": False}},
+        "checkpoint": {"enabled": True, "prefix": "_checkpoints", "skip_statuses": ["uploaded"]},
+    }
+    ingestor = TushareGCSIngestor(config, run_id="run1")
+    fake_bucket = FakeBucket()
+    ingestor._bucket = fake_bucket
+    ingestor._pro = FakeRunTusharePro()
+    failed_job = IngestJob(
+        endpoint_key="daily",
+        api_name="daily",
+        target_table="fact_equity_kline_1d",
+        params={"trade_date": "20260524"},
+        phase=1,
+        mode="by_trade_date",
+        logical_date="20260524",
+        partition_month="202605",
+        chunk_key="failed",
+        priority="p0",
+    )
+    uploaded_job = IngestJob(
+        endpoint_key="daily",
+        api_name="daily",
+        target_table="fact_equity_kline_1d",
+        params={"trade_date": "20260525"},
+        phase=1,
+        mode="by_trade_date",
+        logical_date="20260525",
+        partition_month="202605",
+        chunk_key="uploaded",
+        priority="p0",
+    )
+
+    with pytest.raises(RuntimeError, match="1 Tushare ingestion job"):
+        ingestor.run_jobs([failed_job, uploaded_job])
+
+    summary_name = "a-share/tushare/_manifests/run_id=run1/summary.json"
+    summary = json.loads(fake_bucket.store[summary_name].decode("utf-8"))
+    assert summary["failed_records"] == 1
+    assert summary["uploaded_records"] == 1
+    assert ingestor.checkpoint_object_name(failed_job) not in fake_bucket.store
+    assert ingestor.checkpoint_object_name(uploaded_job) in fake_bucket.store
 
 
 def test_checkpoint_can_skip_completed_job():
@@ -314,6 +532,7 @@ def test_snapshot_endpoint_partitions_to_all():
 
     assert len(jobs) == 1
     assert jobs[0].partition_month == "all"
+    assert jobs[0].logical_date == ingestor.snapshot_date
 
 
 def test_default_rate_limit_is_120_calls_per_minute():

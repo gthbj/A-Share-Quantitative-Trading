@@ -102,6 +102,13 @@ def today_yyyymmdd() -> str:
     return date.today().strftime("%Y%m%d")
 
 
+def snapshot_date_for_run_id(run_id: str) -> str:
+    prefix = run_id[:8]
+    if len(prefix) == 8 and prefix.isdigit():
+        return prefix
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
 def load_config(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
@@ -135,6 +142,16 @@ def iter_calendar_dates(start_date: str, end_date: str) -> Iterable[str]:
         current += timedelta(days=1)
 
 
+def iter_year_ranges(start_date: str, end_date: str) -> Iterable[tuple[str, str]]:
+    start = datetime.strptime(start_date, "%Y%m%d").date()
+    end = datetime.strptime(end_date, "%Y%m%d").date()
+    for year in range(start.year, end.year + 1):
+        year_start = max(start, date(year, 1, 1))
+        year_end = min(end, date(year, 12, 31))
+        if year_start <= year_end:
+            yield year_start.strftime("%Y%m%d"), year_end.strftime("%Y%m%d")
+
+
 def iter_quarter_periods(start_date: str, end_date: str) -> Iterable[str]:
     start = datetime.strptime(start_date, "%Y%m%d").date()
     end = datetime.strptime(end_date, "%Y%m%d").date()
@@ -148,6 +165,35 @@ def iter_quarter_periods(start_date: str, end_date: str) -> Iterable[str]:
 def stable_hash(payload: object, length: int = 12) -> str:
     data = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha256(data).hexdigest()[:length]
+
+
+def dataframe_signature(df: pd.DataFrame) -> str:
+    hashed = pd.util.hash_pandas_object(df, index=True).values
+    return hashlib.sha256(hashed.tobytes()).hexdigest()
+
+
+def is_retryable_tushare_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    non_retryable_markers = (
+        "token is invalid",
+        "invalid token",
+        "token invalid",
+        "token expired",
+        "token 不对",
+        "token不对",
+        "token 错误",
+        "token错误",
+        "权限",
+        "未开通",
+        "积分",
+        "参数",
+        "请输入",
+        "invalid parameter",
+        "permission",
+        "forbidden",
+        "unauthorized",
+    )
+    return not any(marker in message for marker in non_retryable_markers)
 
 
 def normalize_priority(value: str | None) -> str:
@@ -347,6 +393,7 @@ class TushareGCSIngestor:
     def __init__(self, config: dict, *, run_id: str | None = None) -> None:
         self.config = config
         self.run_id = run_id or default_run_id()
+        self.snapshot_date = snapshot_date_for_run_id(self.run_id)
         self.prefix = config["gcs"]["prefix"].strip("/")
         self.bucket_name = config["gcs"]["bucket"]
         self._storage_client = None
@@ -387,11 +434,13 @@ class TushareGCSIngestor:
                 else:
                     df = self.pro.query(api_name, **clean_params)
                 if df is None:
-                    return pd.DataFrame()
+                    raise RuntimeError(f"Tushare API returned None for {api_name}")
                 return df
             except Exception as exc:  # pragma: no cover - exercised in Cloud Run, not unit tests
                 last_error = exc
                 if attempt >= attempts:
+                    break
+                if not is_retryable_tushare_error(exc):
                     break
                 time.sleep(initial_sleep * (backoff ** (attempt - 1)))
         raise RuntimeError(f"Tushare API call failed: {api_name} params={clean_params}") from last_error
@@ -417,10 +466,15 @@ class TushareGCSIngestor:
         ep_start = normalize_yyyymmdd(endpoint.start_date, default=start_date) if endpoint.start_date else start_date
         ep_end = normalize_yyyymmdd(endpoint.end_date, default=end_date) if endpoint.end_date else end_date
         if endpoint.mode == "snapshot":
-            return [self._job(endpoint, dict(endpoint.params), today_yyyymmdd())]
+            return [self._job(endpoint, dict(endpoint.params), self.snapshot_date)]
         if endpoint.mode == "date_range":
             params = {**endpoint.params, "start_date": ep_start, "end_date": ep_end}
             return [self._job(endpoint, params, ep_end)]
+        if endpoint.mode == "by_year_range":
+            return [
+                self._job(endpoint, {**endpoint.params, "start_date": chunk_start, "end_date": chunk_end}, chunk_end)
+                for chunk_start, chunk_end in iter_year_ranges(ep_start, ep_end)
+            ]
         if endpoint.mode == "by_trade_date":
             date_param = endpoint.date_param or "trade_date"
             return [
@@ -477,12 +531,15 @@ class TushareGCSIngestor:
     def checkpoint_skip_statuses(self) -> set[str]:
         return set(self.config.get("checkpoint", {}).get("skip_statuses", ["uploaded"]))
 
-    def checkpoint_object_name(self, job: IngestJob) -> str:
+    def checkpoint_object_name_for(self, endpoint_key: str, logical_date: str) -> str:
         checkpoint_prefix = self.config.get("checkpoint", {}).get("prefix", "_checkpoints").strip("/")
         return (
-            f"{self.prefix}/{checkpoint_prefix}/endpoint={job.endpoint_key}/"
-            f"logical_date={job.logical_date}.json"
+            f"{self.prefix}/{checkpoint_prefix}/endpoint={endpoint_key}/"
+            f"logical_date={logical_date}.json"
         )
+
+    def checkpoint_object_name(self, job: IngestJob) -> str:
+        return self.checkpoint_object_name_for(job.endpoint_key, job.logical_date)
 
     def read_checkpoint(self, job: IngestJob) -> dict | None:
         if not self.checkpoint_enabled():
@@ -504,20 +561,8 @@ class TushareGCSIngestor:
     def upload_checkpoint(self, record: ManifestRecord) -> None:
         if not self.checkpoint_enabled() or record.status not in {"uploaded", "empty"}:
             return
-        job = IngestJob(
-            endpoint_key=record.endpoint_key,
-            api_name=record.api_name,
-            target_table=record.target_table,
-            params=record.params,
-            phase=0,
-            mode="checkpoint",
-            logical_date=record.logical_date,
-            partition_month=record.partition_month,
-            chunk_key="checkpoint",
-            priority=record.priority,
-        )
         payload = json.dumps(asdict(record), ensure_ascii=False, sort_keys=True).encode("utf-8")
-        self.bucket.blob(self.checkpoint_object_name(job)).upload_from_string(
+        self.bucket.blob(self.checkpoint_object_name_for(record.endpoint_key, record.logical_date)).upload_from_string(
             payload,
             content_type="application/json",
         )
@@ -527,21 +572,39 @@ class TushareGCSIngestor:
             page_size = job.page_size or min(job.row_limit or 5000, 5000)
             max_pages = job.max_pages or 100
             pages: list[pd.DataFrame] = []
+            page_signatures: set[str] = set()
             offset = 0
+            reached_max_full_page = False
             for page_number in range(1, max_pages + 1):
                 page_params = {**job.params, "limit": page_size, "offset": offset}
                 page = self.call_tushare(job.api_name, page_params, fields=job.fields)
                 if page.empty:
                     break
+                signature = dataframe_signature(page)
+                if signature in page_signatures:
+                    raise RuntimeError(
+                        f"{job.endpoint_key} received a duplicate pagination page at offset={offset}. "
+                        "The endpoint may ignore limit/offset; split the request more finely."
+                    )
+                page_signatures.add(signature)
                 pages.append(page)
                 if len(page) < page_size:
                     break
                 offset += page_size
             else:
-                raise RuntimeError(
-                    f"{job.endpoint_key} reached max_pages={max_pages}; "
-                    "increase max_pages or split the request more finely."
-                )
+                reached_max_full_page = True
+
+            if reached_max_full_page:
+                probe_params = {**job.params, "limit": page_size, "offset": offset}
+                probe = self.call_tushare(job.api_name, probe_params, fields=job.fields)
+                if not probe.empty:
+                    raise RuntimeError(
+                        f"{job.endpoint_key} reached max_pages={max_pages}; "
+                        "increase max_pages or split the request more finely."
+                    )
+                if not pages:
+                    return pd.DataFrame()
+
             if not pages:
                 return pd.DataFrame()
             return pd.concat(pages, ignore_index=True)
@@ -564,6 +627,10 @@ class TushareGCSIngestor:
             print(f"WARNING: {message}")
             return
         raise RuntimeError(message)
+
+    def should_fail_run_on_job_error(self) -> bool:
+        run_behavior = self.config.get("run_behavior", {})
+        return bool(run_behavior.get("fail_run_on_job_error", True))
 
     def run_jobs(self, jobs: Sequence[IngestJob], *, max_calls: int | None = None) -> list[ManifestRecord]:
         records: list[ManifestRecord] = []
@@ -592,7 +659,7 @@ class TushareGCSIngestor:
                         status="skipped",
                         raw_uri=checkpoint.get("raw_uri"),
                         standardized_uri=checkpoint.get("standardized_uri"),
-                        ingested_at=ingested_at,
+                        ingested_at=checkpoint.get("ingested_at") or ingested_at,
                     )
                     self.upload_manifest_record(record, index)
                     records.append(record)
@@ -675,8 +742,12 @@ class TushareGCSIngestor:
                 )
                 self.upload_manifest_record(record, index)
                 records.append(record)
-                raise
+                print(f"[{index}/{len(jobs)}] failed {job.endpoint_key} {job.logical_date}: {exc}")
+
         self.upload_run_summary(records)
+        failed = [record for record in records if record.status == "failed"]
+        if failed and self.should_fail_run_on_job_error():
+            raise RuntimeError(f"{len(failed)} Tushare ingestion job(s) failed; see run manifest.")
         return records
 
     def raw_object_name(self, job: IngestJob) -> str:
@@ -730,6 +801,7 @@ class TushareGCSIngestor:
             "records": len(records),
             "uploaded_records": sum(1 for r in records if r.status == "uploaded"),
             "empty_records": sum(1 for r in records if r.status == "empty"),
+            "skipped_records": sum(1 for r in records if r.status == "skipped"),
             "failed_records": sum(1 for r in records if r.status == "failed"),
             "rows": sum(r.rows for r in records),
         }

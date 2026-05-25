@@ -6,7 +6,7 @@ REGION="${REGION:-asia-east2}"
 REPO_NAME="${REPO_NAME:-tushare-ingest}"
 IMAGE_TAG="${IMAGE_TAG:-$(date +%Y%m%d-%H%M%S)}"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/tushare-ingest:${IMAGE_TAG}"
-JOB_NAME="${JOB_NAME:-tushare-ingest-${IMAGE_TAG}}"
+JOB_NAME="${JOB_NAME:-tushare-ingest}"
 PRIORITY="${PRIORITY:-p0}"
 PRIORITY_THROUGH="${PRIORITY_THROUGH:-}"
 START_DATE="${START_DATE:-20190101}"
@@ -15,7 +15,7 @@ TASK_MEMORY="${TASK_MEMORY:-2Gi}"
 TASK_CPU="${TASK_CPU:-1}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-14400}"
 TUSHARE_SECRET="${TUSHARE_SECRET:-tushare-token:latest}"
-TUSHARE_HTTP_URL="${TUSHARE_HTTP_URL:-http://118.89.66.41:8010/}"
+TUSHARE_HTTP_URL="${TUSHARE_HTTP_URL:-http://121.40.135.59:8010/}"
 
 echo "Tushare -> GCS ingestion"
 echo "  PROJECT_ID = $PROJECT_ID"
@@ -53,19 +53,26 @@ gcloud builds submit \
     --region="$REGION" \
     --project="$PROJECT_ID"
 
-gcloud run jobs create "$JOB_NAME" \
-    --image="$IMAGE" \
-    --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --tasks=1 \
-    --parallelism=1 \
-    --task-timeout="$TASK_TIMEOUT" \
-    --memory="$TASK_MEMORY" \
-    --cpu="$TASK_CPU" \
-    --max-retries=1 \
-    --set-env-vars="TUSHARE_HTTP_URL=${TUSHARE_HTTP_URL}" \
-    --set-secrets="TUSHARE_TOKEN=${TUSHARE_SECRET}" \
+JOB_FLAGS=(
+    --image="$IMAGE"
+    --region="$REGION"
+    --project="$PROJECT_ID"
+    --tasks=1
+    --parallelism=1
+    --task-timeout="$TASK_TIMEOUT"
+    --memory="$TASK_MEMORY"
+    --cpu="$TASK_CPU"
+    --max-retries=1
+    --set-env-vars="TUSHARE_HTTP_URL=${TUSHARE_HTTP_URL}"
+    --set-secrets="TUSHARE_TOKEN=${TUSHARE_SECRET}"
     --args="${PRIORITY_ARGS[0]},${PRIORITY_ARGS[1]},--start-date,${START_DATE},--end-date,${END_DATE}"
+)
+
+if gcloud run jobs describe "$JOB_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+    gcloud run jobs update "$JOB_NAME" "${JOB_FLAGS[@]}"
+else
+    gcloud run jobs create "$JOB_NAME" "${JOB_FLAGS[@]}"
+fi
 
 gcloud run jobs execute "$JOB_NAME" \
     --region="$REGION" \

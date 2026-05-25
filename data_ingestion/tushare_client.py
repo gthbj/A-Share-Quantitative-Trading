@@ -4,7 +4,7 @@ import os
 
 
 REQUIREMENTS_INSTALL_HINT = "Install dependencies with: python -m pip install -r requirements.txt"
-DEFAULT_HTTP_URL = "http://118.89.66.41:8010/"
+DEFAULT_HTTP_URL = "http://121.40.135.59:8010/"
 
 
 def require_tushare():
