@@ -59,6 +59,19 @@ POSITION_STATE_FEATURE_COLUMNS: List[str] = [
 ]
 
 
+def _numeric_feature(
+    df: pd.DataFrame,
+    column: str,
+    default: float = 0.0,
+) -> pd.Series:
+    """取数值特征列；列缺失时返回与 df 等长的默认 Series。"""
+    if column in df.columns:
+        values = df[column]
+    else:
+        values = pd.Series(default, index=df.index)
+    return pd.to_numeric(values, errors="coerce").fillna(default).astype(float)
+
+
 # 完整的 buy / sell 特征列定义
 RICH_BUY_FEATURE_COLUMNS: List[str] = (
     DAILY_FEATURE_COLUMNS         # 17 维
@@ -87,34 +100,39 @@ def deterministic_rich_score(feature_df: pd.DataFrame) -> pd.Series:
     df = feature_df.copy()
 
     # 技术面 base score（与 v1 一致）
+    return_5d = _numeric_feature(df, "return_5d")
+    return_20d = _numeric_feature(df, "return_20d")
+    rsi_14 = _numeric_feature(df, "rsi_14", 50.0)
+    close_to_ma20 = _numeric_feature(df, "close_to_ma20")
+    std_20d = _numeric_feature(df, "std_20d")
     tech = (
-        df.get("return_5d", 0).fillna(0).astype(float) * 1.0
-        + df.get("return_20d", 0).fillna(0).astype(float) * 0.5
-        + (50 - (df.get("rsi_14", 50).fillna(50).astype(float) - 50).abs()) / 100
-        + df.get("close_to_ma20", 0).fillna(0).astype(float) * 0.3
-        - df.get("std_20d", 0).fillna(0).astype(float) * 0.01
+        return_5d * 1.0
+        + return_20d * 0.5
+        + (50 - (rsi_14 - 50).abs()) / 100
+        + close_to_ma20 * 0.3
+        - std_20d * 0.01
     )
 
     # 基本面加分（低 PE/PB + 高 ROE）
-    pe = df.get("pe_basic", np.nan).astype(float)
+    pe = _numeric_feature(df, "pe_basic", np.nan)
     pe_score = np.where(
         (pe > 0) & (pe < 30),
         1.0 / (pe.clip(lower=1) + 1),   # 越低 PE 分越高
         0.0,
     )
+    pb = _numeric_feature(df, "pb", np.nan)
     pb_score = np.where(
-        (df.get("pb", np.nan).astype(float) > 0)
-        & (df.get("pb", np.nan).astype(float) < 5),
-        1.0 / (df.get("pb", 1).astype(float).clip(lower=0.5) + 1),
+        (pb > 0) & (pb < 5),
+        1.0 / (pb.clip(lower=0.5) + 1),
         0.0,
     )
-    roe_score = df.get("roe", 0).fillna(0).astype(float).clip(-30, 30) / 100
+    roe_score = _numeric_feature(df, "roe").clip(-30, 30) / 100
 
     fundamental = pe_score * 0.5 + pb_score * 0.3 + roe_score * 0.5
 
     # 资金流加分
-    main_flow = df.get("main_net_inflow_pct", 0).fillna(0).astype(float).clip(-1, 1)
-    dragon = df.get("dragon_tiger_net_pct", 0).fillna(0).astype(float).clip(-1, 1)
+    main_flow = _numeric_feature(df, "main_net_inflow_pct").clip(-1, 1)
+    dragon = _numeric_feature(df, "dragon_tiger_net_pct").clip(-1, 1)
     flow = main_flow * 0.5 + dragon * 0.3
 
     return tech + fundamental + flow
@@ -129,19 +147,26 @@ def deterministic_rich_sell_score(feature_df: pd.DataFrame) -> pd.Series:
         - 龙虎榜净卖出 → 风险加分
     """
     df = feature_df.copy()
-    zero = pd.Series(0.0, index=df.index)
-    default_days_to_horizon = pd.Series(5.0, index=df.index)
+    drawdown_high = _numeric_feature(df, "drawdown_from_high_20d")
+    vol_expansion = _numeric_feature(df, "vol_expansion", 1.0)
+    overbought = _numeric_feature(df, "rsi_overbought_streak")
+    return_5d = _numeric_feature(df, "return_5d")
+    position_return = _numeric_feature(df, "position_return")
+    position_drawdown = _numeric_feature(df, "drawdown_from_position_peak")
+    days_to_horizon = _numeric_feature(df, "days_to_expected_horizon", 5.0)
+    debt_to_assets = _numeric_feature(df, "debt_to_assets")
+    dragon = _numeric_feature(df, "dragon_tiger_net_pct")
     raw = (
         # 与 v1 一致的风险因子
-        -df.get("drawdown_from_high_20d", 0).fillna(0).astype(float) * 3
-        + (df.get("vol_expansion", 1).fillna(1).astype(float) - 1).clip(0, None) * 2
-        + (df.get("rsi_overbought_streak", 0).fillna(0).astype(float) > 5).astype(float) * 0.3
-        + (df.get("return_5d", 0).fillna(0).astype(float) < -0.05).astype(float) * 0.3
-        + (df.get("position_return", zero).fillna(0).astype(float) < -0.03).astype(float) * 0.4
-        - df.get("drawdown_from_position_peak", zero).fillna(0).astype(float).clip(-1, 0) * 0.6
-        + (df.get("days_to_expected_horizon", default_days_to_horizon).fillna(5).astype(float) <= 0).astype(float) * 0.2
+        -drawdown_high * 3
+        + (vol_expansion - 1).clip(0, None) * 2
+        + (overbought > 5).astype(float) * 0.3
+        + (return_5d < -0.05).astype(float) * 0.3
+        + (position_return < -0.03).astype(float) * 0.4
+        - position_drawdown.clip(-1, 0) * 0.6
+        + (days_to_horizon <= 0).astype(float) * 0.2
         # 富特征新增风险因子
-        + df.get("debt_to_assets", 0).fillna(0).astype(float).clip(0, 1) * 0.3
-        - df.get("dragon_tiger_net_pct", 0).fillna(0).astype(float).clip(-1, 0) * 0.5  # 净卖出（负值）
+        + debt_to_assets.clip(0, 1) * 0.3
+        - dragon.clip(-1, 0) * 0.5  # 净卖出（负值）
     )
     return 1 / (1 + np.exp(-raw * 3))

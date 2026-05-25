@@ -91,6 +91,7 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         # 预加载的富特征宽表，indexed by (date, equity_code)
         self._rich_features: Optional[pd.DataFrame] = None
         self._rich_features_index: Optional[pd.MultiIndex] = None
+        self._rich_amount_features: Optional[pd.DataFrame] = None
         self._trading_date_index: Dict[str, int] = {}
         # before_trading_start 的"第一次"标记（懒加载）
         self._rich_preloaded: bool = False
@@ -242,6 +243,11 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         df = df.sort_values(["date", "equity_code"]).reset_index(drop=True)
         df = df.set_index(["date", "equity_code"])
         self._rich_features = df
+        self._rich_amount_features = (
+            df[["amount"]].copy()
+            if "amount" in df.columns
+            else None
+        )
         self._trading_date_index = self._build_trading_date_index(
             df.index.get_level_values("date")
         )
@@ -265,7 +271,36 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
 
         return super()._ensure_trading_date_index(context)
 
-    def _dynamic_universe_for_date(self, today_df: pd.DataFrame, current_date: str) -> List[str]:
+    def _rich_amount_history(self) -> Optional[pd.DataFrame]:
+        if self._rich_amount_features is not None and not self._rich_amount_features.empty:
+            return self._rich_amount_features
+        if (
+            self._rich_features is None
+            or self._rich_features.empty
+            or "amount" not in self._rich_features.columns
+        ):
+            return None
+        if not isinstance(self._rich_features.index, pd.MultiIndex):
+            return None
+        self._rich_amount_features = self._rich_features[["amount"]].copy()
+        return self._rich_amount_features
+
+    def _held_codes(self, context: Optional[Context]) -> List[str]:
+        portfolio = getattr(context, "portfolio", None)
+        if portfolio is None:
+            return []
+        return [
+            str(code)
+            for code, pos in getattr(portfolio, "positions", {}).items()
+            if getattr(pos, "total_qty", 0) > 0
+        ]
+
+    def _dynamic_universe_for_date(
+        self,
+        today_df: pd.DataFrame,
+        current_date: str,
+        context: Optional[Context] = None,
+    ) -> List[str]:
         """按当前信号日可见数据动态选近 N 日成交额 Top 股票池。"""
         if self._explicit_universe or self.universe_source != "liquidity_top":
             return list(self._universe)
@@ -275,17 +310,28 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         lookback_start = (
             pd.to_datetime(current_date) - pd.Timedelta(days=self.liquidity_lookback_days * 2)
         ).strftime("%Y%m%d")
-        hist = self._rich_features.reset_index()
-        recent = hist[
-            (hist["date"] >= lookback_start)
-            & (hist["date"] <= current_date)
-            & (hist["equity_code"].isin(today_df["equity_code"]))
-        ]
+        amount_hist = self._rich_amount_history()
+        recent = pd.DataFrame()
+        if amount_hist is not None and isinstance(amount_hist.index, pd.MultiIndex):
+            try:
+                recent = amount_hist.loc[
+                    pd.IndexSlice[lookback_start:current_date, :],
+                    ["amount"],
+                ]
+            except (KeyError, TypeError, pd.errors.UnsortedIndexError):
+                date_idx = amount_hist.index.get_level_values("date")
+                recent = amount_hist[
+                    (date_idx >= lookback_start) & (date_idx <= current_date)
+                ]
+            if not recent.empty:
+                today_codes = set(today_df["equity_code"].astype(str))
+                code_idx = recent.index.get_level_values("equity_code").astype(str)
+                recent = recent[code_idx.isin(today_codes)]
         if recent.empty or "amount" not in recent.columns:
             codes = today_df["equity_code"].head(self.liquidity_top_n).astype(str).tolist()
         else:
             codes = (
-                recent.groupby("equity_code")["amount"]
+                recent.groupby(level="equity_code")["amount"]
                 .mean()
                 .sort_values(ascending=False)
                 .head(self.liquidity_top_n)
@@ -294,7 +340,18 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             )
         if self.trading_permissions is not None:
             codes = filter_codes(codes, self.trading_permissions)
-        self._universe = codes
+        held_codes = self._held_codes(context)
+        if held_codes:
+            held_set = set(held_codes)
+            today_set = set(today_df["equity_code"].astype(str))
+            codes = list(dict.fromkeys(codes + [c for c in held_codes if c in today_set]))
+            if self.trading_permissions is not None:
+                blocked = held_set - set(codes)
+                if blocked:
+                    logger.warning(
+                        f"{current_date} 持仓含当前权限外股票 {sorted(blocked)}；"
+                        "保留行情用于卖出风控，不作为新买候选"
+                    )
         return codes
 
     def _position_state_features(
@@ -313,12 +370,15 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         if portfolio is None:
             return out
         close_by_code = today_df.set_index("equity_code")["close"].astype(float)
-        for code, state in self._position_state.items():
+        held_codes = self._held_codes(context)
+        candidate_codes = list(dict.fromkeys(list(self._position_state.keys()) + held_codes))
+        for code in candidate_codes:
             if code not in close_by_code.index:
                 continue
             pos = portfolio.get_position(code) if hasattr(portfolio, "get_position") else None
             if pos is None or getattr(pos, "total_qty", 0) <= 0:
                 continue
+            state = self._position_state.get(code)
             matching_idx = today_df.index[today_df["equity_code"] == code]
             if len(matching_idx) == 0:
                 continue
@@ -326,14 +386,21 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             close = float(close_by_code.loc[code])
             entry_date = self._actual_position_entry_date(pos)
             if not entry_date:
-                entry_date = self._normalize_trade_date(getattr(state, "entered_date", ""))
+                entry_date = self._normalize_trade_date(
+                    getattr(state, "entered_date", "") if state is not None else ""
+                )
             entry_price = self._rich_entry_open(code, entry_date)
             peak = self._rich_position_peak(code, entry_date, context.current_date, close)
             holding_days = float(self._holding_trade_days(context, state, pos))
+            expected_horizon = (
+                float(state.expected_horizon)
+                if state is not None
+                else float(self.decision_horizon)
+            )
             out.loc[idx, "holding_days"] = holding_days
             out.loc[idx, "position_return"] = (close / entry_price - 1.0) if entry_price > 0 else 0.0
             out.loc[idx, "drawdown_from_position_peak"] = (close / peak - 1.0) if peak > 0 else 0.0
-            out.loc[idx, "days_to_expected_horizon"] = float(state.expected_horizon) - holding_days
+            out.loc[idx, "days_to_expected_horizon"] = expected_horizon - holding_days
         return out
 
     def _rich_entry_open(self, code: str, entry_date: str) -> float:
@@ -410,7 +477,12 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             )
             return super()._score_universe(context)
 
-        current_date = context.current_date[:8]
+        current_date = self._normalize_trade_date(context.current_date)
+        if not current_date:
+            if self.require_rich_features:
+                raise RuntimeError(f"无法规范化当前交易日: {context.current_date}")
+            logger.warning(f"无法规范化当前交易日: {context.current_date}")
+            return None
         try:
             today_df = self._rich_features.xs(current_date, level="date").copy()
         except KeyError:
@@ -426,7 +498,7 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             return None
 
         today_df = today_df.reset_index()
-        dynamic_universe = self._dynamic_universe_for_date(today_df, current_date)
+        dynamic_universe = self._dynamic_universe_for_date(today_df, current_date, context)
         today_df = today_df[today_df["equity_code"].isin(dynamic_universe)]
         if today_df.empty:
             if self.require_rich_features:

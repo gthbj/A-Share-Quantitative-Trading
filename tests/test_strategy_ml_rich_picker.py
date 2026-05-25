@@ -178,6 +178,19 @@ def test_deterministic_rich_score_returns_series():
     assert not out.isna().all()
 
 
+def test_deterministic_rich_fallback_handles_missing_columns():
+    """fallback 单独调用时，缺少 rich 列也不应因为标量默认值崩溃。"""
+    df = pd.DataFrame({"return_5d": [0.05, -0.02]}, index=["a", "b"])
+
+    buy = deterministic_rich_score(df)
+    sell = deterministic_rich_sell_score(pd.DataFrame(index=df.index))
+
+    assert len(buy) == len(df)
+    assert len(sell) == len(df)
+    assert np.isfinite(buy.to_numpy()).all()
+    assert ((sell >= 0) & (sell <= 1)).all()
+
+
 def test_deterministic_rich_sell_score_in_range():
     """sell fallback 输出 [0, 1] 概率。"""
     df = _toy_rich_features()
@@ -352,6 +365,47 @@ def test_position_state_features_use_rich_adjusted_prices_not_execution_cost():
     )
 
 
+def test_position_state_features_use_live_position_when_state_missing():
+    """断点续跑 / 冷启动时，已有持仓没有 _position_state 也应给 sell 模型真实状态。"""
+    strat = MLRichPickerStrategy(require_rich_features=True)
+    rich = pd.DataFrame(
+        [
+            {
+                "date": "20240102",
+                "equity_code": "000001.SZ",
+                "open": 10.0,
+                "close": 10.0,
+                "high": 10.5,
+            },
+            {
+                "date": "20240103",
+                "equity_code": "000001.SZ",
+                "open": 11.0,
+                "close": 12.0,
+                "high": 12.5,
+            },
+        ]
+    )
+    strat._rich_features = rich.set_index(["date", "equity_code"])
+    strat._trading_date_index = {"20240102": 0, "20240103": 1}
+    portfolio = Portfolio(100_000)
+    pos = Position(code="000001.SZ", total_qty=100, sellable_qty=100, cost_price=10.0)
+    pos._buy_records["20240102"] = 100
+    portfolio.positions["000001.SZ"] = pos
+    ctx = SimpleNamespace(
+        current_date="20240103",
+        portfolio=portfolio,
+        all_bars={},
+    )
+
+    today_df = rich[rich["date"] == "20240103"].copy()
+    out = strat._position_state_features(ctx, today_df)
+
+    assert out.loc[today_df.index[0], "holding_days"] == pytest.approx(1.0)
+    assert out.loc[today_df.index[0], "position_return"] == pytest.approx(0.20)
+    assert out.loc[today_df.index[0], "days_to_expected_horizon"] == pytest.approx(4.0)
+
+
 def test_score_universe_dynamic_liquidity_universe():
     """回测交易 universe 每天按近 N 日成交额动态收敛，而不是首日静态。"""
     codes = ["000001.SZ", "600000.SH"]
@@ -384,6 +438,56 @@ def test_score_universe_dynamic_liquidity_universe():
 
     assert out is not None
     assert out["code"].tolist() == ["600000.SH"]
+    assert strat.get_universe() == codes
+
+
+def test_score_universe_scores_held_position_outside_dynamic_liquidity_top():
+    """持仓股即使掉出当日 Top-N，也要进入 score_df 供 sell_model / prob_floor 使用。"""
+    codes = ["000001.SZ", "600000.SH", "000002.SZ"]
+    rows = []
+    for date, amounts in [
+        ("20240101", [1_000.0, 10_000.0, 500.0]),
+        ("20240102", [1_000.0, 20_000.0, 500.0]),
+    ]:
+        frame = _indexed_rich_features(codes).reset_index()
+        frame["date"] = date
+        frame["amount"] = amounts
+        rows.append(frame)
+    features = pd.concat(rows, ignore_index=True).set_index(["date", "equity_code"])
+    strat = MLRichPickerStrategy(
+        require_rich_features=True,
+        use_deterministic_fallback=False,
+        universe_source="liquidity_top",
+        liquidity_top_n=1,
+    )
+    strat._explicit_universe = False
+    strat._universe = codes
+    strat._rich_features = features
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    portfolio = Portfolio(100_000)
+    pos = Position(code="000001.SZ", total_qty=100, sellable_qty=100, cost_price=10.0)
+    pos._buy_records["20240101"] = 100
+    portfolio.positions["000001.SZ"] = pos
+
+    ctx = SimpleNamespace(current_date="20240102", portfolio=portfolio, all_bars={})
+
+    out = strat._score_universe(ctx)
+
+    assert out is not None
+    assert out["code"].tolist() == ["000001.SZ", "600000.SH"]
+    assert strat.get_universe() == codes
+
+
+def test_score_universe_normalizes_hyphenated_current_date():
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    out = strat._score_universe(SimpleNamespace(current_date="2024-01-02"))
+
+    assert out is not None
+    assert set(out["code"]) == {"000001.SZ", "600000.SH"}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -648,6 +752,8 @@ def test_walk_forward_sql_contains_3_tables():
     assert 'ArrayQueryParameter("partition_months", "INT64"' in src
     assert "financial_announcement_date < date" in src
     assert "available_signal_date" in src
+    assert "kpl_mapped AS" in src
+    assert "GROUP BY equity_code, available_signal_date" in src
 
 
 def test_walk_forward_partition_months_cover_full_range():
@@ -724,6 +830,33 @@ def test_sell_training_frame_contains_position_state_features():
     assert set(out["holding_days"].dropna().unique()) == {1.0, 5.0, 10.0}
     assert out.loc[out["holding_days"] == 5.0, "days_to_expected_horizon"].dropna().eq(0.0).all()
     assert out.loc[out["holding_days"] == 10.0, "days_to_expected_horizon"].dropna().eq(-5.0).all()
+
+
+def test_sell_training_frame_default_samples_cover_first_holding_frame():
+    from strategy.ml_rich_picker.walk_forward import _build_held_position_sell_training_frame
+
+    rows = []
+    for i in range(30):
+        row = {
+            "date": f"202401{i + 1:02d}",
+            "equity_code": "000001.SZ",
+            "open": 10.0 + i * 0.1,
+            "high": 10.2 + i * 0.1,
+            "low": 9.8 + i * 0.1,
+            "close": 10.1 + i * 0.1,
+        }
+        for col in RICH_BUY_FEATURE_COLUMNS:
+            row[col] = 0.1
+        rows.append(row)
+
+    out = _build_held_position_sell_training_frame(
+        pd.DataFrame(rows),
+        lookforward=5,
+        drawdown_threshold=-0.05,
+    )
+
+    assert set(out["holding_days"].dropna().unique()) == {0.0, 3.0, 10.0, 20.0}
+    assert out.loc[out["holding_days"] == 0.0, "days_to_expected_horizon"].dropna().eq(5.0).all()
 
 
 def test_binary_auc_helper():

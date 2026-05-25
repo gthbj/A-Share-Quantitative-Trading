@@ -224,7 +224,7 @@ kpl_raw AS (
       {code_clause_other}
     GROUP BY equity_code, date
 ),
-kpl AS (
+kpl_mapped AS (
     -- 开盘啦榜单次日 8:30 更新；T 日 KPL 只能用于下一交易日的收盘信号。
     SELECT
         k.equity_code,
@@ -236,6 +236,16 @@ kpl AS (
         TRUE AS is_kpl_event,
         k.limit_up_streak
     FROM kpl_raw k
+),
+kpl AS (
+    SELECT
+        equity_code,
+        available_signal_date,
+        TRUE AS is_kpl_event,
+        MAX(limit_up_streak) AS limit_up_streak
+    FROM kpl_mapped
+    WHERE available_signal_date IS NOT NULL
+    GROUP BY equity_code, available_signal_date
 )
 SELECT
     d.equity_code,
@@ -409,7 +419,7 @@ def _build_held_position_sell_training_frame(
     if not required.issubset(df.columns):
         raise ValueError(f"df 必须包含 {required}，实际 {set(df.columns)}")
 
-    holding_day_samples = holding_day_samples or [1, 3, 5, 10, 20]
+    holding_day_samples = holding_day_samples or [0, 3, 10, 20]
     base = df.sort_values(["equity_code", "date"]).copy()
     pieces = [
         _future_open_drawdown_from_execution(group, lookforward)

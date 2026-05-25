@@ -170,7 +170,13 @@ class BacktestEngine:
 
             # 1. 构建当日 bar 字典 {code: Series}
             today_bars = {}
-            for code in strategy.get_universe():
+            bar_codes = list(strategy.get_universe())
+            held_codes = [
+                code
+                for code, pos in portfolio.positions.items()
+                if getattr(pos, "total_qty", 0) > 0
+            ]
+            for code in dict.fromkeys(bar_codes + held_codes):
                 df = all_bars.get(code)
                 if df is not None and not df.empty:
                     row = df[df["date"] == date_str]
