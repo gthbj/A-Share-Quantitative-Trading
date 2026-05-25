@@ -45,7 +45,14 @@ params:
   decision_horizon: 5
   min_buy_prob: 0.50
   min_prob_floor: 0.30
-  sell_threshold: 0.70
+  # sell 桥接到父类 prob_sell 用的阈值（>= 此值即认为应卖）
+  # 由 sell_remaining_days_threshold + sigmoid sharpness 共同决定
+  # （remaining_days <= threshold 时 prob_sell 显著大于 0.5）
+  sell_threshold: 0.50
+  # Sell 回归模型参数
+  sell_remaining_days_threshold: 1.0   # 预测剩余天数 <= 该值则视为应卖
+  sell_remaining_days_sharpness: 1.5   # sigmoid 陡峭度（越大越接近硬阈值）
+  sell_max_remaining_days: 20.0        # 与 walk_forward_config.sell_lookforward 对齐
   # 风控
   stop_loss_pct_bull: 0.05
   stop_loss_pct_bear: 0.03

@@ -46,18 +46,19 @@ from strategy.ml_multi_horizon_picker.walk_forward import (
 )
 from strategy.ml_multi_horizon_picker.model_storage import (
     BUY_HORIZONS,
-    SELL_MODEL_NAME,
-    save_bundle,
 )
 from strategy.ml_multi_horizon_picker.tradable import filter_codes, merge_permissions
 
 from strategy.ml_rich_picker.features import (
     DAILY_FEATURE_COLUMNS,
-    FUNDAMENTAL_FEATURE_COLUMNS,
     EVENT_FEATURE_COLUMNS,
-    POSITION_STATE_FEATURE_COLUMNS,
+    FUNDAMENTAL_FEATURE_COLUMNS,
     RICH_BUY_FEATURE_COLUMNS,
-    RICH_SELL_FEATURE_COLUMNS,
+    SELL_REGRESSION_FEATURE_COLUMNS,
+)
+from strategy.ml_rich_picker.model_storage import (
+    SELL_REMAINING_DAYS_MODEL_NAME,
+    save_rich_bundle,
 )
 from utils.logger import get_logger
 
@@ -388,7 +389,12 @@ def _build_buy_labels_execution_open(
 
 def _future_open_drawdown_from_execution(group: pd.DataFrame, lookforward: int) -> pd.Series:
     opens = pd.to_numeric(group["open"], errors="coerce").astype(float).to_numpy()
-    lows = pd.to_numeric(group.get("low", group["close"]), errors="coerce").astype(float).to_numpy()
+    if "low" in group.columns:
+        lows = pd.to_numeric(group["low"], errors="coerce").astype(float).to_numpy()
+    elif "close" in group.columns:
+        lows = pd.to_numeric(group["close"], errors="coerce").astype(float).to_numpy()
+    else:
+        lows = np.full(len(group), np.nan, dtype=float)
     out = np.full(len(group), np.nan, dtype=float)
     for i in range(len(group) - 1):
         entry_idx = i + 1
@@ -407,11 +413,10 @@ def _build_held_position_sell_training_frame(
     decision_horizon: int = 5,
     underperform_quantile: Optional[float] = 0.30,
 ) -> pd.DataFrame:
-    """构造持仓决策 sell 训练样本。
+    """[DEPRECATED] 旧的 binary sell label 构造函数。
 
-    每个信号日模拟若干个已经持有 N 天的状态，标签表示“若今日收盘
-    继续持有，下一开盘之后的 lookforward 窗口是否出现不可接受风险，
-    或未来收益是否落在同日截面底部（机会成本/alpha 衰减）。
+    仅保留以兼容旧 sell_v1.pkl 二分类模型的训练路径；新模型一律走
+    ``_build_optimal_remaining_days_training_frame``（回归）。
     """
     if df.empty:
         return df.copy()
@@ -481,6 +486,127 @@ def _build_held_position_sell_training_frame(
     return out
 
 
+def _compute_optimal_remaining_days_per_group(
+    group: pd.DataFrame,
+    lookforward: int,
+    drawdown_threshold: float,
+) -> pd.Series:
+    """对单只股票计算每天的 ``optimal_remaining_days`` 标签。
+
+    语义：站在 T 日收盘出信号、T+1 开盘进场的口径下，往后看 ``lookforward``
+    个交易日，找出风险可控（自 T+1 起累计 drawdown 不破 ``drawdown_threshold``）
+    的窗口里**累计收益最大**那一天对应的 k。
+
+    具体算法（向量化思路用循环表达）：
+
+    ::
+
+        for each i:
+            entry_idx  = i + 1
+            running_min_low = entry_open
+            best_k = 0
+            best_return = 0
+            for k in 0 .. lookforward:
+                exit_idx = entry_idx + k + 1
+                running_min_low = min(running_min_low, low[entry_idx + k])
+                cum_drawdown = (running_min_low - entry_open) / entry_open
+                if cum_drawdown < drawdown_threshold:
+                    break                           # 已被风控截断
+                cum_return = log(open[exit_idx]) - log(entry_open)
+                if cum_return > best_return:
+                    best_k = k
+                    best_return = cum_return
+            label[i] = best_k
+
+    返回 Series（与 group 同 index），缺数据的位置为 NaN。
+    """
+    n = len(group)
+    out = np.full(n, np.nan, dtype=float)
+    if n < 2:
+        return pd.Series(out, index=group.index)
+
+    opens = pd.to_numeric(group["open"], errors="coerce").to_numpy(dtype=float)
+    # group["close"] / group["low"] 的存在性独立判断，避免 DataFrame.get 默认值
+    # 被强制求值（pandas 不做懒求值）。
+    if "low" in group.columns:
+        lows = pd.to_numeric(group["low"], errors="coerce").to_numpy(dtype=float)
+    elif "close" in group.columns:
+        lows = pd.to_numeric(group["close"], errors="coerce").to_numpy(dtype=float)
+    else:
+        lows = np.full(n, np.nan, dtype=float)
+
+    for i in range(n - 1):
+        entry_idx = i + 1
+        if entry_idx >= n:
+            break
+        entry_open = opens[entry_idx]
+        if not np.isfinite(entry_open) or entry_open <= 0:
+            continue
+
+        running_min_low = entry_open
+        best_k = 0
+        best_return = 0.0
+        kmax = min(lookforward, n - entry_idx - 1)
+        for k in range(kmax + 1):
+            day_idx = entry_idx + k
+            day_low = lows[day_idx]
+            if np.isfinite(day_low) and day_low > 0:
+                if day_low < running_min_low:
+                    running_min_low = day_low
+            # 风控：累计回撤超阈值就截断，剩下的 day 不再考虑
+            cum_drawdown = (running_min_low - entry_open) / entry_open
+            if cum_drawdown < drawdown_threshold:
+                break
+            exit_idx = entry_idx + k + 1
+            if exit_idx >= n:
+                break
+            exit_open = opens[exit_idx]
+            if not np.isfinite(exit_open) or exit_open <= 0:
+                continue
+            cum_return = np.log(exit_open) - np.log(entry_open)
+            if cum_return > best_return:
+                best_return = cum_return
+                best_k = k
+
+        out[i] = float(best_k)
+
+    return pd.Series(out, index=group.index)
+
+
+def _build_optimal_remaining_days_training_frame(
+    df: pd.DataFrame,
+    lookforward: int,
+    drawdown_threshold: float,
+) -> pd.DataFrame:
+    """构造 sell 回归模型的训练样本。
+
+    每行一个 (date, code)，标签 ``label_optimal_remaining_days`` 是从当日
+    收盘出信号、明天开盘进场的视角下，未来 ``lookforward`` 天内**风险可控
+    的最佳卖出剩余天数 k\\*** （浮点，0 表示该立刻卖出）。
+
+    与旧 binary label 的本质区别：
+    - 不再做 holding_day 样本复制 ⇒ 同一个 (date, code) 只有一份标签
+    - 标签是连续值而不是 0/1 ⇒ 训练用 regression，不再用 binary
+    - 标签**独立于持仓状态** ⇒ 持仓状态影响在策略层做最终决策时合成
+    """
+    if df.empty:
+        return df.copy()
+    required = {"date", "equity_code", "open", "close"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"df 必须包含 {required}，实际 {set(df.columns)}")
+
+    base = df.sort_values(["equity_code", "date"]).copy()
+    pieces = [
+        _compute_optimal_remaining_days_per_group(group, lookforward, drawdown_threshold)
+        for _, group in base.groupby("equity_code")
+    ]
+    if pieces:
+        base["label_optimal_remaining_days"] = pd.concat(pieces).sort_index()
+    else:
+        base["label_optimal_remaining_days"] = np.nan
+    return base
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 单时点训练（rich 版本）
 # ──────────────────────────────────────────────────────────────────────
@@ -516,6 +642,35 @@ def _quality_threshold(cfg: WalkForwardConfig, key: str, default: float) -> floa
     return float(getattr(cfg, key, default))
 
 
+def _spearman_corr(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]:
+    """无 scipy 依赖的 Spearman 相关系数。"""
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(y_pred, dtype=float)
+    mask = np.isfinite(y) & np.isfinite(p)
+    y = y[mask]
+    p = p[mask]
+    if len(y) < 5 or np.std(y) == 0 or np.std(p) == 0:
+        return None
+
+    def _rankdata(arr: np.ndarray) -> np.ndarray:
+        order = np.argsort(arr)
+        ranks = np.empty(len(arr), dtype=float)
+        sorted_arr = arr[order]
+        i = 0
+        while i < len(arr):
+            j = i + 1
+            while j < len(arr) and sorted_arr[j] == sorted_arr[i]:
+                j += 1
+            avg_rank = (i + 1 + j) / 2.0
+            ranks[order[i:j]] = avg_rank
+            i = j
+        return ranks
+
+    r1 = _rankdata(y)
+    r2 = _rankdata(p)
+    return float(np.corrcoef(r1, r2)[0, 1])
+
+
 def _train_lgbm_with_quality(
     Xtr: np.ndarray,
     ytr: np.ndarray,
@@ -524,18 +679,57 @@ def _train_lgbm_with_quality(
     cfg: WalkForwardConfig,
     model_name: str,
 ) -> Tuple[Optional[Any], Dict[str, Any]]:
-    model = _train_lgbm(Xtr, ytr, Xva, yva, cfg.lightgbm_params)
-    pred = model.predict(Xva)
-    auc = _binary_auc(yva, pred)
+    """训单个 LightGBM 并做验证集质量闸门。
+
+    根据 ``model_name`` 自动选择评估指标：
+    - ``SELL_REMAINING_DAYS_MODEL_NAME``：回归，用 Spearman 相关系数（rank IC）
+      作为质量闸门，配合 MAE / RMSE 诊断
+    - 其它（buy_hX）：二分类，用 AUC 做闸门
+    """
+    is_regression = model_name == SELL_REMAINING_DAYS_MODEL_NAME
+    params = dict(cfg.lightgbm_params or {})
+    if is_regression:
+        # 覆盖父类默认的 binary 配置
+        params.setdefault("objective", "regression_l1")
+        params.setdefault("metric", ["l1", "l2"])
+    model = _train_lgbm(Xtr, ytr, Xva, yva, params)
+    pred = np.asarray(model.predict(Xva), dtype=float)
     pred_mean = float(np.nanmean(pred)) if len(pred) else float("nan")
+
+    if is_regression:
+        # 回归质量：Spearman rank IC（>= 阈值则通过）
+        corr = _spearman_corr(yva, pred)
+        mae = float(np.nanmean(np.abs(pred - yva))) if len(yva) else float("nan")
+        rmse = float(np.sqrt(np.nanmean((pred - yva) ** 2))) if len(yva) else float("nan")
+        y_mean = float(np.nanmean(yva)) if len(yva) else float("nan")
+        y_std = float(np.nanstd(yva)) if len(yva) else float("nan")
+        min_corr = _quality_threshold(cfg, "min_sell_rank_ic", 0.05)
+        passed = corr is not None and corr >= min_corr
+        metrics: Dict[str, Any] = {
+            "valid_rank_ic": None if corr is None else float(corr),
+            "valid_mae": mae,
+            "valid_rmse": rmse,
+            "valid_pred_mean": pred_mean,
+            "valid_y_mean": y_mean,
+            "valid_y_std": y_std,
+            "min_valid_rank_ic": min_corr,
+            "quality_pass": bool(passed),
+            "objective": params.get("objective"),
+        }
+        if not passed:
+            logger.warning(
+                f"{model_name} 回归质量未过闸门: rank_ic={corr}, min={min_corr}, "
+                f"mae={mae:.3f}, rmse={rmse:.3f}"
+            )
+            return None, metrics
+        return model, metrics
+
+    # 二分类（buy_hX）
+    auc = _binary_auc(yva, pred)
     pos_ratio = float(np.mean(yva)) if len(yva) else float("nan")
-    min_auc = _quality_threshold(
-        cfg,
-        "min_sell_auc" if model_name == SELL_MODEL_NAME else "min_buy_auc",
-        0.52,
-    )
+    min_auc = _quality_threshold(cfg, "min_buy_auc", 0.52)
     passed = auc is not None and auc >= min_auc
-    metrics: Dict[str, Any] = {
+    metrics = {
         "valid_auc": None if auc is None else float(auc),
         "valid_pred_mean": pred_mean,
         "valid_pos_ratio": pos_ratio,
@@ -558,9 +752,11 @@ def _train_one_retrain_point_rich(
 ) -> Tuple[Dict[int, Any], Optional[Any], Dict[str, Any]]:
     """对单个重训点训 4 buy + 1 sell 模型（rich 特征版本）。
 
-    与 v1 _train_one_retrain_point 区别：
-    - 使用 RICH_BUY_FEATURE_COLUMNS (30) / RICH_SELL_FEATURE_COLUMNS (39)
-    - 训练数据允许特征 NaN（LightGBM 原生支持），不强制 dropna 全部列
+    与 v1 _train_one_retrain_point 的区别：
+    - buy 仍是 4 个独立的 binary classifier，特征 ``RICH_BUY_FEATURE_COLUMNS`` (30)
+    - sell **改为 regression** 预测 ``optimal_remaining_days`` ∈ [0, lookforward]，
+      特征 ``SELL_REGRESSION_FEATURE_COLUMNS`` (35)；不再做 5×holding 采样复制
+    - 训练数据允许特征 NaN（LightGBM 原生支持）
     """
     train_start = (
         pd.to_datetime(retrain_end) - timedelta(days=365 * cfg.rolling_window_years)
@@ -583,7 +779,10 @@ def _train_one_retrain_point_rich(
         "rows_in_window": int(len(window)),
         "feature_set": "rich",
         "buy_feature_count": len(RICH_BUY_FEATURE_COLUMNS),
-        "sell_feature_count": len(RICH_SELL_FEATURE_COLUMNS),
+        "sell_feature_count": len(SELL_REGRESSION_FEATURE_COLUMNS),
+        "sell_model_type": "regression_optimal_remaining_days",
+        "sell_lookforward": int(cfg.sell_lookforward),
+        "sell_drawdown_threshold": float(cfg.sell_drawdown_threshold),
     }
     if len(window) < 500:
         logger.warning(f"[{retrain_end}] 训练窗样本极少 ({len(window)} 行)")
@@ -595,13 +794,13 @@ def _train_one_retrain_point_rich(
         top_q=cfg.buy_top_quantile,
         bottom_q=cfg.buy_bottom_quantile,
     )
-    # sell 使用模拟持仓状态，训练成“当前持仓是否应卖”的决策模型。
-    sell_window = _build_held_position_sell_training_frame(
+    # sell 用回归 label：未来 lookforward 天内风险可控的最优剩余天数 k*。
+    # 一个 (date, code) 只生成一份样本，不再做 holding 复制；持仓状态在
+    # 策略层 trigger 时合成。
+    sell_window = _build_optimal_remaining_days_training_frame(
         window,
         lookforward=cfg.sell_lookforward,
         drawdown_threshold=cfg.sell_drawdown_threshold,
-        decision_horizon=int(getattr(cfg, "decision_horizon", 5)),
-        underperform_quantile=getattr(cfg, "sell_underperform_quantile", 0.30),
     )
 
     # ── Buy 模型 ──
@@ -633,25 +832,28 @@ def _train_one_retrain_point_rich(
         metadata[f"buy_h{h}_valid_rows"] = int(len(va))
         metadata[f"buy_h{h}_quality"] = metrics
 
-    # ── Sell 模型 ──
+    # ── Sell 模型（回归 optimal_remaining_days）──
     sell_model = None
-    required_non_null = (
-        DAILY_FEATURE_COLUMNS
-        + POSITION_STATE_FEATURE_COLUMNS
-        + ["label_sell", "date"]
-    )
+    sell_label_col = "label_optimal_remaining_days"
+    # 不在 dropna 列里加 sell-side risk 5 维（它们前 60 天 warmup 内允许 NaN），
+    # 只要 daily 17 维 + label + open 完整即可。
+    required_non_null = DAILY_FEATURE_COLUMNS + ["open", sell_label_col, "date"]
     sub = sell_window.dropna(subset=required_non_null)
     tr = sub[sub["date"] < valid_start]
     va = sub[(sub["date"] >= valid_start) & (sub["date"] <= retrain_end)]
     if len(tr) >= 200 and len(va) >= 30:
-        Xtr = tr[RICH_SELL_FEATURE_COLUMNS].values
-        ytr = tr["label_sell"].astype(int).values
-        Xva = va[RICH_SELL_FEATURE_COLUMNS].values
-        yva = va["label_sell"].astype(int).values
-        sell_model, metrics = _train_lgbm_with_quality(Xtr, ytr, Xva, yva, cfg, SELL_MODEL_NAME)
+        Xtr = tr[SELL_REGRESSION_FEATURE_COLUMNS].values
+        ytr = tr[sell_label_col].astype(float).values
+        Xva = va[SELL_REGRESSION_FEATURE_COLUMNS].values
+        yva = va[sell_label_col].astype(float).values
+        sell_model, metrics = _train_lgbm_with_quality(
+            Xtr, ytr, Xva, yva, cfg, SELL_REMAINING_DAYS_MODEL_NAME,
+        )
         metadata["sell_train_rows"] = int(len(tr))
         metadata["sell_valid_rows"] = int(len(va))
-        metadata["sell_pos_ratio"] = float(np.mean(ytr))
+        metadata["sell_label_mean"] = float(np.nanmean(ytr))
+        metadata["sell_label_std"] = float(np.nanstd(ytr))
+        metadata["sell_label_zero_ratio"] = float(np.mean(ytr == 0.0))
         metadata["sell_quality"] = metrics
     else:
         logger.warning(
@@ -674,7 +876,7 @@ def _missing_rich_model_components(
         if h not in buy_models or buy_models[h] is None
     ]
     if sell_model is None:
-        missing.append(SELL_MODEL_NAME)
+        missing.append(SELL_REMAINING_DAYS_MODEL_NAME)
     return missing
 
 
@@ -689,6 +891,9 @@ def _attach_rich_validation_config(cfg: WalkForwardConfig, config_path: str) -> 
     validation = raw.get("validation", {}) if isinstance(raw, dict) else {}
     labels = raw.get("labels", {}) if isinstance(raw, dict) else {}
     setattr(cfg, "min_buy_auc", float(validation.get("min_buy_auc", 0.52)))
+    # 新 sell 回归模型质量闸门：Spearman rank IC（>= 0.05 视为有效信号）
+    setattr(cfg, "min_sell_rank_ic", float(validation.get("min_sell_rank_ic", 0.05)))
+    # 旧 binary sell 模型阈值（保留供向后兼容）
     setattr(cfg, "min_sell_auc", float(validation.get("min_sell_auc", 0.52)))
     setattr(cfg, "decision_horizon", int(labels.get("decision_horizon", 5)))
     setattr(
@@ -737,7 +942,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     logger.info(f"本任务重训点: {retrain_dates[0]} ~ {retrain_dates[-1]} (共 {len(retrain_dates)})")
     logger.info(
-        f"特征维度: buy={len(RICH_BUY_FEATURE_COLUMNS)}, sell={len(RICH_SELL_FEATURE_COLUMNS)}"
+        f"特征维度: buy={len(RICH_BUY_FEATURE_COLUMNS)}, "
+        f"sell_regression={len(SELL_REGRESSION_FEATURE_COLUMNS)}"
     )
 
     # 数据范围
@@ -751,8 +957,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         print(f"将训练 {len(retrain_dates)} 个时点（rich 特征）")
         print(f"数据范围: {max_train_start} ~ {data_end}")
-        print(f"buy 特征: {RICH_BUY_FEATURE_COLUMNS}")
-        print(f"sell 特征: {RICH_SELL_FEATURE_COLUMNS}")
+        print(f"buy 特征 ({len(RICH_BUY_FEATURE_COLUMNS)} 维): {RICH_BUY_FEATURE_COLUMNS}")
+        print(
+            f"sell 回归特征 ({len(SELL_REGRESSION_FEATURE_COLUMNS)} 维): "
+            f"{SELL_REGRESSION_FEATURE_COLUMNS}"
+        )
+        print(
+            "sell label: optimal_remaining_days (回归), "
+            f"lookforward={cfg.sell_lookforward}, "
+            f"drawdown_threshold={cfg.sell_drawdown_threshold}"
+        )
         return 0
 
     # Phase 1: volume → universe 并集
@@ -836,7 +1050,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             all_metadata[retrain_date] = meta
             continue
         target_dir = _join_path(model_root, retrain_date)
-        save_bundle(target_dir, buy_models, sell_model)
+        save_rich_bundle(target_dir, buy_models, sell_model)
         meta_path = _join_path(target_dir, "metadata.json")
         _write_text_local_or_gcs(meta_path, json.dumps(meta, indent=2, ensure_ascii=False))
         all_metadata[retrain_date] = meta

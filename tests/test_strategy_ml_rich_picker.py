@@ -9,26 +9,33 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
-from types import SimpleNamespace
 
 from account.portfolio import Portfolio
 from account.position import Position
 from strategy.ml_rich_picker import (
     DAILY_FEATURE_COLUMNS,
-    FUNDAMENTAL_FEATURE_COLUMNS,
+    DEFAULT_MAX_REMAINING_DAYS,
     EVENT_FEATURE_COLUMNS,
+    FUNDAMENTAL_FEATURE_COLUMNS,
     POSITION_STATE_FEATURE_COLUMNS,
     RICH_BUY_FEATURE_COLUMNS,
     RICH_SELL_FEATURE_COLUMNS,
+    SELL_REGRESSION_FEATURE_COLUMNS,
+    SELL_REMAINING_DAYS_MODEL_NAME,
     MLRichPickerStrategy,
+    deterministic_optimal_remaining_days,
     deterministic_rich_score,
     deterministic_rich_sell_score,
+    remaining_days_to_prob_sell,
 )
 from strategy.ml_multi_horizon_picker.features import SELL_RISK_FEATURE_COLUMNS
-from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS, SELL_MODEL_NAME
+from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS
 from strategy.ml_multi_horizon_picker.strategy import MLMultiHorizonStrategy, PositionState
 
 
@@ -62,12 +69,24 @@ def test_rich_buy_feature_count():
 
 
 def test_rich_sell_feature_count():
-    """Sell 特征 39 维 = 30 + 5 + 4。"""
+    """[兼容] 旧 39 维 sell schema 保留供 sell_v1 binary 模型 fallback。"""
     assert len(RICH_SELL_FEATURE_COLUMNS) == 39
     # 前 30 维与 buy 一致，然后 5 维 sell-side 风险，最后 4 维持仓状态
     assert RICH_SELL_FEATURE_COLUMNS[:30] == RICH_BUY_FEATURE_COLUMNS
     assert RICH_SELL_FEATURE_COLUMNS[30:35] == SELL_RISK_FEATURE_COLUMNS
     assert RICH_SELL_FEATURE_COLUMNS[35:] == POSITION_STATE_FEATURE_COLUMNS
+
+
+def test_sell_regression_feature_count():
+    """Sell 回归模型 35 维 = 30 buy + 5 sell-side risk。"""
+    assert len(SELL_REGRESSION_FEATURE_COLUMNS) == 35
+    assert SELL_REGRESSION_FEATURE_COLUMNS[:30] == RICH_BUY_FEATURE_COLUMNS
+    assert SELL_REGRESSION_FEATURE_COLUMNS[30:] == SELL_RISK_FEATURE_COLUMNS
+    # 关键约束：sell 回归模型不能含 position state
+    for col in POSITION_STATE_FEATURE_COLUMNS:
+        assert col not in SELL_REGRESSION_FEATURE_COLUMNS, (
+            f"sell 回归模型不应包含 position state 列 {col}"
+        )
 
 
 def test_no_duplicate_features():
@@ -156,6 +175,16 @@ class _FailingModel:
         raise ValueError("dimension mismatch")
 
 
+class _PicklableTaggedModel:
+    """Module-level fake model（local class 无法 pickle，故移到模块顶层）。"""
+
+    def __init__(self, tag: str = "anonymous"):
+        self.tag = tag
+
+    def predict(self, X):
+        return np.zeros(len(X), dtype=float)
+
+
 def _rich_strategy_with_features(use_fallback: bool = False) -> MLRichPickerStrategy:
     codes = ["000001.SZ", "600000.SH"]
     strat = MLRichPickerStrategy(
@@ -206,7 +235,7 @@ def test_score_universe_allows_optional_buy_models_missing_without_fallback():
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
     strat._models.pop("buy_h10")
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
@@ -222,7 +251,7 @@ def test_score_universe_raises_when_decision_buy_model_missing_without_fallback(
     """正式 rich 模式：decision_horizon 的 buy 模型缺失必须失败。"""
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS if h != 5}
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
@@ -239,7 +268,7 @@ def test_score_universe_raises_when_sell_model_missing_without_fallback():
     class _FakeCtx:
         current_date = "20240102"
 
-    with pytest.raises(RuntimeError, match=f"{SELL_MODEL_NAME} 模型缺失"):
+    with pytest.raises(RuntimeError, match=f"{SELL_REMAINING_DAYS_MODEL_NAME} 模型缺失"):
         strat._score_universe(_FakeCtx())
 
 
@@ -248,7 +277,7 @@ def test_score_universe_raises_when_prediction_fails_without_fallback():
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
     strat._models["buy_h5"] = _FailingModel()
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
@@ -275,7 +304,7 @@ def test_score_universe_retains_features_for_parent_regime_breadth():
     """rich score_df 必须保留父类 regime 广度判断所需的可见特征。"""
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
@@ -295,7 +324,7 @@ def test_score_universe_uses_fixed_decision_horizon_score():
         "buy_h5": _ConstantModel(0.4),
         "buy_h10": _ConstantModel(0.8),
         "buy_h20": _ConstantModel(0.7),
-        SELL_MODEL_NAME: _ConstantModel(0.2),
+        SELL_REMAINING_DAYS_MODEL_NAME: _ConstantModel(0.2),
     }
 
     class _FakeCtx:
@@ -429,7 +458,7 @@ def test_score_universe_dynamic_liquidity_universe():
     strat._universe = codes
     strat._rich_features = features
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
@@ -464,7 +493,7 @@ def test_score_universe_scores_held_position_outside_dynamic_liquidity_top():
     strat._universe = codes
     strat._rich_features = features
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
     portfolio = Portfolio(100_000)
     pos = Position(code="000001.SZ", total_qty=100, sellable_qty=100, cost_price=10.0)
     pos._buy_records["20240101"] = 100
@@ -482,7 +511,7 @@ def test_score_universe_scores_held_position_outside_dynamic_liquidity_top():
 def test_score_universe_normalizes_hyphenated_current_date():
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel()
 
     out = strat._score_universe(SimpleNamespace(current_date="2024-01-02"))
 
@@ -781,7 +810,7 @@ def test_walk_forward_requires_decision_horizon_and_sell_model_bundle():
         object(),
         required_horizons=[10],
     ) == []
-    assert _missing_rich_model_components(complete, None) == [SELL_MODEL_NAME]
+    assert _missing_rich_model_components(complete, None) == [SELL_REMAINING_DAYS_MODEL_NAME]
 
 
 def test_buy_label_uses_next_open_execution_return():
@@ -864,3 +893,334 @@ def test_binary_auc_helper():
 
     assert _binary_auc(np.array([0, 0, 1, 1]), np.array([0.1, 0.2, 0.8, 0.9])) == pytest.approx(1.0)
     assert _binary_auc(np.array([1, 1]), np.array([0.1, 0.2])) is None
+
+
+# ──────────────────────────────────────────────────────────────
+# 新 sell 回归模型：optimal_remaining_days
+# ──────────────────────────────────────────────────────────────
+
+
+def test_optimal_remaining_days_uphill_picks_last_day():
+    """单调上涨行情：最佳卖出剩余天数应该接近 lookforward 上限。"""
+    from strategy.ml_rich_picker.walk_forward import (
+        _compute_optimal_remaining_days_per_group,
+    )
+
+    group = pd.DataFrame(
+        {
+            "date": [f"202401{i + 1:02d}" for i in range(15)],
+            "open": [10.0 + i * 0.5 for i in range(15)],   # 单调上涨
+            "low": [10.0 + i * 0.5 - 0.1 for i in range(15)],
+        }
+    )
+
+    labels = _compute_optimal_remaining_days_per_group(
+        group, lookforward=5, drawdown_threshold=-0.10,
+    )
+
+    # 第 0 行：T+1 进、T+6 出最赚 → label = 5（lookforward 上限）
+    assert labels.iloc[0] == pytest.approx(5.0)
+    # 第 5 行：往后 5 天仍单调涨 → 同样 5
+    assert labels.iloc[5] == pytest.approx(5.0)
+
+
+def test_optimal_remaining_days_downhill_picks_zero():
+    """单调下跌：立刻卖（k* = 0）。"""
+    from strategy.ml_rich_picker.walk_forward import (
+        _compute_optimal_remaining_days_per_group,
+    )
+
+    group = pd.DataFrame(
+        {
+            "date": [f"202401{i + 1:02d}" for i in range(15)],
+            "open": [20.0 - i * 0.5 for i in range(15)],   # 单调下跌
+            "low": [20.0 - i * 0.5 - 0.1 for i in range(15)],
+        }
+    )
+
+    labels = _compute_optimal_remaining_days_per_group(
+        group, lookforward=5, drawdown_threshold=-0.10,
+    )
+
+    # 任何起点都该立刻卖：未来都是亏的，best_return 维持 0、best_k=0
+    assert labels.iloc[0] == pytest.approx(0.0)
+    assert labels.iloc[5] == pytest.approx(0.0)
+
+
+def test_optimal_remaining_days_drawdown_truncates_window():
+    """中段触发风控阈值：搜索窗被截断，不会贪婪等下一个高点。"""
+    from strategy.ml_rich_picker.walk_forward import (
+        _compute_optimal_remaining_days_per_group,
+    )
+
+    # T 日 = 20240101，T+1 entry_open = 10.0：
+    #   k=0：exit=opens[2]=11，return=log(11/10)=0.095，min_low so far=9.8（dd=-2%）
+    #   k=1：exit=opens[3]=12，return=log(12/10)=0.182，min_low=9.8
+    #   k=2：exit=opens[4]=8（暴跌日），return=log(8/10)=-0.223，不更新 best
+    #   k=3：day_idx=4 → low=7.8 → running_min=7.8 → dd=-22% < -10% → break
+    # 所以 best_k = 1（k=1 时收益最大且未触发风控）
+    group = pd.DataFrame(
+        {
+            "date": ["20240101", "20240102", "20240103", "20240104",
+                     "20240105", "20240106", "20240107"],
+            "open": [9.5, 10.0, 11.0, 12.0, 8.0, 13.0, 14.0],
+            "low":  [9.0, 9.8, 10.5, 11.5, 7.8, 12.8, 13.7],
+        }
+    )
+
+    labels = _compute_optimal_remaining_days_per_group(
+        group, lookforward=5, drawdown_threshold=-0.10,
+    )
+
+    assert labels.iloc[0] == pytest.approx(1.0)
+
+
+def test_optimal_remaining_days_label_does_not_depend_on_holding_state():
+    """同一行的 label 不应被人为复制 4 份；每个 (date, code) 只一行样本。"""
+    from strategy.ml_rich_picker.walk_forward import (
+        _build_optimal_remaining_days_training_frame,
+    )
+
+    rows = []
+    for i in range(20):
+        rows.append({
+            "date": f"202401{i + 1:02d}",
+            "equity_code": "000001.SZ",
+            "open": 10.0 + i * 0.2,
+            "close": 10.1 + i * 0.2,
+            "high": 10.3 + i * 0.2,
+            "low": 9.9 + i * 0.2,
+        })
+
+    out = _build_optimal_remaining_days_training_frame(
+        pd.DataFrame(rows),
+        lookforward=5,
+        drawdown_threshold=-0.05,
+    )
+
+    # 每个 (date, code) 只产生一行，不再做 holding_day 样本复制
+    assert len(out) == len(rows)
+    assert "label_optimal_remaining_days" in out.columns
+    # label 是浮点天数，不再是 0/1 binary
+    valid = out["label_optimal_remaining_days"].dropna()
+    assert len(valid) > 0
+    assert (valid >= 0).all()
+    assert (valid <= 5).all()
+
+
+def test_deterministic_optimal_remaining_days_high_risk_means_few_days():
+    """deterministic fallback：高风险信号 → remaining_days 接近 0。"""
+    # 构造一个明显的"该卖"行：深度回撤 + 波动率扩张 + 龙虎榜净卖出
+    df = pd.DataFrame([{
+        "drawdown_from_high_20d": -0.20,
+        "vol_expansion": 3.0,
+        "rsi_overbought_streak": 10.0,
+        "return_5d": -0.10,
+        "debt_to_assets": 0.9,
+        "dragon_tiger_net_pct": -0.8,
+        "rsi_14": 85.0,
+        "return_20d": -0.15,
+        "main_net_inflow_pct": -0.5,
+        "dist_to_ma60": -0.20,
+    }])
+    out = deterministic_optimal_remaining_days(df, max_remaining_days=20.0)
+    assert out.iloc[0] < 5.0   # 风险大 → 强烈建议尽快卖
+
+
+def test_deterministic_optimal_remaining_days_low_risk_means_many_days():
+    """deterministic fallback：低风险 + 强势 → remaining_days 接近上限。"""
+    df = pd.DataFrame([{
+        "drawdown_from_high_20d": -0.01,
+        "vol_expansion": 0.8,
+        "rsi_overbought_streak": 0.0,
+        "return_5d": 0.05,
+        "debt_to_assets": 0.2,
+        "dragon_tiger_net_pct": 0.5,
+        "rsi_14": 55.0,
+        "return_20d": 0.20,
+        "main_net_inflow_pct": 0.6,
+        "dist_to_ma60": 0.15,
+    }])
+    out = deterministic_optimal_remaining_days(df, max_remaining_days=20.0)
+    assert out.iloc[0] > 12.0   # 良性环境 → 继续持有
+
+
+def test_deterministic_optimal_remaining_days_clipped_to_range():
+    """输出 clip 到 [0, max_remaining_days]。"""
+    df = pd.DataFrame([{}, {}, {}])   # 全空列
+    out = deterministic_optimal_remaining_days(df, max_remaining_days=10.0)
+    assert (out >= 0).all()
+    assert (out <= 10.0).all()
+
+
+def test_remaining_days_to_prob_sell_threshold_boundary():
+    """剩余天数 = threshold 时桥接的 prob_sell 应为 0.5。"""
+    rd = pd.Series([0.0, 1.0, 2.0, 5.0, 20.0])
+    prob = remaining_days_to_prob_sell(rd, threshold=1.0, sharpness=1.5)
+
+    # threshold 处恰好 0.5
+    assert prob.iloc[1] == pytest.approx(0.5, abs=1e-6)
+    # 小于 threshold（应该卖）→ prob 大
+    assert prob.iloc[0] > 0.5
+    # 大于 threshold（不卖）→ prob 小
+    assert prob.iloc[2] < 0.5
+    assert prob.iloc[3] < 0.2
+    assert prob.iloc[4] < 0.01
+
+
+def test_remaining_days_to_prob_sell_sharpness_effect():
+    """sharpness 越大越接近硬阈值。"""
+    rd = pd.Series([0.5, 1.5])   # threshold 两侧各 0.5
+    soft = remaining_days_to_prob_sell(rd, threshold=1.0, sharpness=0.5)
+    sharp = remaining_days_to_prob_sell(rd, threshold=1.0, sharpness=5.0)
+    # sharp 版的 0/1 分离更明显
+    assert (sharp.iloc[0] - sharp.iloc[1]) > (soft.iloc[0] - soft.iloc[1])
+
+
+def test_score_universe_outputs_predicted_remaining_days_column():
+    """新 sell 回归模型的输出列必须出现在 score_df 上。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    # 回归模型常数输出 3.0（"再持有 3 天"）
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel(3.0)
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+    assert out is not None
+    assert "predicted_remaining_days" in out.columns
+    assert "prob_sell" in out.columns
+    # 预测被 clip 到 [0, sell_max_remaining_days]，恒 3.0 不变
+    assert out["predicted_remaining_days"].between(0.0, 20.0).all()
+    assert np.allclose(out["predicted_remaining_days"].to_numpy(), 3.0)
+    # 桥接 prob_sell：3 > threshold(1) 显著大于 0 → prob_sell 偏低（不卖）
+    assert (out["prob_sell"] < 0.5).all()
+
+
+def test_score_universe_remaining_days_clipped_when_model_overshoots():
+    """模型预测超出 [0, max] 时也要被 clip 到合法范围。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    # 异常大的输出 100.0（远超 max=20）
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel(100.0)
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+    assert out is not None
+    assert np.allclose(out["predicted_remaining_days"].to_numpy(), 20.0)
+
+
+def test_score_universe_prob_sell_triggers_when_remaining_days_zero():
+    """remaining_days=0 → prob_sell 显著 > 0.5 → 父类 trigger 会卖。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _ConstantModel(0.0)
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    out = strat._score_universe(_FakeCtx())
+    assert out is not None
+    assert (out["prob_sell"] > 0.5).all()
+
+
+def test_score_universe_uses_sell_regression_features_not_position_state():
+    """sell 回归模型应该用 SELL_REGRESSION_FEATURE_COLUMNS (35 维)，
+    不应被传入 4 维 position state。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
+
+    seen_x_shapes = []
+
+    class _DimSpyModel:
+        def predict(self, X):
+            seen_x_shapes.append(X.shape)
+            return np.full(len(X), 3.0)
+
+    strat._models[SELL_REMAINING_DAYS_MODEL_NAME] = _DimSpyModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    strat._score_universe(_FakeCtx())
+    # 应该是 (n_codes, 35)
+    assert len(seen_x_shapes) == 1
+    n_rows, n_cols = seen_x_shapes[0]
+    assert n_cols == 35, f"sell 模型应该收到 35 维特征，实际 {n_cols}"
+
+
+def test_train_lgbm_with_quality_regression_uses_rank_ic_gate():
+    """sell 回归模型走 Spearman rank IC 闸门，buy 走 AUC 闸门。"""
+    from strategy.ml_rich_picker.walk_forward import _train_lgbm_with_quality
+
+    # 构造一个易学的回归：y = X[:, 0] * 2 + noise
+    rng = np.random.RandomState(7)
+    n = 600
+    X = rng.randn(n, 5)
+    y_reg = X[:, 0] * 2.0 + rng.randn(n) * 0.1
+    cfg = SimpleNamespace(
+        lightgbm_params={
+            "num_boost_round": 30,
+            "early_stopping_rounds": 5,
+            "verbose": -1,
+        },
+        min_buy_auc=0.55,
+        min_sell_rank_ic=0.10,
+    )
+    model, metrics = _train_lgbm_with_quality(
+        X[:400], y_reg[:400], X[400:], y_reg[400:], cfg,
+        SELL_REMAINING_DAYS_MODEL_NAME,
+    )
+    assert model is not None
+    assert metrics["quality_pass"] is True
+    assert "valid_rank_ic" in metrics
+    assert "valid_mae" in metrics
+    assert metrics["objective"] == "regression_l1"
+
+
+def test_spearman_corr_helper():
+    """无 scipy 的 Spearman 相关系数：单调关系 → 1.0。"""
+    from strategy.ml_rich_picker.walk_forward import _spearman_corr
+
+    rho = _spearman_corr(
+        np.array([1.0, 2.0, 3.0, 4.0, 5.0]),
+        np.array([10.0, 20.0, 30.0, 40.0, 50.0]),
+    )
+    assert rho == pytest.approx(1.0)
+
+    rho_inv = _spearman_corr(
+        np.array([1.0, 2.0, 3.0, 4.0, 5.0]),
+        np.array([50.0, 40.0, 30.0, 20.0, 10.0]),
+    )
+    assert rho_inv == pytest.approx(-1.0)
+
+    # 极小样本返回 None
+    assert _spearman_corr(np.array([1.0, 2.0]), np.array([1.0, 2.0])) is None
+
+
+def test_rich_bundle_save_load_round_trip(tmp_path):
+    """save_rich_bundle / load_rich_bundle 圆环：sell 走新名字 sell_remaining_days_v1。"""
+    from strategy.ml_rich_picker.model_storage import (
+        save_rich_bundle,
+        load_rich_bundle,
+        sell_remaining_days_path,
+    )
+
+    buy_models = {h: _PicklableTaggedModel(f"buy_h{h}") for h in BUY_HORIZONS}
+    sell_model = _PicklableTaggedModel("sell_regression")
+
+    save_rich_bundle(str(tmp_path), buy_models, sell_model)
+
+    # sell_remaining_days_v1.pkl 必须存在
+    expected = sell_remaining_days_path(str(tmp_path))
+    assert Path(expected).exists()
+
+    loaded = load_rich_bundle(str(tmp_path), horizons=BUY_HORIZONS)
+    assert loaded[SELL_REMAINING_DAYS_MODEL_NAME] is not None
+    assert loaded[SELL_REMAINING_DAYS_MODEL_NAME].tag == "sell_regression"
+    for h in BUY_HORIZONS:
+        assert loaded[f"buy_h{h}"] is not None
+        assert loaded[f"buy_h{h}"].tag == f"buy_h{h}"

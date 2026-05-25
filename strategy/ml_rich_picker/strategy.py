@@ -4,11 +4,19 @@
 
 - 特征加载：initialize 时预拉取整个回测期 + warmup 的 rich features 宽表，
   按 (date, equity_code) 建索引；handle_data 时 O(1) 查表
-- 推理特征列：30 维 buy / 39 维 sell（含基本面 + 资金流 + 持仓状态）
+- 推理特征列：30 维 buy / 35 维 sell（回归 ``optimal_remaining_days``，不含
+  持仓状态）
 
 其余逻辑（regime / 走步切换 / trading_permissions 过滤）继承自父类；
 sell trigger 使用当前持仓决策口径：不做 h5 到期硬卖，仅用更长
 max_hold_days 作为异常兜底。
+
+Sell 模型语义说明（修法 3）：
+- 模型输出 ``predicted_remaining_days`` ∈ [0, sell_lookforward]，表示
+  「从今天起还应该持有多少个交易日（风险可控的最优卖出窗口）」
+- 父类 sell trigger 仍然用 ``prob_sell > sell_threshold`` 判断，rich 这里
+  把 ``predicted_remaining_days`` 通过 sigmoid 桥接到 ``prob_sell``，
+  保留父类逻辑无需改动
 """
 
 from __future__ import annotations
@@ -20,18 +28,26 @@ import pandas as pd
 
 from strategy.base_strategy import Context
 from strategy.ml_multi_horizon_picker.strategy import MLMultiHorizonStrategy
-from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS, SELL_MODEL_NAME
+from strategy.ml_multi_horizon_picker.model_registry import ModelRegistry
+from strategy.ml_multi_horizon_picker.model_storage import BUY_HORIZONS
 from strategy.ml_multi_horizon_picker.tradable import filter_codes
 
 from strategy.ml_rich_picker.features import (
     DAILY_FEATURE_COLUMNS,
-    FUNDAMENTAL_FEATURE_COLUMNS,
+    DEFAULT_MAX_REMAINING_DAYS,
     EVENT_FEATURE_COLUMNS,
+    FUNDAMENTAL_FEATURE_COLUMNS,
     POSITION_STATE_FEATURE_COLUMNS,
     RICH_BUY_FEATURE_COLUMNS,
     RICH_SELL_FEATURE_COLUMNS,
+    SELL_REGRESSION_FEATURE_COLUMNS,
+    deterministic_optimal_remaining_days,
     deterministic_rich_score,
-    deterministic_rich_sell_score,
+    remaining_days_to_prob_sell,
+)
+from strategy.ml_rich_picker.model_storage import (
+    SELL_REMAINING_DAYS_MODEL_NAME,
+    load_rich_bundle,
 )
 from utils.logger import get_logger
 
@@ -48,7 +64,14 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
        handle_data 时 O(1) 查表，无需每只股票循环。
 
     2. **特征维度**：buy 30 维（17 daily + 8 fundamental + 5 event），
-       sell 39 维（30 + 5 sell-side 风险特征 + 4 持仓状态特征）。
+       sell 35 维（30 + 5 sell-side 风险特征）。
+
+    3. **Sell 模型语义**：从父类的 binary ``prob_sell`` 改为回归
+       ``predicted_remaining_days``——预测未来若干天内风险可控的最优
+       卖出剩余天数。父类 sell trigger 继续用 ``prob_sell > threshold``，
+       rich 这里把 ``predicted_remaining_days`` 通过 sigmoid 桥接到
+       ``prob_sell``，无需改父类逻辑。持仓状态特征不进入 sell 模型，
+       只在策略层 trigger 时作为辅助判断。
 
     其余（regime / 走步切换）复用父类；sell trigger 使用当前持仓决策口径，
     不再按 h5/expected_horizon 到期硬卖。
@@ -57,6 +80,7 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
     # 类常量
     RICH_BUY_FEATURE_COLUMNS = RICH_BUY_FEATURE_COLUMNS
     RICH_SELL_FEATURE_COLUMNS = RICH_SELL_FEATURE_COLUMNS
+    SELL_REGRESSION_FEATURE_COLUMNS = SELL_REGRESSION_FEATURE_COLUMNS
 
     def __init__(
         self,
@@ -68,6 +92,9 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         require_rich_features: bool = True,
         decision_horizon: int = 5,
         max_hold_days: Optional[int] = 20,
+        sell_remaining_days_threshold: float = 1.0,
+        sell_remaining_days_sharpness: float = 1.5,
+        sell_max_remaining_days: float = DEFAULT_MAX_REMAINING_DAYS,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -88,6 +115,12 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
             if max_hold_days is not None and int(max_hold_days) > 0
             else None
         )
+        # Sell 回归模型 → prob_sell 桥接参数
+        # predicted_remaining_days <= sell_remaining_days_threshold 视为应卖
+        # sharpness 越大越接近硬阈值（默认 1.5 适中平滑）
+        self.sell_remaining_days_threshold = float(sell_remaining_days_threshold)
+        self.sell_remaining_days_sharpness = float(sell_remaining_days_sharpness)
+        self.sell_max_remaining_days = float(sell_max_remaining_days)
         # 预加载的富特征宽表，indexed by (date, equity_code)
         self._rich_features: Optional[pd.DataFrame] = None
         self._rich_features_index: Optional[pd.MultiIndex] = None
@@ -103,8 +136,24 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
     # ──────────────────────────────────────────────────────────────
 
     def initialize(self, context: Context) -> None:
-        """父类初始化。Rich features 预加载推迟到 before_trading_start。"""
+        """父类初始化。Rich features 预加载推迟到 before_trading_start。
+
+        覆盖父类的传统模型加载：用 ``load_rich_bundle`` 拿新的 sell 回归模型
+        （文件名 ``sell_remaining_days_v1.pkl``），而不是父类的 binary
+        ``sell_v1.pkl``。
+        """
         super().initialize(context)
+        # 父类 initialize 在 _model_registry_path 为 None 时已经走 load_bundle 加载
+        # 了一组父类的 binary sell_v1.pkl。这对 rich 不适用——rich 用回归模型，
+        # 重新覆盖加载结果。
+        if self._model_registry is None and self.model_dir:
+            try:
+                self._models = load_rich_bundle(self.model_dir, horizons=BUY_HORIZONS)
+                self._current_model_dir = self.model_dir
+                logger.info(f"rich 模型加载完成: {self.model_dir}")
+            except Exception as exc:
+                logger.warning(f"rich 模型加载失败: {exc}（继续初始化，运行时再判断）")
+
         if self.universe_source == "liquidity_top" and not self._explicit_universe:
             broad_universe = self._load_broad_trading_universe(context)
             if broad_universe:
@@ -115,6 +164,19 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                     f"每日按近 {self.liquidity_lookback_days} 日成交额取 Top{self.liquidity_top_n}"
                 )
         # 不在这里调 _preload_rich_features —— 此时 context.all_bars 未注入
+
+    def _maybe_switch_model(self, current_date: str) -> bool:
+        """覆盖父类：走步模式下用 ``load_rich_bundle`` 加载 rich 模型。"""
+        if self._model_registry is None:
+            return True  # 传统模式（已在 initialize 加载）直接放行
+        target_dir = self._model_registry.find_for_date(current_date)
+        if target_dir is None:
+            return False
+        if target_dir != self._current_model_dir:
+            self._models = load_rich_bundle(target_dir, horizons=BUY_HORIZONS)
+            self._current_model_dir = target_dir
+            logger.info(f"{current_date} 切换到 rich 模型 {target_dir}")
+        return True
 
     def _load_broad_trading_universe(self, context: Context) -> List[str]:
         """返回预加载用宽股票池；实际交易池在每日打分时动态收敛。"""
@@ -515,12 +577,14 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                 raise RuntimeError(f"{current_date} daily 特征完整的 rich 截面为空")
             return None
         today_df = today_df.reset_index(drop=True)
+        # 持仓状态特征只用于诊断 / 策略层 trigger 合成，不再喂给 sell 模型。
+        # 但保留写入 today_df / score_df 方便 _last_score_df 输出 / 单测验证。
         position_features = self._position_state_features(context, today_df)
         for col in POSITION_STATE_FEATURE_COLUMNS:
             today_df[col] = position_features[col].astype(float).to_numpy()
 
         X_buy = today_df[RICH_BUY_FEATURE_COLUMNS].values
-        X_sell = today_df[RICH_SELL_FEATURE_COLUMNS].values
+        X_sell_reg = today_df[SELL_REGRESSION_FEATURE_COLUMNS].values
 
         # 保留当日可见特征列，供父类 regime 市场广度/危机判断复用。
         score_df = today_df[["equity_code"] + RICH_BUY_FEATURE_COLUMNS].rename(
@@ -555,28 +619,48 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                     f"buy_h{h} 模型缺失，且 use_deterministic_fallback=False"
                 )
 
-        # 预测 sell
-        sell_model = self._models.get(SELL_MODEL_NAME)
+        # ── 预测 sell（回归 optimal_remaining_days）──
+        # 输出列：
+        #   predicted_remaining_days  原始回归预测，clip 到 [0, sell_max_remaining_days]
+        #   prob_sell                父类 sell trigger 用，sigmoid 桥接
+        sell_model = self._models.get(SELL_REMAINING_DAYS_MODEL_NAME)
+        remaining_days_series: pd.Series
         if sell_model is not None:
             try:
-                score_df["prob_sell"] = self._squash_to_prob(sell_model.predict(X_sell))
+                raw_pred = np.asarray(sell_model.predict(X_sell_reg), dtype=float)
+                remaining_days_series = pd.Series(raw_pred, index=today_df.index)
             except Exception as exc:
                 if not self.use_deterministic_fallback:
                     raise RuntimeError(
-                        "sell 模型预测失败，且 use_deterministic_fallback=False"
+                        "sell 回归模型预测失败，且 use_deterministic_fallback=False"
                     ) from exc
-                logger.warning(f"sell 预测失败，降级 fallback: {exc}")
-                score_df["prob_sell"] = deterministic_rich_sell_score(
-                    today_df[RICH_SELL_FEATURE_COLUMNS]
-                ).to_numpy()
+                logger.warning(f"sell 回归预测失败，降级 fallback: {exc}")
+                remaining_days_series = deterministic_optimal_remaining_days(
+                    today_df[SELL_REGRESSION_FEATURE_COLUMNS],
+                    max_remaining_days=self.sell_max_remaining_days,
+                )
         elif self.use_deterministic_fallback:
-            score_df["prob_sell"] = deterministic_rich_sell_score(
-                today_df[RICH_SELL_FEATURE_COLUMNS]
-            ).to_numpy()
+            remaining_days_series = deterministic_optimal_remaining_days(
+                today_df[SELL_REGRESSION_FEATURE_COLUMNS],
+                max_remaining_days=self.sell_max_remaining_days,
+            )
         else:
             raise RuntimeError(
-                f"{SELL_MODEL_NAME} 模型缺失，且 use_deterministic_fallback=False"
+                f"{SELL_REMAINING_DAYS_MODEL_NAME} 模型缺失，"
+                "且 use_deterministic_fallback=False"
             )
+
+        # clip 到 [0, sell_max_remaining_days]，防止极端预测搞乱 trigger
+        remaining_days_series = remaining_days_series.clip(
+            lower=0.0, upper=self.sell_max_remaining_days
+        )
+        score_df["predicted_remaining_days"] = remaining_days_series.to_numpy()
+        # 桥接到父类 prob_sell（>= sell_threshold 触发卖出）
+        score_df["prob_sell"] = remaining_days_to_prob_sell(
+            remaining_days_series,
+            threshold=self.sell_remaining_days_threshold,
+            sharpness=self.sell_remaining_days_sharpness,
+        ).to_numpy()
 
         # 不跨 horizon 比较原始概率；交易排序固定用一个决策 horizon。
         score_df["score"] = score_df[f"prob_up_h{self.decision_horizon}"]

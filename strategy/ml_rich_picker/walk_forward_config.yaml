@@ -72,4 +72,7 @@ data:
 validation:
   valid_days: 60
   min_buy_auc: 0.52
+  # 新 sell 回归模型用 Spearman rank IC 做质量闸门；>= 0.05 视为有效信号
+  min_sell_rank_ic: 0.05
+  # 旧 binary sell 阈值（保留以便向后兼容；当前未使用）
   min_sell_auc: 0.52
