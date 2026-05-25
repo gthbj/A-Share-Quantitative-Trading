@@ -60,6 +60,7 @@ class BacktestEngine:
         comparison_benchmarks: Optional[Dict[str, str]] = None,
         daily_candidate_top_n: int = 10,
         early_stop_excess_vs_hs300: Optional[float] = None,
+        bar_adjust: Optional[str] = "none",
     ) -> None:
         self.strategy_cls = strategy_cls
         self.data_source = data_source
@@ -77,6 +78,7 @@ class BacktestEngine:
         self.comparison_benchmarks: Dict[str, str] = comparison_benchmarks or {}
         self.daily_candidate_top_n = max(int(daily_candidate_top_n), 0)
         self.early_stop_excess_vs_hs300 = early_stop_excess_vs_hs300
+        self.bar_adjust = bar_adjust if bar_adjust in ("qfq", "hfq") else "none"
 
         # 校验止损阈值
         if self.stop_loss_enabled and self.stop_loss_threshold <= 0:
@@ -667,9 +669,15 @@ class BacktestEngine:
         end = trading_days[-1].strftime("%Y%m%d")
         logger.info(
             f"预加载行情数据: {start} ~ {end}, period={self.frequency}, "
-            f"lookback_days={lookback_days}"
+            f"lookback_days={lookback_days}, adjust={self.bar_adjust}"
         )
-        return self.data_source.get_multi_bars(codes, start, end, period=self.frequency)
+        return self.data_source.get_multi_bars(
+            codes,
+            start,
+            end,
+            period=self.frequency,
+            adjust=self.bar_adjust,
+        )
 
     def _load_comparison_benchmarks(
         self,

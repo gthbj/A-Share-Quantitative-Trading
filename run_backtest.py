@@ -279,6 +279,8 @@ def main() -> int:
         or global_bt.get("frequency", "daily")
     )
     benchmark = preset_bt.get("benchmark") or global_bt.get("benchmark", "000300.SH")
+    data_cfg = cfg.get("data", {}) or {}
+    bar_adjust = data_cfg.get("execution_adjust_type", "none")
     stop_loss_cfg = cfg.get("stop_loss", {})
 
     # 用配置文件构造撮合引擎（佣金/印花税/滑点/撮合规则等）
@@ -311,6 +313,7 @@ def main() -> int:
         benchmark=benchmark,
         trade_engine=trade_engine,
         frequency=frequency,
+        bar_adjust=bar_adjust,
         stop_loss_enabled=stop_loss_cfg.get("enabled", False),
         stop_loss_threshold=stop_loss_cfg.get("threshold", 0.05),
         strategy_kwargs=strategy_kwargs,

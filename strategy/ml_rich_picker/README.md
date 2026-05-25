@@ -6,8 +6,8 @@
 |---|---|---|
 | Buy 特征 | 17（日线技术）| **30**（17 daily + 8 fundamental + 5 event）|
 | Sell 特征 | 22（17 + 5 risk）| **39**（30 + 5 risk + 4 position state）|
-| 数据源表 | 1（`dws_equity_daily_features`）| **3**（+ `dws_equity_fundamental_features`, `dws_equity_event_money_flow_features_1d`）|
-| 模型架构 | 4 horizon buy + 1 sell | **同**（完全继承）|
+| 数据源表 | 1（`dws_equity_daily_features`）| **daily + fundamental + moneyflow/龙虎榜/KPL 明细** |
+| 模型架构 | 4 horizon buy + 1 sell | **交易只要求 decision_horizon buy（默认 h5）+ sell；其他 horizon 可训练作诊断** |
 | Sell 触发 | 止损/追踪止盈/排名/prob 兜底/sell 模型/max_hold 兜底 | **继承新持仓决策口径：无 h5 到期硬卖** |
 | Regime 调制 | bull/neutral/bear | **同**（完全继承）|
 
@@ -57,7 +57,7 @@ python -m strategy.ml_rich_picker.walk_forward \
 ./deploy/cloud_run_walk_forward_rich/run.sh
 ```
 
-输出：`models/walk_forward_rich/{YYYYMMDD}/{buy_h1,buy_h5,buy_h10,buy_h20,sell_v1}.pkl`
+输出：`models/walk_forward_rich/{YYYYMMDD}/{buy_h5,sell_v1}.pkl` 为正式交易必需；`buy_h1/buy_h10/buy_h20` 可同时训练保存作诊断，不再阻塞回测。
 
 ### 2. 回测
 
@@ -67,7 +67,7 @@ python run_backtest.py --preset ml_rich_picker \
 ```
 
 策略 `initialize` 会一次性预拉取整个回测期 + 60 天 warmup 的富特征宽表
-（3 表 JOIN），handle_data 时 O(1) 查表打分。**比 v1 推理快 10-20 倍**
+（BigQuery JOIN），handle_data 时 O(1) 查表打分。**比 v1 推理快 10-20 倍**
 （v1 每天 500 股 × context.get_price 调用；v2 一次 BQ 拉完）。
 
 ### 3. 与 v1 A/B 对比
@@ -111,8 +111,7 @@ v2 在 initialize 里一次拉 5 年 × 500 股的全部特征（约 30 MB），
 
 ### 不重新训练 sell 模型？
 
-sell 模型使用 rich sell 特征（39 维输入，含持仓状态特征）重新训练。
-所以 sell 模型有自己的 .pkl，与 v1 模型不冲突。
+sell 模型使用 rich sell 特征（39 维输入，含持仓状态特征）重新训练。标签同时覆盖未来不可接受回撤与同日截面底部收益，定位为“继续持仓是否不划算”的持仓决策模型，而不是单纯止损模型。
 
 ---
 

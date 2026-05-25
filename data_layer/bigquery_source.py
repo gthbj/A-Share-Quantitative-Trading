@@ -359,7 +359,18 @@ class BigQueryDataSource(BaseDataSource):
             logger.info("账户权限过滤：跳过 %s 个不可交易标的", blocked_count)
         return allowed
 
-    def _security_permission_filter_sql(self, alias: str = "s") -> str:
+    @staticmethod
+    def _cache_code_key(code: str, adjust: Optional[str]) -> str:
+        """本地 K 线缓存 key：完整代码 + 复权口径，避免 qfq/none/hfq 串缓存。"""
+        safe_code = str(code).replace("/", "_").replace(".", "_")
+        adjust_type = adjust if adjust in ("qfq", "hfq") else "none"
+        return f"{safe_code}_{adjust_type}"
+
+    def _security_permission_filter_sql(
+        self,
+        alias: str = "s",
+        use_current_name_lifecycle_filters: bool = True,
+    ) -> str:
         """生成基于 dim_security 的账户权限过滤 SQL。"""
         conditions: List[str] = []
 
@@ -397,11 +408,17 @@ class BigQueryDataSource(BaseDataSource):
                     f"COALESCE({alias}.market_type, '') NOT LIKE '%全国股转%'",
                 ]
             )
-        if not self._permission_enabled("allow_risk_warning"):
+        if (
+            use_current_name_lifecycle_filters
+            and not self._permission_enabled("allow_risk_warning")
+        ):
             conditions.append(
                 f"NOT REGEXP_CONTAINS(UPPER(COALESCE({alias}.security_name, '')), r'\\*?ST')"
             )
-        if not self._permission_enabled("allow_delisting"):
+        if (
+            use_current_name_lifecycle_filters
+            and not self._permission_enabled("allow_delisting")
+        ):
             conditions.extend(
                 [
                     f"COALESCE({alias}.security_name, '') NOT LIKE '%退%'",
@@ -462,17 +479,17 @@ class BigQueryDataSource(BaseDataSource):
             logger.info("账户权限过滤：跳过不可交易标的 %s", code)
             return pd.DataFrame()
 
-        norm_code = code.split(".")[0]
+        cache_code = self._cache_code_key(code, adjust)
 
         # 1) 本地缓存优先
         if self.use_cache:
-            cached_full = self.storage.load_bars_raw(norm_code, period=period)
+            cached_full = self.storage.load_bars_raw(cache_code, period=period)
             if not cached_full.empty and "date" in cached_full.columns:
                 cmin = str(cached_full["date"].min())
                 cmax = str(cached_full["date"].max())
                 if cmin <= str(start_date) and cmax >= str(end_date):
                     df = self.storage.load_bars(
-                        norm_code, start_date, end_date, period=period
+                        cache_code, start_date, end_date, period=period
                     )
                     return df
 
@@ -489,14 +506,14 @@ class BigQueryDataSource(BaseDataSource):
 
         # 3) 写缓存
         if self.use_cache:
-            existing = self.storage.load_bars_raw(norm_code, period=period)
+            existing = self.storage.load_bars_raw(cache_code, period=period)
             if not existing.empty:
                 combined = pd.concat([existing, df], ignore_index=True)
                 combined = combined.drop_duplicates(subset=["date"], keep="last")
                 combined = combined.sort_values("date").reset_index(drop=True)
-                self.storage.save_bars(norm_code, combined, period=period)
+                self.storage.save_bars(cache_code, combined, period=period)
             else:
-                self.storage.save_bars(norm_code, df, period=period)
+                self.storage.save_bars(cache_code, df, period=period)
 
         # 4) 按请求区间过滤并返回
         if period == "daily":
@@ -507,26 +524,53 @@ class BigQueryDataSource(BaseDataSource):
             )
         return df.loc[mask].copy().reset_index(drop=True)
 
-    def get_stock_list(self) -> pd.DataFrame:
+    def get_stock_list(
+        self,
+        as_of_date: Optional[str] = None,
+        include_inactive: bool = False,
+    ) -> pd.DataFrame:
         """从 dim_security 获取股票列表。
 
         返回列：[code, name, list_date, industry]
+        as_of_date 指定时按该日期判断上市/退市；include_inactive=True 时返回全历史股票池。
         权限配置会过滤当前账户不可交易的专项板块股票。
         """
-        permission_sql = self._security_permission_filter_sql("s")
-        use_stock_list_cache = self.use_cache and permission_sql == "TRUE"
+        use_current_name_filters = not include_inactive and not as_of_date
+        permission_sql = self._security_permission_filter_sql(
+            "s",
+            use_current_name_lifecycle_filters=use_current_name_filters,
+        )
+        use_stock_list_cache = (
+            self.use_cache
+            and permission_sql == "TRUE"
+            and not include_inactive
+            and not as_of_date
+        )
         if use_stock_list_cache:
             cached = self.storage.load_stock_list()
             if not cached.empty:
                 return cached
 
         table = self._require_table("dim_security")
+        where = [
+            "s.security_type = 'stock'",
+            permission_sql,
+        ]
+        if as_of_date:
+            as_of = self._to_date_literal(as_of_date)
+            where.extend(
+                [
+                    f"(s.list_date IS NULL OR s.list_date <= DATE '{as_of}')",
+                    f"(s.delist_date IS NULL OR s.delist_date > DATE '{as_of}')",
+                ]
+            )
+        elif not include_inactive:
+            where.append("s.is_active = TRUE")
+        where_sql = " AND ".join(where)
         sql = (
             f"SELECT security_code, security_name, list_date\n"
             f"FROM `{self.project_id}.{self.dataset}.{table}` AS s\n"
-            f"WHERE s.security_type = 'stock'\n"
-            f"  AND s.is_active = TRUE\n"
-            f"  AND {permission_sql}\n"
+            f"WHERE {where_sql}\n"
             f"ORDER BY security_code"
         )
         df = self._execute_sql(sql)
@@ -584,7 +628,10 @@ class BigQueryDataSource(BaseDataSource):
             return []
 
         pm_list = ", ".join(str(pm) for pm in partition_months)
-        permission_sql = self._security_permission_filter_sql("s")
+        permission_sql = self._security_permission_filter_sql(
+            "s",
+            use_current_name_lifecycle_filters=False,
+        )
         adjust_type = adjust if adjust in ("qfq", "hfq") else "none"
         min_observations = min(5, lookback_days)
         sql = f"""
@@ -601,7 +648,8 @@ WITH liquidity AS (
     AND k.date >= DATE '{start.strftime("%Y-%m-%d")}'
     AND k.date < DATE '{as_of.strftime("%Y-%m-%d")}'
     AND s.security_type = 'stock'
-    AND s.is_active = TRUE
+    AND (s.list_date IS NULL OR s.list_date <= DATE '{end.strftime("%Y-%m-%d")}')
+    AND (s.delist_date IS NULL OR s.delist_date > DATE '{as_of.strftime("%Y-%m-%d")}')
     AND {permission_sql}
   GROUP BY k.equity_code
   HAVING observation_count >= {min_observations}

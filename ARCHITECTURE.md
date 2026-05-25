@@ -279,10 +279,10 @@ context.order(code, target_qty - current_qty)
 **实现要点**：
 - `BigQueryDataSource` 实现 `BaseDataSource` 全部三个抽象方法。
 - `BigQueryDataSource` 额外提供可选 DWS/ADS helper：`get_equity_feature_snapshot(codes, date, feature_set)` 供回测调仓日读取截面特征；`get_equity_feature_history(codes, start, end, feature_set, label_horizon)` 供 ML 训练脚本读取增强特征并生成训练标签；`get_bqml_signal_candidates(start_date, end_date, table_name, candidate_pool_size)` 供 BQML ADS 信号策略读取候选池。这些方法不属于 `BaseDataSource` 抽象接口。
-- `BigQueryDataSource` 接收 `trading_permissions` 配置；`get_stock_list()` 和 `get_bqml_signal_candidates()` 会 join / 查询 `dwd_dim_security` 并过滤当前账户无权限标的，`get_bars()` / `get_multi_bars()` 也会用代码前缀拦截直接传入的北交所、科创板、创业板股票。
+- `BigQueryDataSource` 接收 `trading_permissions` 配置；`get_stock_list(as_of_date=...)` 可按上市/退市日期返回指定信号日可交易股票，`include_inactive=True` 可返回全历史股票池供 rich 预加载使用；历史 as-of 模式不使用当前 `security_name` 的 ST/退市字样过滤，避免幸存者偏差，严格 ST PIT 过滤需后续接入历史 ST 状态；`get_bqml_signal_candidates()` 会 join `dwd_dim_security` 并过滤当前账户无权限标的，`get_bars()` / `get_multi_bars()` 也会用代码前缀拦截直接传入的北交所、科创板、创业板股票。
 - `BigQueryDataSource.get_multi_bars(codes, start, end, period="daily")` 对股票日线走 BigQuery 批量查询，减少 ADS 候选池回测时的串行 per-code 查询开销；其他周期或资产类型仍回退到逐标的 `get_bars()`。
 - 连接懒加载，凭据通过 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `config/secrets.yaml`（gitignored）注入；本地开发可设置 `ASHARE_USE_GCLOUD_ACCESS_TOKEN=1` 临时复用 `gcloud auth print-access-token`。
-- 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费。
+- 本地 Parquet 缓存与清理策略由 `data.cache.retention_days` / `data.cache.max_size_gb` 控制，避免重复查询计费；K 线缓存 key 包含完整证券代码与 `adjust_type`，避免 `qfq/none/hfq` 串缓存。
 - `maxcompute_source.py`、`akshare_source.py` 与 `tushare_source.py` 保留但不再被 `run_backtest.py` 默认装载，以便后续按需切换。
 - GCS 到 BigQuery 的 ODS 接入由 `gcs_to_bigquery/pipeline.py` 负责，包括 manifest、ODS external table 创建、ODS audit 和历史 staging/load 兼容命令。
 - 新增 raw 到标准化 Parquet 的 VM 处理仍由 `data_transfer/prepare_parquet_to_gcs.py` 负责。`sync-raw` 命令只读 GCS raw，并按 per-prefix suffix 规则同步到 `/mnt/localssd/raw_incremental/...`，随后复用 `build` / `upload` / `audit` 命令生成并上传 month-partitioned Parquet；普通指数日/周/月 K 线全量和普通指数日线增量已从新增 raw 任务中排除，避免与现有 `fact_index_kline_*` 重复。
@@ -341,7 +341,7 @@ context.order(code, target_qty - current_qty)
 
 1. **代码格式统一**：BigQuery 表内直接使用框架标准格式 `XXXXXX.SH` / `XXXXXX.SZ` / `XXXXXX.BJ`，**无需像 MaxCompute 那样做 shXXXXXX 双向映射**。股票事实表使用 `equity_code`，指数事实表使用 `index_code`；指数代码中 `000/930/932/950` 前缀归一为 `.SH`，`399` 前缀归一为 `.SZ`。
 2. **分区裁剪**：`get_bars()` 根据请求的 `[start_date, end_date]` 计算覆盖的 `partition_month` 列表（`_partition_months_in_range()`），SQL 中以 `partition_month IN (202001, 202002, ...)` 触发分区裁剪。**不裁剪则全表扫描，查询成本显著增加。**
-3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。若 ODS 贴源字段暂未提供复权口径，DWD 转换不得伪造 qfq/hfq；第一版只能安全生成 `none` 或明确来源可验证的复权类型。
+3. **复权字段约定**：目标日K表通过 `adjust_type` 字段区分 none/qfq/hfq。回测撮合、资金、费用与 NAV 默认使用 `data.execution_adjust_type: none`；策略训练/特征可单独使用 qfq。当前 BigQuery qfq 只能说明数据口径，不能单独证明 point-in-time；若要严格 PIT，需要补采 Tushare `stk_factor` 快照或按 `daily none + adj_factor` 自建 as-of 复权序列。
 4. **资产类型自动路由**：`BigQueryDataSource._resolve_kline_table()` 根据代码前缀自动判断：
    - ETF/LOF（51/56/58/11.SH, 15/16.SZ）→ `fact_fund_kline_1d`
    - 指数（000/399/930/950 前缀）→ `fact_index_kline_1d`
@@ -636,6 +636,7 @@ handle_data → Context.limit_order / stop_order
 编辑 `config/backtest.yaml`：
 - `trading.commission_rate`：佣金费率；当前默认万一（`0.0001`）
 - `trading.min_commission`：最低佣金；当前默认免五（`0.0`）
+- `data.execution_adjust_type`：回测撮合 / NAV 行情复权口径；当前默认 `none`
 - `slippage.value`：滑点大小
 - `execution.price_type`：`next_open` 或 `current_close`
 - `stop_loss.enabled`：是否启用全局止损
@@ -678,8 +679,8 @@ handle_data → Context.limit_order / stop_order
 | `strategy/multi_factor.py` | 单文件 | 多因子选股策略示例 |
 | `strategy/intraday_ma.py` | 单文件 | 日内双均线策略示例 |
 | `strategy/ml_stock_picker/` | 实验包 | 单模型 LightGBM 选股（5 日固定调仓 + Top-K，无止损/regime）|
-| `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/13/14/15/16、PRD_20260525_01）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + 6 卖出触发；regime 由沪深300趋势/动量/回撤/波动 + 股票池市场广度共同判定，并直接约束风险预算，默认 bull 最多 5 只/85% 资金、neutral 最多 3 只/45% 资金、bear 0 只/0% 资金且清掉可卖持仓；支持走步重训（walk_forward.py / model_registry.py）、可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）、**Cloud Run 并行训练**（build_registry.py + deploy/cloud_run_walk_forward/），并可在回测 preset 中直接读取 `gs://data-aquarium/models/walk_forward/registry.json`；模型按 `train_end_date < current_date` 生效，月末训练模型从下一交易日开始使用；未显式指定 universe 时按回测首日前近 60 日成交额初始化 Top 500 股票池 |
-| `strategy/ml_rich_picker/` | 实验包 | **富特征 ML 策略**（PRD_20260525_03）：继承 ml_multi_horizon，特征从 17 维扩展到 30 维（+ 8 维基本面 PE/PB/ROE/毛利率 + 5 维资金流 龙虎榜/主力净流入/涨停连板/开盘啦）；3 表 BigQuery JOIN 在 SQL 层完成，LEFT JOIN 缺失喂 NaN 给 LightGBM 原生处理；initialize 预拉宽表 + (date, code) 索引，handle_data O(1) 查表（比 v1 推理快 10-20x）；模型存储 `gs://data-aquarium/models/walk_forward_rich/`，与 v1 完全隔离便于 A/B 对比 |
+| `strategy/ml_multi_horizon_picker/` | 实验包 | 多 Horizon ML 策略（PRD_20260524_12/13/14/15/16、PRD_20260525_01）：4 buy 模型 × horizon{1,5,10,20} + 1 sell 风险模型 + 多卖出触发；regime 由沪深300趋势/动量/回撤/波动 + 股票池市场广度共同判定，并直接约束风险预算，默认 bull 最多 5 只/85% 资金、neutral 最多 3 只/45% 资金、bear 0 只/0% 资金且清掉可卖持仓；支持走步重训（walk_forward.py / model_registry.py）、可交易过滤（tradable.py，schema 与 BigQueryDataSource.trading_permissions 对齐）、**Cloud Run 并行训练**（build_registry.py + deploy/cloud_run_walk_forward/），并可在回测 preset 中直接读取 `gs://data-aquarium/models/walk_forward/registry.json`；模型按 `train_end_date < current_date` 生效，月末训练模型从下一交易日开始使用 |
+| `strategy/ml_rich_picker/` | 实验包 | **富特征 ML 策略**（PRD_20260525_03）：继承 ml_multi_horizon，特征从 17 维扩展到 30 维（+ 8 维基本面 PE/PB/ROE/毛利率 + 5 维资金流 龙虎榜/主力净流入/涨停连板/开盘啦），sell 输入 39 维；BigQuery JOIN 在 SQL 层完成，LEFT JOIN 缺失喂 NaN 给 LightGBM 原生处理；initialize 预拉全历史可交易宽表 + (date, code) 索引，handle_data 按当日流动性动态 universe 查表；交易 score 固定使用 `decision_horizon=5`，正式模型包只强制 `buy_h5 + sell_v1`；成交/NAV 用不复权价格，持仓状态特征用 qfq rich 价格对齐训练；模型存储 `gs://data-aquarium/models/walk_forward_rich/` |
 | `deploy/cloud_run_walk_forward/` | 部署 | Cloud Run Job 并行走步训练（PRD_20260524_14）：Dockerfile + run.sh + walk_forward_cloud_config.yaml；8 并发 ~15 分钟跑完 5 年走步训练，~HK$1 |
 | `deploy/cloud_run_walk_forward_rich/` | 部署 | Cloud Run Job 富特征走步训练（PRD_20260525_03）：复用 walk_forward 部署套路，独立镜像 `ml-rich-picker`、独立模型 GCS 路径 |
 | `deploy/cloud_run_backtest/` | 部署 | Cloud Run Job 完整回测（PRD_20260524_16）：Dockerfile + cloudbuild.yaml + run.sh；复用 GCS walk-forward registry，在 GCP 上运行 2020-01-02 至 2026-04-30 月度重训真实撮合回测，并归档产物到 GCS |

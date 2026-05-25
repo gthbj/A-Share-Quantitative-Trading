@@ -121,7 +121,10 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         if not callable(loader):
             return []
         try:
-            stock_df = loader()
+            try:
+                stock_df = loader(include_inactive=True)
+            except TypeError:
+                stock_df = loader()
         except Exception as exc:
             logger.warning(f"加载全市场股票池失败，保留父类初始 universe: {exc}")
             return []
@@ -321,14 +324,62 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                 continue
             idx = matching_idx[0]
             close = float(close_by_code.loc[code])
-            cost = float(getattr(pos, "cost_price", 0.0) or 0.0)
-            peak = max(float(state.peak_price or 0.0), close)
+            entry_date = self._actual_position_entry_date(pos)
+            if not entry_date:
+                entry_date = self._normalize_trade_date(getattr(state, "entered_date", ""))
+            entry_price = self._rich_entry_open(code, entry_date)
+            peak = self._rich_position_peak(code, entry_date, context.current_date, close)
             holding_days = float(self._holding_trade_days(context, state, pos))
             out.loc[idx, "holding_days"] = holding_days
-            out.loc[idx, "position_return"] = (close / cost - 1.0) if cost > 0 else 0.0
+            out.loc[idx, "position_return"] = (close / entry_price - 1.0) if entry_price > 0 else 0.0
             out.loc[idx, "drawdown_from_position_peak"] = (close / peak - 1.0) if peak > 0 else 0.0
             out.loc[idx, "days_to_expected_horizon"] = float(state.expected_horizon) - holding_days
         return out
+
+    def _rich_entry_open(self, code: str, entry_date: str) -> float:
+        """取实际成交日的 qfq open，供 sell 模型持仓收益特征使用。"""
+        if not entry_date or self._rich_features is None or self._rich_features.empty:
+            return 0.0
+        try:
+            row = self._rich_features.loc[(entry_date, code)]
+        except KeyError:
+            return 0.0
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        value = row.get("open", 0.0)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _rich_position_peak(
+        self,
+        code: str,
+        entry_date: str,
+        current_date: str,
+        fallback_close: float,
+    ) -> float:
+        """持仓期 qfq high 峰值，与训练样本的 drawdown_from_position_peak 对齐。"""
+        if not entry_date or self._rich_features is None or self._rich_features.empty:
+            return float(fallback_close)
+        current_key = self._normalize_trade_date(current_date)
+        if not current_key:
+            return float(fallback_close)
+        try:
+            code_hist = self._rich_features.xs(code, level="equity_code")
+        except KeyError:
+            return float(fallback_close)
+        if code_hist.empty or "high" not in code_hist.columns:
+            return float(fallback_close)
+        window = code_hist.loc[
+            (code_hist.index >= entry_date) & (code_hist.index <= current_key)
+        ]
+        if window.empty:
+            return float(fallback_close)
+        high = pd.to_numeric(window["high"], errors="coerce").max()
+        if pd.isna(high) or float(high) <= 0:
+            return float(fallback_close)
+        return max(float(high), float(fallback_close))
 
     # ──────────────────────────────────────────────────────────────
     # 重写 _score_universe：从预加载表查特征
@@ -425,6 +476,8 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                 score_df[col] = self._squash_to_prob(
                     deterministic_rich_score(today_df[RICH_BUY_FEATURE_COLUMNS]).to_numpy()
                 )
+            elif h != self.decision_horizon:
+                score_df[col] = np.nan
             else:
                 raise RuntimeError(
                     f"buy_h{h} 模型缺失，且 use_deterministic_fallback=False"

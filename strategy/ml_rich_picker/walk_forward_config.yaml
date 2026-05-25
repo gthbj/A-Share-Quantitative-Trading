@@ -37,10 +37,12 @@ universe:
 
 labels:
   buy_horizons: [1, 5, 10, 20]
+  decision_horizon: 5
   buy_top_quantile: 0.30
   buy_bottom_quantile: 0.30
   sell_lookforward: 5
   sell_drawdown_threshold: -0.05
+  sell_underperform_quantile: 0.30
 
 lightgbm:
   objective: "binary"

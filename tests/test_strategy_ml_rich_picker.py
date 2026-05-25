@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from types import SimpleNamespace
 
 from account.portfolio import Portfolio
 from account.position import Position
@@ -115,8 +116,10 @@ def _indexed_rich_features(codes: list[str] | None = None) -> pd.DataFrame:
         row = {
             "date": "20240102",
             "equity_code": code,
+            "open": 9.8 + i,
             "close": 10.0 + i,
             "high": 10.5 + i,
+            "low": 9.5 + i,
             "ma_60": 9.5 + i,
             "amount": 1_000_000.0,
         }
@@ -185,8 +188,8 @@ def test_deterministic_rich_sell_score_in_range():
     assert (out >= 0).all() and (out <= 1).all()
 
 
-def test_score_universe_raises_when_buy_model_missing_without_fallback():
-    """正式 rich 模式：buy 模型缺失应失败，不写 0 或 deterministic 分数。"""
+def test_score_universe_allows_optional_buy_models_missing_without_fallback():
+    """正式 rich 模式：非 decision_horizon 的 buy 模型缺失不应阻塞交易。"""
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
     strat._models.pop("buy_h10")
@@ -195,7 +198,23 @@ def test_score_universe_raises_when_buy_model_missing_without_fallback():
     class _FakeCtx:
         current_date = "20240102"
 
-    with pytest.raises(RuntimeError, match="buy_h10 模型缺失"):
+    out = strat._score_universe(_FakeCtx())
+
+    assert out is not None
+    assert out["prob_up_h10"].isna().all()
+    assert out["score"].notna().all()
+
+
+def test_score_universe_raises_when_decision_buy_model_missing_without_fallback():
+    """正式 rich 模式：decision_horizon 的 buy 模型缺失必须失败。"""
+    strat = _rich_strategy_with_features(use_fallback=False)
+    strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS if h != 5}
+    strat._models[SELL_MODEL_NAME] = _ConstantModel()
+
+    class _FakeCtx:
+        current_date = "20240102"
+
+    with pytest.raises(RuntimeError, match="buy_h5 模型缺失"):
         strat._score_universe(_FakeCtx())
 
 
@@ -215,13 +234,13 @@ def test_score_universe_raises_when_prediction_fails_without_fallback():
     """正式 rich 模式：模型维度不匹配 / predict 失败应直接暴露。"""
     strat = _rich_strategy_with_features(use_fallback=False)
     strat._models = {f"buy_h{h}": _ConstantModel() for h in BUY_HORIZONS}
-    strat._models["buy_h1"] = _FailingModel()
+    strat._models["buy_h5"] = _FailingModel()
     strat._models[SELL_MODEL_NAME] = _ConstantModel()
 
     class _FakeCtx:
         current_date = "20240102"
 
-    with pytest.raises(RuntimeError, match="buy_h1 模型预测失败"):
+    with pytest.raises(RuntimeError, match="buy_h5 模型预测失败"):
         strat._score_universe(_FakeCtx())
 
 
@@ -273,6 +292,64 @@ def test_score_universe_uses_fixed_decision_horizon_score():
 
     assert out is not None
     assert (out["score"] == out["prob_up_h5"]).all()
+
+
+def test_position_state_features_use_rich_adjusted_prices_not_execution_cost():
+    """sell 持仓状态特征用 qfq rich 价格，不能把 qfq close 除以 none 成本价。"""
+    strat = MLRichPickerStrategy(require_rich_features=True)
+    rich = pd.DataFrame(
+        [
+            {
+                "date": "20240103",
+                "equity_code": "000001.SZ",
+                "open": 100.0,
+                "high": 105.0,
+                "low": 99.0,
+                "close": 102.0,
+                "ma_60": 90.0,
+                "amount": 1_000_000.0,
+            },
+            {
+                "date": "20240104",
+                "equity_code": "000001.SZ",
+                "open": 110.0,
+                "high": 130.0,
+                "low": 109.0,
+                "close": 120.0,
+                "ma_60": 90.0,
+                "amount": 1_000_000.0,
+            },
+        ]
+    )
+    for col in RICH_SELL_FEATURE_COLUMNS:
+        if col not in rich.columns:
+            rich[col] = 0.1
+    strat._rich_features = rich.set_index(["date", "equity_code"])
+    strat._trading_date_index = {
+        "20240103": 0,
+        "20240104": 1,
+    }
+    strat._position_state["000001.SZ"] = PositionState(
+        entered_date="20240102",
+        expected_horizon=5,
+        peak_price=10.0,
+    )
+    portfolio = Portfolio(initial_capital=100_000)
+    portfolio.apply_buy_fill("000001.SZ", 100, 10.0, "20240103")
+
+    ctx = SimpleNamespace(
+        current_date="20240104",
+        portfolio=portfolio,
+        all_bars={},
+    )
+
+    today_df = rich[rich["date"] == "20240104"].copy()
+    out = strat._position_state_features(ctx, today_df)
+
+    assert out.loc[today_df.index[0], "position_return"] == pytest.approx(0.20)
+    assert out.loc[today_df.index[0], "drawdown_from_position_peak"] == pytest.approx(
+        120.0 / 130.0 - 1.0
+    )
 
 
 def test_score_universe_dynamic_liquidity_universe():
@@ -583,7 +660,7 @@ def test_walk_forward_partition_months_cover_full_range():
     ]
 
 
-def test_walk_forward_requires_complete_rich_model_bundle():
+def test_walk_forward_requires_decision_horizon_and_sell_model_bundle():
     from strategy.ml_rich_picker.walk_forward import _missing_rich_model_components
 
     complete = {h: object() for h in BUY_HORIZONS}
@@ -591,7 +668,13 @@ def test_walk_forward_requires_complete_rich_model_bundle():
 
     partial = {1: object(), 5: object()}
     missing = _missing_rich_model_components(partial, object())
-    assert missing == ["buy_h10", "buy_h20"]
+    assert missing == []
+    assert _missing_rich_model_components({1: object()}, object()) == ["buy_h5"]
+    assert _missing_rich_model_components(
+        {1: object(), 10: object()},
+        object(),
+        required_horizons=[10],
+    ) == []
     assert _missing_rich_model_components(complete, None) == [SELL_MODEL_NAME]
 
 
@@ -633,12 +716,14 @@ def test_sell_training_frame_contains_position_state_features():
         frame,
         lookforward=5,
         drawdown_threshold=-0.05,
-        holding_day_samples=[1, 5],
+        holding_day_samples=[1, 5, 10],
     )
 
     assert set(POSITION_STATE_FEATURE_COLUMNS).issubset(out.columns)
     assert "label_sell" in out.columns
-    assert set(out["holding_days"].dropna().unique()) == {1.0, 5.0}
+    assert set(out["holding_days"].dropna().unique()) == {1.0, 5.0, 10.0}
+    assert out.loc[out["holding_days"] == 5.0, "days_to_expected_horizon"].dropna().eq(0.0).all()
+    assert out.loc[out["holding_days"] == 10.0, "days_to_expected_horizon"].dropna().eq(-5.0).all()
 
 
 def test_binary_auc_helper():

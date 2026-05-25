@@ -6,7 +6,7 @@
 
 name: "ml_rich_picker"
 class: "strategy.ml_rich_picker.MLRichPickerStrategy"
-description: "富特征 ML 策略：30 维 buy (17 daily + 8 fundamental + 5 event) + 35 维 sell"
+description: "富特征 ML 策略：30 维 buy (17 daily + 8 fundamental + 5 event) + 39 维 sell"
 
 params:
   # 走步模型注册表（训完后路径）

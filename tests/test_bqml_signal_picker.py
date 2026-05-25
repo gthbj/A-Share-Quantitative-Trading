@@ -102,6 +102,75 @@ def test_bigquery_source_allows_special_board_codes_when_permission_enabled():
     assert source._is_code_allowed_by_permissions("300001.SZ")
 
 
+def test_bigquery_bar_cache_key_includes_full_code_and_adjust_type():
+    assert BigQueryDataSource._cache_code_key("000001.SZ", "qfq") == "000001_SZ_qfq"
+    assert BigQueryDataSource._cache_code_key("000001.SZ", None) == "000001_SZ_none"
+    assert (
+        BigQueryDataSource._cache_code_key("000001.SZ", "qfq")
+        != BigQueryDataSource._cache_code_key("000001.SZ", None)
+    )
+
+
+def test_get_stock_list_can_filter_as_of_date(monkeypatch):
+    source = BigQueryDataSource(
+        project_id="data-aquarium",
+        dataset="ashare",
+        use_cache=False,
+        tables={"dim_security": "dwd_dim_security"},
+    )
+    captured = {}
+
+    def fake_execute(sql: str, max_retries: int = 3):
+        captured["sql"] = sql
+        return pd.DataFrame(
+            {
+                "security_code": ["000001.SZ"],
+                "security_name": ["平安银行"],
+                "list_date": ["19910403"],
+            }
+        )
+
+    monkeypatch.setattr(source, "_execute_sql", fake_execute)
+
+    out = source.get_stock_list(as_of_date="20200102")
+
+    sql = captured["sql"]
+    assert "s.list_date IS NULL OR s.list_date <= DATE '2020-01-02'" in sql
+    assert "s.delist_date IS NULL OR s.delist_date > DATE '2020-01-02'" in sql
+    assert "s.is_active = TRUE" not in sql
+    assert "r'\\*?ST'" not in sql
+    assert "security_name, '') NOT LIKE '%退%'" not in sql
+    assert out["code"].tolist() == ["000001.SZ"]
+
+
+def test_liquidity_top_equities_uses_as_of_listing_window(monkeypatch):
+    source = BigQueryDataSource(
+        project_id="data-aquarium",
+        dataset="ashare",
+        use_cache=False,
+        tables={
+            "kline_1d_equity": "dwd_fact_equity_kline_1d",
+            "dim_security": "dwd_dim_security",
+        },
+    )
+    captured = {}
+
+    def fake_execute(sql: str, max_retries: int = 3):
+        captured["sql"] = sql
+        return pd.DataFrame({"equity_code": ["000001.SZ"]})
+
+    monkeypatch.setattr(source, "_execute_sql", fake_execute)
+
+    assert source.get_liquidity_top_equities("20240110", top_n=1) == ["000001.SZ"]
+
+    sql = captured["sql"]
+    assert "s.list_date IS NULL OR s.list_date <= DATE '2024-01-09'" in sql
+    assert "s.delist_date IS NULL OR s.delist_date > DATE '2024-01-10'" in sql
+    assert "s.is_active = TRUE" not in sql
+    assert "r'\\*?ST'" not in sql
+    assert "security_name, '') NOT LIKE '%退%'" not in sql
+
+
 def test_bqml_signal_query_applies_security_permission_filter(monkeypatch):
     source = BigQueryDataSource(
         project_id="data-aquarium",

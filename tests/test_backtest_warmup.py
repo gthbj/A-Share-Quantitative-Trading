@@ -77,7 +77,8 @@ def test_backtest_preloads_before_start_date():
 
     assert not result.empty
     assert data_source.multi_calls
-    _, start_date, end_date, period, _ = data_source.multi_calls[0]
+    _, start_date, end_date, period, adjust = data_source.multi_calls[0]
     assert start_date < "20240110"
     assert end_date == "20240112"
     assert period == "daily"
+    assert adjust == "none"

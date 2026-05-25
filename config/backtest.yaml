@@ -55,6 +55,9 @@ data:
     retention_days: 7        # 缓存文件保留时长（天），超过此期限的文件会被清理
     max_size_gb: 1.0         # 缓存目录最大体积（GB），超过则按修改时间升序清理至阈值内
 
+  # 回测撮合 / NAV 使用真实不复权价格；策略如需 qfq 特征应在策略层单独读取。
+  execution_adjust_type: "none"
+
   # Google Cloud BigQuery 数据源配置
   # 敏感凭据（GOOGLE_APPLICATION_CREDENTIALS）放在 config/secrets.yaml 或环境变量，不入 git
   bigquery:

@@ -394,11 +394,14 @@ def _build_held_position_sell_training_frame(
     lookforward: int,
     drawdown_threshold: float,
     holding_day_samples: Optional[List[int]] = None,
+    decision_horizon: int = 5,
+    underperform_quantile: Optional[float] = 0.30,
 ) -> pd.DataFrame:
     """构造持仓决策 sell 训练样本。
 
     每个信号日模拟若干个已经持有 N 天的状态，标签表示“若今日收盘
-    继续持有，下一开盘之后的 lookforward 窗口是否出现不可接受风险”。
+    继续持有，下一开盘之后的 lookforward 窗口是否出现不可接受风险，
+    或未来收益是否落在同日截面底部（机会成本/alpha 衰减）。
     """
     if df.empty:
         return df.copy()
@@ -413,6 +416,25 @@ def _build_held_position_sell_training_frame(
         for _, group in base.groupby("equity_code")
     ]
     base["future_exec_max_dd"] = pd.concat(pieces).sort_index() if pieces else np.nan
+    ret_pieces = [
+        _compute_execution_horizon_return(group, lookforward)
+        for _, group in base.groupby("equity_code")
+    ]
+    base["future_exec_ret"] = pd.concat(ret_pieces).sort_index() if ret_pieces else np.nan
+    if underperform_quantile is not None:
+        q = max(0.0, min(1.0, float(underperform_quantile)))
+
+        def _date_underperform_threshold(group: pd.Series) -> float:
+            valid = group.dropna()
+            if len(valid) < 10:
+                return np.nan
+            return float(valid.quantile(q))
+
+        base["future_underperform_threshold"] = base.groupby("date")[
+            "future_exec_ret"
+        ].transform(_date_underperform_threshold)
+    else:
+        base["future_underperform_threshold"] = np.nan
 
     frames: List[pd.DataFrame] = []
     for holding_days in holding_day_samples:
@@ -433,16 +455,19 @@ def _build_held_position_sell_training_frame(
             / pd.to_numeric(position_peak, errors="coerce").astype(float)
             - 1.0
         )
-        expected_horizon = min([h for h in BUY_HORIZONS if h >= holding_days] or [max(BUY_HORIZONS)])
-        sample["days_to_expected_horizon"] = float(expected_horizon - holding_days)
+        sample["days_to_expected_horizon"] = float(int(decision_horizon) - holding_days)
         frames.append(sample)
 
     out = pd.concat(frames, ignore_index=True)
     out["label_sell"] = np.nan
-    valid = out["future_exec_max_dd"].notna()
-    out.loc[valid, "label_sell"] = (
-        out.loc[valid, "future_exec_max_dd"] <= drawdown_threshold
-    ).astype(float)
+    risk_hit = out["future_exec_max_dd"] <= drawdown_threshold
+    underperform_hit = (
+        out["future_exec_ret"].notna()
+        & out["future_underperform_threshold"].notna()
+        & (out["future_exec_ret"] <= out["future_underperform_threshold"])
+    )
+    valid = out["future_exec_max_dd"].notna() | out["future_exec_ret"].notna()
+    out.loc[valid, "label_sell"] = (risk_hit | underperform_hit).loc[valid].astype(float)
     return out
 
 
@@ -565,6 +590,8 @@ def _train_one_retrain_point_rich(
         window,
         lookforward=cfg.sell_lookforward,
         drawdown_threshold=cfg.sell_drawdown_threshold,
+        decision_horizon=int(getattr(cfg, "decision_horizon", 5)),
+        underperform_quantile=getattr(cfg, "sell_underperform_quantile", 0.30),
     )
 
     # ── Buy 模型 ──
@@ -627,11 +654,13 @@ def _train_one_retrain_point_rich(
 def _missing_rich_model_components(
     buy_models: Dict[int, Any],
     sell_model: Optional[Any],
+    required_horizons: Optional[List[int]] = None,
 ) -> List[str]:
     """返回 rich 策略正式回测必需但本次未训练出的模型名。"""
+    required = required_horizons or [5]
     missing = [
         f"buy_h{h}"
-        for h in BUY_HORIZONS
+        for h in required
         if h not in buy_models or buy_models[h] is None
     ]
     if sell_model is None:
@@ -648,8 +677,15 @@ def _attach_rich_validation_config(cfg: WalkForwardConfig, config_path: str) -> 
         logger.warning(f"读取 rich validation 配置失败，使用默认质量闸门: {exc}")
         raw = {}
     validation = raw.get("validation", {}) if isinstance(raw, dict) else {}
+    labels = raw.get("labels", {}) if isinstance(raw, dict) else {}
     setattr(cfg, "min_buy_auc", float(validation.get("min_buy_auc", 0.52)))
     setattr(cfg, "min_sell_auc", float(validation.get("min_sell_auc", 0.52)))
+    setattr(cfg, "decision_horizon", int(labels.get("decision_horizon", 5)))
+    setattr(
+        cfg,
+        "sell_underperform_quantile",
+        float(labels.get("sell_underperform_quantile", 0.30)),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -773,8 +809,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         buy_models, sell_model, meta = _train_one_retrain_point_rich(
             features_df, universe, retrain_date, cfg
         )
-        missing_models = _missing_rich_model_components(buy_models, sell_model)
+        required_horizons = [int(getattr(cfg, "decision_horizon", 5))]
+        missing_models = _missing_rich_model_components(
+            buy_models,
+            sell_model,
+            required_horizons=required_horizons,
+        )
         meta["expected_buy_horizons"] = list(BUY_HORIZONS)
+        meta["required_buy_horizons"] = required_horizons
         meta["model_bundle_complete"] = not missing_models
         meta["missing_models"] = missing_models
         if missing_models:
