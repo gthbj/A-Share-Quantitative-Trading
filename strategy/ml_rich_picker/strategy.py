@@ -703,12 +703,19 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         触发器，用 position_return 和 holding_days 真正合成业务决策——
         因为新 sell 回归模型已经把持仓状态从特征里拿掉，这些信号必须在
         策略层显式合成，否则"浮盈大该止盈 / 浮亏久该割肉"会丢失。
+
+        ``stop_loss_pct`` 是当前 regime 下生效的硬止损阈值（由父类调用方
+        按 regime 算好后透传），rich 转交给 helper 用作 ``stale_loss`` 的
+        下界——保证 stale_loss 永远落在 stop_loss 安全区里，不和 stop_loss
+        重叠。
         """
         sells = super()._check_sell_triggers(
             context, score_df, top_2n_codes, stop_loss_pct, data,
         )
         extra = self._check_position_aware_sell_triggers(
-            context, score_df, data, existing=sells,
+            context, score_df, data,
+            existing=sells,
+            stop_loss_pct=stop_loss_pct,
         )
         sells.update(extra)
         return sells
@@ -719,6 +726,7 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         score_df: pd.DataFrame,
         data: Dict[str, pd.Series],
         existing: Dict[str, str],
+        stop_loss_pct: float,
     ) -> Dict[str, str]:
         """逐持仓检查两个 position-aware 触发器：
 
@@ -728,21 +736,26 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
           覆盖父类没有的场景："价仍在创新高所以 trailing_stop 没触发，但
           模型已经看不到上行了，应该兑现"。
         - **stale_loss（温水割肉）**：``holding_days >= stale_loss_min_days``
-          *且* 浮亏 ≤ ``stale_loss_return_threshold``（**比父类 stop_loss
-          浅一档**，默认 -2% vs 父类 -5%/-3%）→ 认输。
-          覆盖父类没有的场景："亏得不够深所以 stop_loss 没触发，但已经
-          拖了 8+ 个交易日还在水下"——典型温水煮青蛙。
+          *且* 浮亏在 **``(-stop_loss_pct, stale_loss_return_threshold]``** 区间
+          → 认输。语义："亏得没到硬止损线，但已经拖了 8+ 个交易日还在水下"
+          ——典型温水煮青蛙。
+
+          **关键设计**：上界用 ``stale_loss_return_threshold``（默认 -2%），
+          下界**直接用本次调用传入的 ``stop_loss_pct``**（而不是固定值），
+          所以哪怕未来有人把 ``stop_loss_pct_bull/bear`` 调到 1.5%，也不会
+          让 stale_loss 和 stop_loss 重叠——stale_loss 自动只覆盖 stop_loss
+          安全区内的浅亏。
 
         与父类触发器的关系（rich 在父类之后追加，已被父类卖出的 code 跳过）：
 
         ::
 
-            父类:  a. stop_loss     | 浮亏 > stop_loss_pct（5%/3%）→ 卖
+            父类:  a. stop_loss     | 浮亏 > stop_loss_pct → 卖
                    b. trailing_stop | 从持仓高点回撤 > trailing_stop_pct → 卖
                    ...
                    f. sell_model    | prob_sell > sell_threshold → 卖
             rich:  g. profit_take   | 浮盈 ≥ 20% 且模型转弱 → 卖
-                   h. stale_loss    | 持仓久 + 浅幅亏（避开 a） → 卖
+                   h. stale_loss    | (-stop_loss_pct, stale_loss_threshold] 浅亏长拖
 
         触发依据用真实持仓的 ``pos.cost_price``（execution-priced，none 复权）
         计算 ``position_return``，跟回测撮合口径一致；不依赖 _position_state
@@ -752,6 +765,10 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
         prob_lookup = score_df.set_index("code")
         out: Dict[str, str] = {}
         prob_h_col = f"prob_up_h{self.decision_horizon}"
+        # 把 stop_loss_pct 翻成 return 域的下界（负数）。
+        # 任何 position_return <= stop_loss_return 的持仓**理论上**已经被父类
+        # stop_loss 卖出，这里 stale_loss 只覆盖 (-stop_loss, threshold] 区间。
+        stop_loss_return = -abs(float(stop_loss_pct))
 
         for code, pos in portfolio.positions.items():
             if code in existing or getattr(pos, "total_qty", 0) <= 0:
@@ -788,12 +805,21 @@ class MLRichPickerStrategy(MLMultiHorizonStrategy):
                     )
                     continue
 
-            # 割肉：持仓拖太久 + 仍浮亏
-            if (holding_days >= self.stale_loss_min_days
-                    and position_return <= self.stale_loss_return_threshold):
+            # 温水割肉：持仓久 + 浮亏在 stop_loss 安全区内
+            #
+            # 区间判断 **显式** 用 ``stop_loss_return`` 做下界，不再依赖
+            # "调用方把 stale_loss_return_threshold 配得比 stop_loss 浅"
+            # 这种隐含契约——这样以后任意调 stop_loss_pct，stale_loss 都不会
+            # 退化成死代码或过宽触发器。
+            if (
+                holding_days >= self.stale_loss_min_days
+                and position_return <= self.stale_loss_return_threshold
+                and position_return > stop_loss_return
+            ):
                 out[code] = (
                     f"stale_loss(ret={position_return:.2%},"
-                    f"held={holding_days}d)"
+                    f"held={holding_days}d,"
+                    f"stop_floor={stop_loss_return:.2%})"
                 )
                 continue
 

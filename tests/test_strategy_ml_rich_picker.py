@@ -1386,7 +1386,7 @@ def test_profit_take_helper_fires_when_no_trailing_risk():
     data = {"600000.SH": pd.Series({"close": 13.0})}
 
     out = strat._check_position_aware_sell_triggers(
-        ctx, score_df, data, existing={},
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
     )
     assert "600000.SH" in out
     assert "profit_take" in out["600000.SH"]
@@ -1410,7 +1410,7 @@ def test_profit_take_helper_not_triggered_when_market_still_bullish():
     data = {"600000.SH": pd.Series({"close": 14.0})}
 
     out = strat._check_position_aware_sell_triggers(
-        ctx, score_df, data, existing={},
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
     )
     assert "600000.SH" not in out
 
@@ -1441,7 +1441,7 @@ def test_stale_loss_helper_fires_in_stop_loss_safe_zone():
     data = {"600000.SH": pd.Series({"close": 9.7})}
 
     out = strat._check_position_aware_sell_triggers(
-        ctx, score_df, data, existing={},
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
     )
     assert "600000.SH" in out
     assert "stale_loss" in out["600000.SH"]
@@ -1464,7 +1464,7 @@ def test_stale_loss_helper_not_triggered_when_held_short():
     data = {"600000.SH": pd.Series({"close": 9.7})}
 
     out = strat._check_position_aware_sell_triggers(
-        ctx, score_df, data, existing={},
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
     )
     # 持仓只有 3 个交易日 < 8 → 不触发 stale_loss
     assert "600000.SH" not in out
@@ -1489,7 +1489,9 @@ def test_position_aware_triggers_skip_existing_sells():
 
     # 已经在 existing 里 → 跳过
     out = strat._check_position_aware_sell_triggers(
-        ctx, score_df, data, existing={"600000.SH": "stop_loss"},
+        ctx, score_df, data,
+        existing={"600000.SH": "stop_loss"},
+        stop_loss_pct=0.05,
     )
     assert "600000.SH" not in out
 
@@ -1618,6 +1620,88 @@ def test_full_chain_stop_loss_takes_precedence_over_stale_loss():
     assert sells["600000.SH"].startswith("stop_loss"), (
         f"父类 stop_loss 应优先于 rich stale_loss，实际：{sells['600000.SH']}"
     )
+
+
+def test_stale_loss_uses_stop_loss_pct_as_floor_not_static_threshold():
+    """关键契约：stale_loss 区间下界**显式**用 stop_loss_pct，而不是依赖
+    配置约定。
+
+    场景：把 stop_loss_pct 临时调到 1.5%（比 stale_loss_return_threshold=-2%
+    更浅），那 -2% 的浮亏已经穿过 stop_loss 区，stale_loss 必须**不触发**
+    （父类 stop_loss 应该早就卖掉了）。
+
+    这是把"abs(stale_loss_threshold) < stop_loss_pct" 这个隐含参数契约
+    硬编码进 stale_loss 自身逻辑的代码约束测试。
+    """
+    dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
+             "20240108", "20240109", "20240110", "20240111", "20240112",
+             "20240115"]
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240101",
+        current_date="20240115",
+        peak_price=10.0,
+        trading_days=dates,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.02,
+    )
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
+    ])
+    # 浮亏 -2.5% → 在默认 stop_loss=5% 时落在 stale_loss 区间
+    data = {"600000.SH": pd.Series({"close": 9.75})}
+
+    # 用默认 bull stop_loss 0.05 → stale_loss 应该触发
+    out_bull = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
+    )
+    assert "600000.SH" in out_bull
+    assert "stale_loss" in out_bull["600000.SH"]
+
+    # 同样浮亏，但 stop_loss 调到 1.5%（比 stale_loss_threshold 浅）→
+    # -2.5% 已经穿过 stop_loss 区，stale_loss 必须不触发
+    out_tight = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={}, stop_loss_pct=0.015,
+    )
+    assert "600000.SH" not in out_tight, (
+        "stop_loss_pct=1.5% 时 -2.5% 已经穿过 stop_loss 区，"
+        "stale_loss 不应抢父类 stop_loss 的活"
+    )
+
+
+def test_stale_loss_floor_inclusive_when_return_equals_stop_loss_boundary():
+    """边界：浮亏正好 = -stop_loss_pct 时不触发 stale_loss
+    （因为父类 stop_loss 用的是严格 ``<``，理论上不会卖；但 rich 这边为了
+    避免和父类边界重叠，仍然用严格 ``>`` 来排除等号——
+    宁可少卖一次也不让两个 trigger 在同一个浮亏点都判定为卖出）。
+    """
+    dates = ["20240101", "20240102", "20240103", "20240104", "20240105",
+             "20240108", "20240109", "20240110", "20240111", "20240112",
+             "20240115"]
+    strat, ctx = _make_strat_with_position(
+        cost=10.0,
+        entry_date="20240101",
+        current_date="20240115",
+        peak_price=10.0,
+        trading_days=dates,
+        stale_loss_min_days=8,
+        stale_loss_return_threshold=-0.02,
+    )
+
+    score_df = pd.DataFrame([
+        {"code": "600000.SH", "prob_up_h5": 0.50, "prob_sell": 0.20,
+         "score": 0.50, "predicted_remaining_days": 3.0},
+    ])
+    # 浮亏正好 -5%（= stop_loss_pct_bull）：边界值
+    data = {"600000.SH": pd.Series({"close": 9.5})}
+
+    out = strat._check_position_aware_sell_triggers(
+        ctx, score_df, data, existing={}, stop_loss_pct=0.05,
+    )
+    # 浮亏 == -5%：return == stop_loss_return，严格 ``>`` 排除等号 → 不触发
+    assert "600000.SH" not in out
 
 
 def test_full_chain_trailing_stop_takes_precedence_over_profit_take():
